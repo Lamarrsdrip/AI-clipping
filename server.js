@@ -34,10 +34,13 @@ const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
 const CREDITS_ENABLED = process.env.CREDITS_ENABLED === 'true';
 const CLIP_JOB_CREDIT_COST = Number(process.env.CLIP_JOB_CREDIT_COST || 5);
+const MIN_CLIP_SOURCE_SECONDS = Number(process.env.MIN_CLIP_SOURCE_SECONDS || 15);
 
 mkdirSync(DATA_DIR, { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'originals'), { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'clips'), { recursive: true });
+mkdirSync(path.join(STORAGE_DIR, 'uploads'), { recursive: true });
+mkdirSync(path.join(STORAGE_DIR, 'thumbs'), { recursive: true });
 
 const seed = {
   users: [{
@@ -428,6 +431,10 @@ function parseYouTubeUrl(input) {
     if (!/^[\w-]{11}$/.test(id)) throw new Error('That YouTube watch link does not contain a valid video ID.');
     return { type: 'video', id, canonical: `https://www.youtube.com/watch?v=${id}`, original: url.toString() };
   }
+  if (url.pathname === '/playlist' && url.searchParams.get('list')) {
+    const id = url.searchParams.get('list');
+    return { type: 'playlist', id, canonical: `https://www.youtube.com/playlist?list=${encodeURIComponent(id)}`, original: url.toString() };
+  }
   if (url.pathname.startsWith('/shorts/')) {
     const id = url.pathname.split('/')[2];
     if (!/^[\w-]{11}$/.test(id)) throw new Error('That Shorts link does not contain a valid video ID.');
@@ -524,19 +531,58 @@ async function fetchChannelWithApi(channelUrl) {
     throw new Error(message);
   }
   const videoData = await videoResponse.json();
-  return videoData.items.map(normalizeApiVideo).filter(video => video.durationSeconds >= 600);
+  return classifyImportVideos(videoData.items.map(normalizeApiVideo), { sourceType: 'channel', source: 'youtube-api' }).accepted;
+}
+
+async function fetchPlaylistWithApi(playlistId) {
+  const db = loadDb();
+  const apiKey = settingValue(db, 'YOUTUBE_API_KEY');
+  if (!apiKey) return null;
+  const playlist = new URL('https://www.googleapis.com/youtube/v3/playlistItems');
+  playlist.searchParams.set('part', 'snippet');
+  playlist.searchParams.set('playlistId', playlistId);
+  playlist.searchParams.set('maxResults', '12');
+  playlist.searchParams.set('key', apiKey);
+  const playlistResponse = await fetch(playlist);
+  if (!playlistResponse.ok) {
+    const body = await playlistResponse.text();
+    const message = friendlyYouTubeApiError(playlistResponse.status, body);
+    importLog(playlistResponse.status >= 500 ? 'error' : 'warn', message, { status: playlistResponse.status, playlistId, body: body.slice(0, 500) });
+    throw new Error(message);
+  }
+  const playlistData = await playlistResponse.json();
+  const ids = playlistData.items.map(item => item.snippet?.resourceId?.videoId).filter(Boolean).join(',');
+  if (!ids) return [];
+  const videos = new URL('https://www.googleapis.com/youtube/v3/videos');
+  videos.searchParams.set('part', 'snippet,contentDetails,statistics');
+  videos.searchParams.set('id', ids);
+  videos.searchParams.set('key', apiKey);
+  const videoResponse = await fetch(videos);
+  if (!videoResponse.ok) {
+    const body = await videoResponse.text();
+    const message = friendlyYouTubeApiError(videoResponse.status, body);
+    importLog(videoResponse.status >= 500 ? 'error' : 'warn', message, { status: videoResponse.status, playlistId, body: body.slice(0, 500) });
+    throw new Error(message);
+  }
+  const videoData = await videoResponse.json();
+  return classifyImportVideos(videoData.items.map(normalizeApiVideo), { sourceType: 'playlist', source: 'youtube-api' }).accepted;
 }
 
 function normalizeApiVideo(item) {
+  const durationSeconds = isoDurationToSeconds(item.contentDetails.duration);
+  const liveStatus = item.snippet.liveBroadcastContent || 'none';
   return {
     youtubeId: item.id,
     url: `https://www.youtube.com/watch?v=${item.id}`,
     title: item.snippet.title,
     channelTitle: item.snippet.channelTitle,
-    durationSeconds: isoDurationToSeconds(item.contentDetails.duration),
+    durationSeconds,
     viewCount: Number(item.statistics?.viewCount || 0),
     publishedAt: item.snippet.publishedAt,
     thumbnailUrl: item.snippet.thumbnails?.high?.url || item.snippet.thumbnails?.medium?.url || '',
+    isShort: durationSeconds > 0 && durationSeconds <= 90,
+    liveStatus,
+    importSource: 'youtube-api',
     status: 'imported'
   };
 }
@@ -559,17 +605,78 @@ async function fetchWithYtDlp(source) {
     throw new Error('yt-dlp could not read metadata for that YouTube link.');
   }
   const entries = data.entries?.length ? data.entries : [data];
-  return entries.map(item => ({
-    youtubeId: item.id,
-    url: item.webpage_url || `https://www.youtube.com/watch?v=${item.id}`,
-    title: item.title || 'Untitled video',
-    channelTitle: item.channel || item.uploader || '',
-    durationSeconds: Math.round(item.duration || 0),
-    viewCount: Number(item.view_count || 0),
-    publishedAt: item.upload_date ? `${item.upload_date.slice(0, 4)}-${item.upload_date.slice(4, 6)}-${item.upload_date.slice(6, 8)}T00:00:00.000Z` : null,
-    thumbnailUrl: item.thumbnail || '',
-    status: 'imported'
-  })).filter(video => video.youtubeId && video.durationSeconds >= 600);
+  const videos = entries.map(item => {
+    const durationSeconds = Math.round(item.duration || 0);
+    return {
+      youtubeId: item.id,
+      url: item.webpage_url || `https://www.youtube.com/watch?v=${item.id}`,
+      title: item.title || 'Untitled video',
+      channelTitle: item.channel || item.uploader || '',
+      durationSeconds,
+      viewCount: Number(item.view_count || 0),
+      publishedAt: item.upload_date ? `${item.upload_date.slice(0, 4)}-${item.upload_date.slice(4, 6)}-${item.upload_date.slice(6, 8)}T00:00:00.000Z` : null,
+      thumbnailUrl: item.thumbnail || '',
+      isShort: durationSeconds > 0 && durationSeconds <= 90 || item.webpage_url?.includes('/shorts/'),
+      liveStatus: item.is_live ? 'live' : 'none',
+      availability: item.availability || '',
+      ageLimit: Number(item.age_limit || 0),
+      importSource: 'yt-dlp',
+      status: 'imported'
+    };
+  });
+  return classifyImportVideos(videos, { sourceType: 'yt-dlp', source }).accepted;
+}
+
+function classifyVideoForImport(video, context = {}) {
+  const reasons = [];
+  const duration = Number(video.durationSeconds || 0);
+  const availability = String(video.availability || '').toLowerCase();
+  if (!video.youtubeId) reasons.push('missing video id');
+  if (availability.includes('private')) reasons.push('private');
+  if (availability.includes('subscriber') || availability.includes('premium') || availability.includes('membership')) reasons.push('members-only');
+  if (video.liveStatus === 'live' || video.liveStatus === 'upcoming') reasons.push('livestream');
+  if (Number(video.ageLimit || 0) >= 18) reasons.push('age restricted');
+  if (!Number.isFinite(duration) || duration < 0) reasons.push('unsupported duration');
+  if (duration > 0 && duration < MIN_CLIP_SOURCE_SECONDS) importLog('warn', 'video is short but accepted', { id: video.youtubeId, durationSeconds: duration });
+  const accepted = Boolean(video.youtubeId) && !reasons.length;
+  const isShort = Boolean(video.isShort || duration <= 90);
+  const normalized = {
+    ...video,
+    isShort,
+    clipEligible: accepted,
+    clipMode: isShort ? 'shorts-direct' : 'long-form-clipping',
+    importWarning: accepted ? '' : reasons.join(', ')
+  };
+  importLog(accepted ? 'log' : 'warn', accepted ? 'video accepted' : 'video rejected', {
+    id: video.youtubeId,
+    title: video.title,
+    durationSeconds: duration,
+    reason: reasons.join(', ') || 'accepted',
+    source: context.source
+  });
+  return { accepted, reasons, video: normalized };
+}
+
+function classifyImportVideos(videos, context = {}) {
+  const accepted = [];
+  const rejected = [];
+  for (const video of videos) {
+    const result = classifyVideoForImport(video, context);
+    if (result.accepted) accepted.push(result.video);
+    else rejected.push(result);
+  }
+  return { accepted, rejected };
+}
+
+function importFailureMessage(rejected = [], parsed = {}) {
+  const reasons = rejected.flatMap(item => item.reasons || []);
+  if (!reasons.length) return parsed.type === 'channel' ? 'No public uploads were found for that channel.' : parsed.type === 'playlist' ? 'No public videos were found in that playlist.' : 'Video unavailable.';
+  if (reasons.includes('private')) return 'Private video. Try a public video link.';
+  if (reasons.includes('members-only')) return 'Members-only video. Use a public video you own or have permission to reuse.';
+  if (reasons.includes('livestream')) return 'Livestreams are not supported until they finish processing as regular videos.';
+  if (reasons.includes('age restricted')) return 'Age-restricted videos are not supported for this MVP.';
+  if (reasons.includes('unsupported duration')) return 'Unsupported duration. Try another public YouTube video.';
+  return parsed.type === 'channel' ? 'No public uploads were available to import.' : parsed.type === 'playlist' ? 'No public videos were available in that playlist.' : 'Video unavailable.';
 }
 
 async function fetchSourceVideos(sourceUrl) {
@@ -596,6 +703,18 @@ async function fetchSourceVideos(sourceUrl) {
       source = 'yt-dlp';
       videos = await fetchWithYtDlp(parsed.canonical);
     }
+  } else if (parsed.type === 'playlist') {
+    try {
+      const apiVideos = await fetchPlaylistWithApi(parsed.id);
+      videos = apiVideos || [];
+    } catch (error) {
+      warnings.push(error.message);
+      videos = [];
+    }
+    if (!videos.length) {
+      source = 'yt-dlp';
+      videos = await fetchWithYtDlp(parsed.canonical);
+    }
   } else {
     try {
       const apiVideos = await fetchChannelWithApi(parsed.canonical);
@@ -610,8 +729,8 @@ async function fetchSourceVideos(sourceUrl) {
     }
   }
   if (!videos.length) {
-    importLog('warn', 'no long public videos found', { source: parsed.canonical, type: parsed.type });
-    throw new Error('We found the source, but no long public videos were available to clip. Try a long-form video or a channel with recent uploads.');
+    importLog('warn', 'no importable public videos found', { source: parsed.canonical, type: parsed.type });
+    throw new Error(importFailureMessage([], parsed));
   }
   db.importCache.unshift({ cacheKey, sourceUrl: parsed.canonical, sourceType: parsed.type, videos, warnings, metadataSource: source, createdAt: new Date().toISOString() });
   db.importCache = db.importCache.slice(0, 80);
@@ -672,6 +791,96 @@ async function importSource(sourceUrl) {
   const result = addImportedVideos(db, parsed.canonical, parsed.type, videos);
   saveDb(db);
   return { ...result, source: source || 'youtube-api', warnings: warnings || [], canonicalUrl: parsed.canonical };
+}
+
+function parseMultipart(req, buffer) {
+  const type = req.headers['content-type'] || '';
+  const boundary = type.match(/boundary=(?:"([^"]+)"|([^;]+))/)?.[1] || type.match(/boundary=(?:"([^"]+)"|([^;]+))/)?.[2];
+  if (!boundary) throw new Error('Upload request is missing multipart boundary.');
+  const body = buffer.toString('binary');
+  const parts = body.split(`--${boundary}`);
+  const fields = {};
+  const files = [];
+  for (const part of parts) {
+    if (!part.includes('Content-Disposition')) continue;
+    const [rawHeaders, rawContent = ''] = part.split('\r\n\r\n');
+    const name = rawHeaders.match(/name="([^"]+)"/)?.[1];
+    const filename = rawHeaders.match(/filename="([^"]*)"/)?.[1];
+    const mimeType = rawHeaders.match(/Content-Type:\s*([^\r\n]+)/i)?.[1] || 'application/octet-stream';
+    const content = rawContent.replace(/\r\n$/, '');
+    if (!name) continue;
+    if (filename) files.push({ field: name, filename, mimeType, buffer: Buffer.from(content, 'binary') });
+    else fields[name] = Buffer.from(content, 'binary').toString('utf8');
+  }
+  return { fields, files };
+}
+
+async function readMultipart(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return parseMultipart(req, Buffer.concat(chunks));
+}
+
+async function probeMedia(filePath) {
+  try {
+    const { stdout } = await run(FFMPEG, ['-i', filePath, '-hide_banner']);
+    return stdout;
+  } catch (error) {
+    const text = error.message || '';
+    const duration = text.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+    return {
+      durationSeconds: duration ? Number(duration[1]) * 3600 + Number(duration[2]) * 60 + Number(duration[3]) : 0
+    };
+  }
+}
+
+async function thumbnailForUpload(filePath, uploadId) {
+  const output = path.join(STORAGE_DIR, 'thumbs', `${uploadId}.jpg`);
+  try {
+    await run(FFMPEG, ['-y', '-ss', '1', '-i', filePath, '-frames:v', '1', '-q:v', '3', output]);
+    return `/media/thumbs/${uploadId}.jpg`;
+  } catch (error) {
+    importLog('warn', 'thumbnail generation failed', { error: error.message });
+    return '';
+  }
+}
+
+async function importUploadedVideo(req) {
+  const maxBytes = Number(process.env.MAX_UPLOAD_BYTES || 500 * 1024 * 1024);
+  const { fields, files } = await readMultipart(req);
+  const file = files.find(item => item.field === 'video') || files[0];
+  if (!file) throw new Error('No video file was uploaded.');
+  if (file.buffer.length > maxBytes) throw new Error('File too large. Upload a smaller video file.');
+  const ext = path.extname(file.filename || '').toLowerCase();
+  const allowed = new Set(['.mp4', '.mov', '.webm', '.m4v']);
+  if (!allowed.has(ext)) throw new Error('Unsupported file type. Upload mp4, mov, webm, or m4v.');
+  const uploadId = randomUUID();
+  const storedName = `${uploadId}${ext}`;
+  const uploadPath = path.join(STORAGE_DIR, 'uploads', storedName);
+  writeFileSync(uploadPath, file.buffer);
+  const probe = await probeMedia(uploadPath);
+  const thumbnailUrl = await thumbnailForUpload(uploadPath, uploadId);
+  const title = fields.title || file.filename.replace(/\.[^.]+$/, '') || 'Uploaded video';
+  const video = classifyVideoForImport({
+    youtubeId: `upload_${uploadId}`,
+    url: `/media/uploads/${storedName}`,
+    title,
+    channelTitle: 'Uploaded file',
+    durationSeconds: Math.round(probe.durationSeconds || 0),
+    viewCount: 0,
+    publishedAt: new Date().toISOString(),
+    thumbnailUrl,
+    isShort: Number(probe.durationSeconds || 0) <= 90,
+    sourceKind: 'upload',
+    storagePath: uploadPath,
+    originalFilename: file.filename,
+    mimeType: file.mimeType,
+    status: 'imported'
+  }, { source: 'upload' }).video;
+  const db = loadDb();
+  const result = addImportedVideos(db, 'upload', 'upload', [video]);
+  saveDb(db);
+  return { ...result, source: 'upload', warnings: [], canonicalUrl: 'upload' };
 }
 
 function queueBackgroundProcess(videoId, options) {
@@ -908,6 +1117,25 @@ function demoMoments(video) {
   });
 }
 
+function fallbackMomentsForVideo(video) {
+  const duration = Math.max(5, Number(video.durationSeconds || 30));
+  const count = duration < 20 ? 1 : Math.min(3, Math.max(1, Math.floor(duration / 20)));
+  return Array.from({ length: count }).map((_, index) => {
+    const segmentLength = Math.min(60, Math.max(5, Math.floor(duration / count)));
+    const start = Math.min(Math.max(0, index * segmentLength), Math.max(0, duration - 5));
+    const end = Math.min(duration, Math.max(start + 5, start + segmentLength));
+    return {
+      start,
+      end,
+      score: Math.max(72, 88 - index * 5),
+      reason: video.isShort ? 'shorts-direct' : 'visual',
+      hook: video.isShort ? 'Ready for Shorts' : 'Strong visual moment',
+      rationale: video.isShort ? 'Imported as a short vertical source for direct remix/export.' : 'Fallback edit window created because transcript/captions were unavailable.',
+      text: video.title || 'Uploaded video clip'
+    };
+  });
+}
+
 async function buildDemoClip(db, video, moment, index) {
   const title = `${video.title}`.slice(0, 48);
   const hook = index === 0 ? 'This is the moment people will replay' : index === 1 ? 'Nobody explains this part clearly' : 'The ending changes the whole story';
@@ -1019,9 +1247,9 @@ async function processVideo(payload) {
   db.jobs.unshift(job);
   saveDb(db);
   try {
-    const ytdlpReady = await hasCommand(YTDLP);
+    const ytdlpReady = Boolean(await workingYtDlpCommand());
     const ffmpegReady = await hasCommand(FFMPEG);
-    if (!ytdlpReady || !ffmpegReady) {
+    if ((!ytdlpReady && video.sourceKind !== 'upload') || !ffmpegReady) {
       updateJob(job.id, { progress: 18, stage: 'demo mode: fetching metadata', steps: processingSteps('downloading', 18) });
       updateJob(job.id, { progress: 45, stage: 'demo mode: estimating viral moments', steps: processingSteps('viral', 45) });
       const clips = [];
@@ -1030,12 +1258,17 @@ async function processVideo(payload) {
       completeJobWithClips(job.id, video.id, clips);
       return { jobId: job.id, demoMode: true };
     }
-    const mediaPath = await downloadVideo(video);
+    const mediaPath = video.sourceKind === 'upload' ? video.storagePath : await downloadVideo(video);
     updateJob(job.id, { progress: 30, stage: 'transcribing', steps: processingSteps('transcribing', 30) });
-    const transcript = await getTranscript(video, mediaPath);
+    let transcript = [];
+    try {
+      transcript = video.sourceKind === 'upload' ? [] : await getTranscript(video, mediaPath);
+    } catch (error) {
+      updateJob(job.id, { progress: 44, stage: 'no transcript: using visual edit fallback', steps: processingSteps('transcribing', 44) });
+    }
     updateJob(job.id, { progress: 58, stage: 'finding viral moments', steps: processingSteps('viral', 58) });
-    const moments = await detectViralMoments(db, video, transcript);
-    if (!moments.length) throw new Error('Transcript did not contain a clean 15-60 second clipping window.');
+    const moments = transcript.length ? await detectViralMoments(db, video, transcript) : fallbackMomentsForVideo(video);
+    if (!moments.length) throw new Error('Could not create a clipping window for this video.');
     updateJob(job.id, { progress: 72, stage: 'creating vertical clips', steps: processingSteps('vertical', 72) });
     const rendered = [];
     for (let i = 0; i < moments.length; i += 1) rendered.push(await renderClip(db, video, mediaPath, moments[i], i));
@@ -1477,6 +1710,39 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/import' && req.method === 'POST') {
       const body = await readJson(req);
       return json(res, 200, await importSource(body.sourceUrl || ''));
+    }
+    if (pathname === '/api/upload' && req.method === 'POST') {
+      return json(res, 200, await importUploadedVideo(req));
+    }
+    if (pathname === '/api/debug/import') {
+      const debugUrl = new URL(req.url, `http://${req.headers.host}`).searchParams.get('url') || '';
+      const parsed = parseYouTubeUrl(debugUrl);
+      let apiVideos = [];
+      let ytdlpVideos = [];
+      let apiError = '';
+      let ytdlpError = '';
+      try {
+        if (parsed.type === 'video') apiVideos = [await fetchYouTubeVideoWithApi(parsed.id)].filter(Boolean);
+        else if (parsed.type === 'playlist') apiVideos = await fetchPlaylistWithApi(parsed.id) || [];
+        else apiVideos = await fetchChannelWithApi(parsed.canonical) || [];
+      } catch (error) {
+        apiError = error.message;
+      }
+      try {
+        ytdlpVideos = await fetchWithYtDlp(parsed.canonical);
+      } catch (error) {
+        ytdlpError = error.message;
+      }
+      const first = apiVideos[0] || ytdlpVideos[0] || null;
+      return json(res, 200, {
+        parsed,
+        title: first?.title || '',
+        durationSeconds: first?.durationSeconds || 0,
+        status: first ? 'public/importable' : 'unavailable',
+        rejectionReason: first ? '' : (apiError || ytdlpError || 'No public videos found'),
+        youtubeApi: { ok: Boolean(apiVideos.length), error: apiError },
+        ytdlp: { ok: Boolean(ytdlpVideos.length), error: ytdlpError }
+      });
     }
     if (pathname === '/api/watch-channel' && req.method === 'POST') {
       const body = await readJson(req);

@@ -61,6 +61,12 @@ function renderCreate() {
         <form id="importForm" class="source-form"><input id="sourceUrl" type="url" value="${esc(state.importUrl)}" placeholder="Paste YouTube video or channel link" required ${state.importing ? 'disabled' : ''}><button ${state.importing ? 'disabled' : ''}>${state.importing ? 'Fetching...' : 'Fetch videos'}</button></form>
         <div id="importMessage" class="message ${state.importStatus?.type === 'error' ? 'error' : ''}">${state.importStatus?.text || ''}</div>
         <div class="source-preview">${sourcePreview()}</div>
+        <div class="upload-box">
+          <span class="eyebrow">Backup option</span>
+          <h3>Upload from phone/file</h3>
+          <p>If YouTube import or download is blocked, upload your own mp4, mov, webm, or m4v file and create clips from it.</p>
+          <form id="uploadForm" class="stack"><input id="uploadVideo" type="file" accept="video/mp4,video/quicktime,video/webm,.m4v"><button ${state.importing ? 'disabled' : ''}>Upload video</button></form>
+        </div>
       </section>
       <section class="panel">
         <div class="panel-head"><div><span class="eyebrow">Step 2</span><h2>Select and generate</h2></div><span class="pill">${state.selected.size} selected</span></div>
@@ -75,6 +81,7 @@ function renderCreate() {
       </section>
     </div>`;
   $('#importForm').addEventListener('submit', importSource);
+  $('#uploadForm').addEventListener('submit', uploadSource);
   $$('#create [data-select]').forEach(b => b.addEventListener('click', () => { state.selected.has(b.dataset.select) ? state.selected.delete(b.dataset.select) : state.selected.add(b.dataset.select); renderCreate(); }));
   $('#processSelected').addEventListener('click', processSelected);
 }
@@ -86,7 +93,7 @@ function sourcePreview() {
 }
 function videoCards() {
   const videos = state.library.videos || [];
-  return videos.length ? videos.map(v => `<article class="video-card ${state.selected.has(v.id) ? 'selected' : ''}"><img src="${v.thumbnailUrl || ''}"><div><div class="meta"><span>${dur(v.durationSeconds)}</span><span>${fmt(v.viewCount)} views</span><span>${when(v.publishedAt)}</span></div><h3>${v.title}</h3><p>${v.channelTitle || 'YouTube'}</p><button class="ghost" data-select="${v.id}">${state.selected.has(v.id) ? 'Selected' : 'Select'}</button></div></article>`).join('') : empty('No videos imported yet.');
+  return videos.length ? videos.map(v => `<article class="video-card ${state.selected.has(v.id) ? 'selected' : ''}"><img src="${v.thumbnailUrl || ''}"><div><div class="meta"><span>${dur(v.durationSeconds)}</span><span>${v.sourceKind === 'upload' ? 'Uploaded file' : `${fmt(v.viewCount)} views`}</span><span>${v.isShort ? 'Shorts/direct' : 'Long-form'}</span><span>${when(v.publishedAt)}</span></div><h3>${v.title}</h3><p>${v.channelTitle || 'YouTube'} ${v.importWarning ? `• ${v.importWarning}` : ''}</p><button class="ghost" data-select="${v.id}">${state.selected.has(v.id) ? 'Selected' : 'Select'}</button></div></article>`).join('') : empty('No videos imported yet.');
 }
 async function importSource(e) {
   e.preventDefault();
@@ -105,6 +112,34 @@ async function importSource(e) {
   } catch (err) {
     state.importing = false;
     state.importStatus = { type: 'error', text: err.message || 'Import failed. Try another YouTube link.' };
+    renderCreate();
+  }
+}
+async function uploadSource(e) {
+  e.preventDefault();
+  const file = $('#uploadVideo').files?.[0];
+  if (!file) {
+    state.importStatus = { type: 'error', text: 'Choose a video file first.' };
+    renderCreate();
+    return;
+  }
+  state.importing = true;
+  state.importStatus = { type: 'loading', text: `Uploading ${file.name}...` };
+  renderCreate();
+  try {
+    const form = new FormData();
+    form.append('video', file);
+    form.append('title', file.name.replace(/\.[^.]+$/, ''));
+    const res = await fetch('/api/upload', { method: 'POST', headers: { 'x-user-id': uid() }, body: form });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Upload failed.');
+    state.importStatus = { type: 'success', text: `Uploaded ${data.videos.length} video file. Select it below to generate clips.` };
+    await loadAll();
+    state.importing = false;
+    setView('create');
+  } catch (err) {
+    state.importing = false;
+    state.importStatus = { type: 'error', text: err.message || 'Upload failed.' };
     renderCreate();
   }
 }
