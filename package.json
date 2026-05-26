@@ -1,0 +1,13 @@
+{
+  "name": "clipforge-ai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI clipping SaaS MVP for owned or permissioned YouTube videos.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

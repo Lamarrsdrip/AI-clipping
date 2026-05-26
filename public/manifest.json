@@ -1,0 +1,16 @@
+{
+  "name": "ClipForge AI",
+  "short_name": "ClipForge",
+  "description": "Generate ready-to-post short clips from YouTube videos with captions and manual posting guides.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f8fb",
+  "theme_color": "#101828",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#101828">
+    <title>ClipForge AI</title>
+    <link rel="manifest" href="/manifest.json">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <section id="authShell" class="auth-shell">
+      <form id="authForm" class="auth-card">
+        <div class="brand"><span>CF</span><b>ClipForge AI</b></div>
+        <h1>Ready-to-post shorts, no account linking.</h1>
+        <p>Generate original, transformed, ready-to-post clips. Pay for credits by local bank transfer and post manually.</p>
+        <input id="authEmail" type="email" placeholder="Email" required>
+        <input id="authPassword" type="password" placeholder="Password" required>
+        <button id="authSubmit" type="submit">Login</button>
+        <div class="auth-links"><button type="button" class="text-btn" id="toggleAuth">Create account</button><button type="button" class="text-btn" id="forgotPassword">Forgot password?</button></div>
+        <div id="authMessage" class="message"></div>
+      </form>
+    </section>
+
+    <div id="appShell" class="app-shell hidden">
+      <aside class="side-nav">
+        <div class="brand"><span>CF</span><b>ClipForge</b></div>
+        <nav id="sideNav"></nav>
+        <div class="user-box"><b id="userName">User</b><small id="userPlan">Credits</small></div>
+      </aside>
+
+      <main class="main">
+        <header class="app-top">
+          <div><span id="pageEyebrow" class="eyebrow">Home</span><h1 id="pageTitle">Manual Posting Assistant</h1></div>
+          <button class="icon-btn" data-view-jump="settings" title="Settings">⚙</button>
+        </header>
+
+        <section id="home" class="view active"></section>
+        <section id="create" class="view"></section>
+        <section id="clips" class="view"></section>
+        <section id="clipDetail" class="view"></section>
+        <section id="billing" class="view"></section>
+        <section id="settings" class="view"></section>
+        <section id="admin" class="view"></section>
+      </main>
+
+      <nav id="bottomNav" class="bottom-nav"></nav>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
