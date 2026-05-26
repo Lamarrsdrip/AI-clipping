@@ -145,13 +145,28 @@ async function uploadSource(e) {
 }
 async function processSelected() {
   if (!$('#rightsBulk').checked) return alert('Confirm permission first.');
-  for (const videoId of state.selected) await api('/api/process', { method: 'POST', body: JSON.stringify({ videoId, rightsConfirmed: true }) });
-  state.selected.clear();
-  await loadAll(); setView('clips');
+  const selected = [...state.selected];
+  if (!selected.length) return alert('Select at least one video first.');
+  const button = $('#processSelected');
+  button.disabled = true;
+  button.textContent = 'Starting job...';
+  state.importStatus = { type: 'loading', text: 'Starting clip generation. You will see progress on the Clips page.' };
+  renderCreate();
+  try {
+    await Promise.all(selected.map(videoId => api('/api/process', { method: 'POST', body: JSON.stringify({ videoId, rightsConfirmed: true }) })));
+    state.selected.clear();
+    await loadAll();
+    setView('clips');
+  } catch (err) {
+    state.importStatus = { type: 'error', text: err.message || 'Could not start clip generation.' };
+    await loadAll();
+    setView('create');
+  }
 }
 function jobCard(j) {
   const v = state.library.videos?.find(x => x.id === j.videoId);
-  return `<article class="admin-card"><div class="panel-head"><div><b>${v?.title || 'Video'}</b><p>${j.stage}${j.error ? ` • ${j.error}` : ''}</p></div><span class="pill ${j.status === 'complete' ? 'ok' : j.status === 'failed' ? 'bad' : 'warn'}">${j.status}</span></div><div class="progress"><span style="width:${j.progress || 0}%"></span></div></article>`;
+  const blocked = /Upload the video file instead/i.test(j.error || '');
+  return `<article class="admin-card"><div class="panel-head"><div><b>${v?.title || 'Video'}</b><p>${j.stage}${j.error ? ` • ${esc(j.error)}` : ''}</p></div><span class="pill ${j.status === 'complete' ? 'ok' : j.status === 'failed' ? 'bad' : 'warn'}">${j.status}</span></div><div class="progress"><span style="width:${j.progress || 0}%"></span></div>${blocked ? '<div class="actions"><button data-view-jump="create">Upload file instead</button></div>' : ''}</article>`;
 }
 
 function renderClips() {
@@ -346,6 +361,16 @@ function setView(view) {
   if (view === 'billing') renderBilling();
   if (view === 'admin') renderAdmin();
 }
+
+setInterval(async () => {
+  if (!uid() || !state.library?.jobs?.some(job => !['complete', 'completed', 'failed'].includes(job.status))) return;
+  const activeView = $('.view.active')?.id || 'home';
+  try {
+    await loadAll();
+    setView(activeView);
+  } catch {}
+}, 5000);
+
 function renderNav() {
   const items = [...nav, ...(state.user?.role === 'admin' ? [['admin', '◆', 'Admin']] : [])];
   $('#sideNav').innerHTML = items.map(([id, icon, label]) => `<a href="#${id}" data-view="${id}">${icon} ${label}</a>`).join('');

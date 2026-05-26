@@ -5,6 +5,7 @@ ENV HOST=0.0.0.0
 ENV PORT=10000
 ENV YTDLP_PATH=yt-dlp
 ENV FFMPEG_PATH=ffmpeg
+ENV YTDLP_JS_RUNTIME=node
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip ca-certificates \

@@ -35,6 +35,10 @@ const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
 const CREDITS_ENABLED = process.env.CREDITS_ENABLED === 'true';
 const CLIP_JOB_CREDIT_COST = Number(process.env.CLIP_JOB_CREDIT_COST || 5);
 const MIN_CLIP_SOURCE_SECONDS = Number(process.env.MIN_CLIP_SOURCE_SECONDS || 15);
+const IMPORT_RATE_LIMIT_MS = Number(process.env.IMPORT_RATE_LIMIT_MS || 8000);
+const YTDLP_BLOCK_COOLDOWN_MS = Number(process.env.YTDLP_BLOCK_COOLDOWN_MS || 15 * 60 * 1000);
+const importAttempts = new Map();
+const ytdlpBlock = { until: 0, reason: '' };
 
 mkdirSync(DATA_DIR, { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'originals'), { recursive: true });
@@ -366,6 +370,17 @@ async function workingYtDlpCommand() {
   return '';
 }
 
+async function ytDlpBaseArgs() {
+  const args = [];
+  const runtime = String(process.env.YTDLP_JS_RUNTIME || 'node').trim();
+  if (runtime && runtime.toLowerCase() !== 'none') {
+    const runtimeName = runtime.split(':')[0];
+    if (await hasCommand(runtimeName)) args.push('--js-runtimes', runtime);
+    else importLog('warn', 'yt-dlp JavaScript runtime not found', { runtime });
+  }
+  return args;
+}
+
 async function commandVersion(command) {
   try {
     const { stdout, stderr } = await run(command, command === FFMPEG ? ['-version'] : ['--version']);
@@ -404,6 +419,40 @@ function friendlyYouTubeApiError(status, body = '') {
   if (status === 403 && /quota/i.test(reason)) return 'YouTube API quota exceeded. Trying yt-dlp fallback.';
   if (status === 403) return `YouTube API key is invalid, restricted, or missing permission${reason ? ` (${reason})` : ''}. Trying yt-dlp fallback.`;
   return `YouTube API failed with ${status}${reason ? ` (${reason})` : ''}. Trying yt-dlp fallback.`;
+}
+
+function ytDlpBlockedByYouTube(message = '') {
+  return /HTTP Error 429|Too Many Requests|Sign in to confirm you.?re not a bot|confirm you.?re not a bot/i.test(String(message));
+}
+
+function friendlyYtDlpError(error) {
+  const text = String(error?.message || error || '');
+  if (/YouTube blocked server download/i.test(text)) return 'YouTube blocked server download. Upload the video file instead.';
+  if (ytDlpBlockedByYouTube(text)) return 'YouTube blocked server download. Upload the video file instead.';
+  if (/private video/i.test(text)) return 'Private video. Try a public video link or upload the file instead.';
+  if (/members-only|members only/i.test(text)) return 'Members-only video. Upload a file you have permission to reuse.';
+  if (/age.?restricted/i.test(text)) return 'Age-restricted video. Upload a permitted file instead.';
+  if (/Unsupported URL|not a valid URL/i.test(text)) return 'Unsupported YouTube link. Paste a video, Shorts, playlist, channel, or @handle URL.';
+  if (/No supported JavaScript runtime/i.test(text)) return 'Server video downloader needs a JavaScript runtime. Redeploy the Docker service, then try again or upload the file.';
+  return 'YouTube download failed. Upload the video file instead.';
+}
+
+function rememberYtDlpBlock(error) {
+  const message = String(error?.message || error || '');
+  if (!ytDlpBlockedByYouTube(message)) return;
+  ytdlpBlock.until = Date.now() + YTDLP_BLOCK_COOLDOWN_MS;
+  ytdlpBlock.reason = friendlyYtDlpError(error);
+  importLog('warn', 'yt-dlp paused after YouTube bot/rate-limit block', {
+    cooldownSeconds: Math.round(YTDLP_BLOCK_COOLDOWN_MS / 1000),
+    raw: message.slice(0, 1200)
+  });
+}
+
+function assertYtDlpNotCoolingDown() {
+  if (Date.now() < ytdlpBlock.until) {
+    const seconds = Math.ceil((ytdlpBlock.until - Date.now()) / 1000);
+    throw new Error(`${ytdlpBlock.reason || 'YouTube blocked server download. Upload the video file instead.'} Try server download again in ${seconds}s.`);
+  }
 }
 
 function parseYouTubeUrl(input) {
@@ -593,9 +642,18 @@ async function fetchWithYtDlp(source) {
     importLog('error', 'yt-dlp missing', { tried: ytdlpCandidates().join(', ') });
     throw new Error('yt-dlp is not installed on the server. Deploy with Docker or install yt-dlp from requirements.txt so imports can fallback when the YouTube API fails.');
   }
-  const args = ['--dump-single-json', '--skip-download', '--no-warnings', '--ignore-no-formats-error', '--playlist-end', '12', source];
+  assertYtDlpNotCoolingDown();
+  const args = [...(await ytDlpBaseArgs()), '--dump-single-json', '--skip-download', '--no-warnings', '--ignore-no-formats-error', '--playlist-end', '12', source];
   importLog('log', 'yt-dlp metadata fallback started', { source, command: ytdlpCommand });
-  const { stdout, stderr } = await run(ytdlpCommand, args);
+  let stdout = '';
+  let stderr = '';
+  try {
+    ({ stdout, stderr } = await run(ytdlpCommand, args));
+  } catch (error) {
+    rememberYtDlpBlock(error);
+    importLog('error', 'yt-dlp metadata failed', { source, raw: String(error.message || error).slice(0, 1200) });
+    throw new Error(friendlyYtDlpError(error));
+  }
   if (stderr) importLog('warn', 'yt-dlp metadata warnings', { stderr: stderr.slice(0, 500) });
   let data;
   try {
@@ -688,6 +746,11 @@ async function fetchSourceVideos(sourceUrl) {
     importLog('log', 'metadata cache hit', { source: parsed.canonical, count: cached.videos.length });
     return { parsed, videos: cached.videos, source: 'cache', warnings: cached.warnings || [] };
   }
+  const lastAttempt = importAttempts.get(cacheKey) || 0;
+  if (Date.now() - lastAttempt < IMPORT_RATE_LIMIT_MS) {
+    throw new Error('Please wait a few seconds before importing this YouTube link again.');
+  }
+  importAttempts.set(cacheKey, Date.now());
   let videos = [];
   const warnings = [];
   let source = 'youtube-api';
@@ -969,8 +1032,15 @@ async function pollWatchedChannel(watchId) {
 async function downloadVideo(video) {
   const ytdlpCommand = await workingYtDlpCommand();
   if (!ytdlpCommand) throw new Error('yt-dlp is required to download owned or permissioned source videos.');
+  assertYtDlpNotCoolingDown();
   const output = path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.%(ext)s`);
-  await run(ytdlpCommand, ['-f', 'bv*[height<=1080]+ba/b[height<=1080]', '--merge-output-format', 'mp4', '-o', output, video.url]);
+  try {
+    await run(ytdlpCommand, [...(await ytDlpBaseArgs()), '-f', 'bv*[height<=1080]+ba/b[height<=1080]', '--merge-output-format', 'mp4', '-o', output, video.url]);
+  } catch (error) {
+    rememberYtDlpBlock(error);
+    importLog('error', 'yt-dlp download failed', { videoId: video.youtubeId, title: video.title, raw: String(error.message || error).slice(0, 1600) });
+    throw new Error(friendlyYtDlpError(error));
+  }
   const files = await readdir(path.join(STORAGE_DIR, 'originals'));
   const found = files.find(file => file.startsWith(video.youtubeId) && file.endsWith('.mp4'));
   if (!found) throw new Error('yt-dlp completed but no mp4 output was found.');
@@ -986,7 +1056,7 @@ async function getTranscript(video, mediaPath) {
   try {
     const ytdlpCommand = await workingYtDlpCommand();
     if (ytdlpCommand) {
-      await run(ytdlpCommand, ['--skip-download', '--write-auto-subs', '--sub-lang', 'en', '--sub-format', 'json3', '-o', path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.%(ext)s`), video.url]);
+      await run(ytdlpCommand, [...(await ytDlpBaseArgs()), '--skip-download', '--write-auto-subs', '--sub-lang', 'en', '--sub-format', 'json3', '-o', path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.%(ext)s`), video.url]);
     }
   } catch {
     // Keep the pipeline provider-neutral. LLM calls analyze transcripts; audio transcription is configured separately.
@@ -1223,7 +1293,12 @@ async function processVideo(payload) {
     completeJobWithClips(job.id, video.id, rendered);
     return { jobId: job.id };
   } catch (error) {
-    updateJob(job.id, { status: 'failed', progress: 100, stage: 'failed', error: error.message });
+    const rawError = String(error.message || error);
+    const cleanError = ytDlpBlockedByYouTube(rawError) || /No supported JavaScript runtime|YouTube download failed|YouTube blocked server download/i.test(rawError)
+      ? friendlyYtDlpError(error)
+      : rawError;
+    if (cleanError !== rawError) console.error('[job:error]', { jobId: job.id, raw: rawError.slice(0, 2000), clean: cleanError });
+    updateJob(job.id, { status: 'failed', progress: 100, stage: 'failed', error: cleanError });
     throw error;
   }
 }
@@ -1778,8 +1853,9 @@ async function handleApi(req, res, pathname) {
     }
     if (pathname === '/api/process' && req.method === 'POST') {
       const body = await readJson(req);
-      const result = await processVideo(body);
-      return json(res, 200, result);
+      const jobPromise = processVideo(body);
+      jobPromise.catch(error => console.error('[job:background-failed]', String(error.message || error).slice(0, 2000)));
+      return json(res, 202, { queued: true });
     }
     if (pathname === '/api/clip' && req.method === 'PATCH') {
       const body = await readJson(req);
