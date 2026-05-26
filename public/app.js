@@ -1,6 +1,6 @@
 const $ = s => document.querySelector(s);
 const $$ = s => Array.from(document.querySelectorAll(s));
-const state = { user: null, session: null, library: {}, selected: new Set(), clip: null, authMode: 'login', bank: null, importing: false, importStatus: null, importUrl: '' };
+const state = { user: null, session: null, library: {}, selected: new Set(), activeVideoIds: null, clip: null, authMode: 'login', bank: null, importing: false, importStatus: null, importUrl: '', uploadProgress: 0 };
 const nav = [['home', '⌂', 'Home'], ['create', '＋', 'Create'], ['clips', '⇩', 'Clips'], ['billing', '◇', 'Billing'], ['settings', '⚙', 'Settings']];
 const platforms = ['TikTok', 'Instagram Reels', 'Facebook Reels', 'YouTube Shorts', 'X'];
 
@@ -56,16 +56,19 @@ function renderCreate() {
     <div class="create-grid">
       <section class="panel">
         <span class="eyebrow">Step 1</span>
-        <h2>Paste YouTube link</h2>
-        <p>Use a video link or channel link. We show the video details first so you can choose what to clip.</p>
-        <form id="importForm" class="source-form"><input id="sourceUrl" type="url" value="${esc(state.importUrl)}" placeholder="Paste YouTube video or channel link" required ${state.importing ? 'disabled' : ''}><button ${state.importing ? 'disabled' : ''}>${state.importing ? 'Fetching...' : 'Fetch videos'}</button></form>
+        <h2>Upload video from phone/file</h2>
+        <p>This is the main workflow. Upload your mp4, mov, webm, or m4v file, then the app renders vertical 9:16 clips with captions and hook text.</p>
         <div id="importMessage" class="message ${state.importStatus?.type === 'error' ? 'error' : ''}">${state.importStatus?.text || ''}</div>
+        <div class="upload-box primary-upload">
+          <form id="uploadForm" class="stack"><input id="uploadVideo" type="file" accept="video/mp4,video/quicktime,video/webm,.m4v"><button ${state.importing ? 'disabled' : ''}>${state.importing ? 'Uploading...' : 'Upload video'}</button></form>
+          ${state.importing && state.uploadProgress ? `<div class="progress"><span style="width:${state.uploadProgress}%"></span></div><p class="muted">${state.uploadProgress}% uploaded</p>` : ''}
+        </div>
         <div class="source-preview">${sourcePreview()}</div>
-        <div class="upload-box">
-          <span class="eyebrow">Backup option</span>
-          <h3>Upload from phone/file</h3>
-          <p>If YouTube import or download is blocked, upload your own mp4, mov, webm, or m4v file and create clips from it.</p>
-          <form id="uploadForm" class="stack"><input id="uploadVideo" type="file" accept="video/mp4,video/quicktime,video/webm,.m4v"><button ${state.importing ? 'disabled' : ''}>Upload video</button></form>
+        <div class="youtube-option">
+          <span class="eyebrow">Optional</span>
+          <h3>Import YouTube metadata</h3>
+          <p>YouTube can block server downloads on Render. If that happens, upload the file above and keep creating clips.</p>
+          <form id="importForm" class="source-form"><input id="sourceUrl" type="text" inputmode="url" value="${esc(state.importUrl)}" placeholder="Paste YouTube video, Shorts, channel, or playlist link" ${state.importing ? 'disabled' : ''}><button ${state.importing ? 'disabled' : ''}>Fetch</button></form>
         </div>
       </section>
       <section class="panel">
@@ -86,24 +89,40 @@ function renderCreate() {
   $('#processSelected').addEventListener('click', processSelected);
 }
 function sourcePreview() {
-  if (state.importing) return `<div class="import-loading"><div class="spinner"></div><b>Reading YouTube metadata</b><p>Checking the YouTube API first. If it fails, the server will automatically try yt-dlp.</p><div class="progress"><span style="width:62%"></span></div></div>`;
-  const v = state.library.videos?.[0];
-  if (v) return `<article class="project-card import-success"><img class="project-thumb" src="${v.thumbnailUrl || ''}"><span class="pill ok">Ready</span><h3>${v.channelTitle || 'YouTube source'}</h3><p>${state.library.videos.length} imported video${state.library.videos.length === 1 ? '' : 's'}. Select which ones to clip.</p></article>`;
-  return empty(state.importStatus?.type === 'error' ? 'Nothing imported yet. Check the message above, then try another YouTube video/channel or ask admin to install yt-dlp on the server.' : 'Paste a YouTube video or channel link. We will show thumbnails, title, duration, views, and upload date.');
+  if (state.importing) return `<div class="import-loading"><div class="spinner"></div><b>Working on your video</b><p>${state.uploadProgress ? 'Uploading the file and preparing a thumbnail preview.' : 'Reading YouTube metadata if a link was submitted.'}</p><div class="progress"><span style="width:${state.uploadProgress || 62}%"></span></div></div>`;
+  const visible = activeVideos();
+  const v = visible[0];
+  if (v) return `<article class="project-card import-success"><img class="project-thumb" src="${v.thumbnailUrl || ''}"><span class="pill ok">Ready</span><h3>${v.title || v.channelTitle || 'Uploaded source'}</h3><p>${visible.length} video${visible.length === 1 ? '' : 's'} ready. Select one below, choose clip length, then generate.</p></article>`;
+  return empty(state.importStatus?.type === 'error' ? 'Nothing ready yet. Upload the video file from your phone, or try another YouTube link.' : 'Upload a video file to generate a thumbnail preview and start clipping.');
+}
+function activeVideos() {
+  const videos = state.library.videos || [];
+  if (!state.activeVideoIds?.length) return videos;
+  const active = videos.filter(v => state.activeVideoIds.includes(v.id));
+  return active.length ? active : videos;
 }
 function videoCards() {
-  const videos = state.library.videos || [];
+  const videos = activeVideos();
   return videos.length ? videos.map(v => `<article class="video-card ${state.selected.has(v.id) ? 'selected' : ''}"><img src="${v.thumbnailUrl || ''}"><div><div class="meta"><span>${dur(v.durationSeconds)}</span><span>${v.sourceKind === 'upload' ? 'Uploaded file' : `${fmt(v.viewCount)} views`}</span><span>${v.isShort ? 'Shorts/direct' : 'Long-form'}</span><span>${when(v.publishedAt)}</span></div><h3>${v.title}</h3><p>${v.channelTitle || 'YouTube'} ${v.importWarning ? `• ${v.importWarning}` : ''}</p><button class="ghost" data-select="${v.id}">${state.selected.has(v.id) ? 'Selected' : 'Select'}</button></div></article>`).join('') : empty('No videos imported yet.');
 }
 async function importSource(e) {
   e.preventDefault();
-  const sourceUrl = $('#sourceUrl').value;
+  const sourceUrl = $('#sourceUrl').value.trim();
+  if (!sourceUrl) {
+    state.importStatus = { type: 'error', text: 'Paste a YouTube link first, or upload a video file above.' };
+    renderCreate();
+    return;
+  }
   state.importUrl = sourceUrl;
   state.importing = true;
+  state.uploadProgress = 0;
+  state.activeVideoIds = null;
+  state.selected.clear();
   state.importStatus = { type: 'loading', text: 'Fetching YouTube metadata...' };
   renderCreate();
   try {
     const res = await api('/api/import', { method: 'POST', body: JSON.stringify({ sourceUrl }) });
+    state.activeVideoIds = (res.videos || []).map(v => v.id);
     state.importStatus = { type: 'success', text: `Imported ${res.videos.length} video${res.videos.length === 1 ? '' : 's'} using ${res.source || 'metadata'}.` };
     if (res.warnings?.length) state.importStatus.text += ` ${res.warnings[0]}`;
     await loadAll();
@@ -123,25 +142,60 @@ async function uploadSource(e) {
     renderCreate();
     return;
   }
+  const allowed = ['mp4', 'mov', 'webm', 'm4v'];
+  const ext = file.name.split('.').pop().toLowerCase();
+  if (!allowed.includes(ext)) {
+    state.importStatus = { type: 'error', text: 'Unsupported format. Upload mp4, mov, webm, or m4v.' };
+    renderCreate();
+    return;
+  }
   state.importing = true;
+  state.uploadProgress = 1;
+  state.importUrl = '';
+  state.activeVideoIds = [];
+  state.selected.clear();
   state.importStatus = { type: 'loading', text: `Uploading ${file.name}...` };
   renderCreate();
   try {
     const form = new FormData();
     form.append('video', file);
     form.append('title', file.name.replace(/\.[^.]+$/, ''));
-    const res = await fetch('/api/upload', { method: 'POST', headers: { 'x-user-id': uid() }, body: form });
-    const data = await res.json();
-    if (!res.ok || data.error) throw new Error(data.error || 'Upload failed.');
-    state.importStatus = { type: 'success', text: `Uploaded ${data.videos.length} video file. Select it below to generate clips.` };
+    const data = await uploadWithProgress(form);
+    state.activeVideoIds = (data.videos || []).map(v => v.id);
+    state.selected = new Set(state.activeVideoIds);
+    state.uploadProgress = 100;
+    state.importStatus = { type: 'success', text: `Uploaded ${data.videos.length} video file. Thumbnail ready. Select clip length and generate clips.` };
     await loadAll();
     state.importing = false;
+    state.uploadProgress = 0;
     setView('create');
   } catch (err) {
     state.importing = false;
+    state.uploadProgress = 0;
     state.importStatus = { type: 'error', text: err.message || 'Upload failed.' };
     renderCreate();
   }
+}
+function uploadWithProgress(form) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload');
+    xhr.setRequestHeader('x-user-id', uid());
+    xhr.upload.onprogress = event => {
+      if (!event.lengthComputable) return;
+      state.uploadProgress = Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100)));
+      state.importStatus = { type: 'loading', text: `Uploading video... ${state.uploadProgress}%` };
+      renderCreate();
+    };
+    xhr.onerror = () => reject(new Error('Upload failed. Check your connection and try again.'));
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText || '{}'); } catch { return reject(new Error('Upload failed. Server returned an invalid response.')); }
+      if (xhr.status >= 400 || data.error) reject(new Error(data.error || 'Upload failed.'));
+      else resolve(data);
+    };
+    xhr.send(form);
+  });
 }
 async function processSelected() {
   if (!$('#rightsBulk').checked) return alert('Confirm permission first.');
@@ -150,10 +204,12 @@ async function processSelected() {
   const button = $('#processSelected');
   button.disabled = true;
   button.textContent = 'Starting job...';
+  const clipCount = Number($('#clipCount')?.value || 3);
+  const clipLength = Number($('#clipLength')?.value || 15);
   state.importStatus = { type: 'loading', text: 'Starting clip generation. You will see progress on the Clips page.' };
   renderCreate();
   try {
-    await Promise.all(selected.map(videoId => api('/api/process', { method: 'POST', body: JSON.stringify({ videoId, rightsConfirmed: true }) })));
+    await Promise.all(selected.map(videoId => api('/api/process', { method: 'POST', body: JSON.stringify({ videoId, rightsConfirmed: true, clipCount, clipLength }) })));
     state.selected.clear();
     await loadAll();
     setView('clips');
@@ -166,12 +222,18 @@ async function processSelected() {
 function jobCard(j) {
   const v = state.library.videos?.find(x => x.id === j.videoId);
   const blocked = /Upload the video file instead/i.test(j.error || '');
-  return `<article class="admin-card"><div class="panel-head"><div><b>${v?.title || 'Video'}</b><p>${j.stage}${j.error ? ` • ${esc(j.error)}` : ''}</p></div><span class="pill ${j.status === 'complete' ? 'ok' : j.status === 'failed' ? 'bad' : 'warn'}">${j.status}</span></div><div class="progress"><span style="width:${j.progress || 0}%"></span></div>${blocked ? '<div class="actions"><button data-view-jump="create">Upload file instead</button></div>' : ''}</article>`;
+  return `<article class="admin-card"><div class="panel-head"><div><b>${v?.title || 'Video'}</b><p>${j.stage}${j.error ? ` • ${esc(j.error)}` : ''}</p></div><span class="pill ${j.status === 'complete' ? 'ok' : j.status === 'failed' ? 'bad' : 'warn'}">${j.status}</span></div><div class="progress"><span style="width:${j.progress || 0}%"></span></div>${j.status === 'failed' ? `<div class="actions"><button data-retry-job="${j.id}">Retry</button><button class="ghost" data-delete-job="${j.id}">Delete</button>${blocked ? '<button data-view-jump="create">Upload file instead</button>' : ''}</div>` : ''}</article>`;
 }
 
 function renderClips() {
   const clips = (state.library.clips || []).filter(c => c.outputPath && !c.demoMode);
-  const jobs = (state.library.jobs || []).filter(j => !['complete', 'completed'].includes(j.status));
+  const seen = new Set();
+  const jobs = (state.library.jobs || []).filter(j => !['complete', 'completed'].includes(j.status)).filter(j => {
+    const key = j.status === 'failed' ? `${j.videoId}:${j.status}:${j.error}` : j.id;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
   $('#clips').innerHTML = `${jobs.length ? `<section class="panel"><h2>Processing</h2>${jobs.map(jobCard).join('')}</section>` : ''}${clips.length ? `<div class="panel-head"><div><span class="eyebrow">Library</span><h2>Ready clips</h2></div><button data-view-jump="create">Create more</button></div><div class="card-grid">${clips.map(clipCard).join('')}</div>` : `<section class="panel empty-state"><h2>No clips generated yet</h2><p>Create clips from a YouTube link or upload a video file. Real rendered clips will appear here after FFmpeg finishes.</p><button data-view-jump="create">Create clips</button></section>`}`;
 }
 function clipCard(c) {
@@ -469,6 +531,10 @@ document.addEventListener('click', e => {
   if (approve) api('/api/admin/payments', { method: 'PATCH', body: JSON.stringify({ paymentId: approve.dataset.approvePayment, status: 'approved' }) }).then(loadAll).then(renderAdmin);
   const reject = e.target.closest('[data-reject-payment]');
   if (reject) api('/api/admin/payments', { method: 'PATCH', body: JSON.stringify({ paymentId: reject.dataset.rejectPayment, status: 'rejected' }) }).then(loadAll).then(renderAdmin);
+  const retryJob = e.target.closest('[data-retry-job]');
+  if (retryJob) api('/api/job', { method: 'PATCH', body: JSON.stringify({ jobId: retryJob.dataset.retryJob, action: 'retry' }) }).then(loadAll).then(() => setView('clips'));
+  const deleteJob = e.target.closest('[data-delete-job]');
+  if (deleteJob) api('/api/job', { method: 'PATCH', body: JSON.stringify({ jobId: deleteJob.dataset.deleteJob, action: 'delete' }) }).then(loadAll).then(() => setView('clips'));
 });
 $('#authForm').addEventListener('submit', async e => {
   e.preventDefault();

@@ -904,16 +904,16 @@ async function thumbnailForUpload(filePath, uploadId) {
     return `/media/thumbs/${uploadId}.jpg`;
   } catch (error) {
     importLog('warn', 'thumbnail generation failed', { error: error.message });
-    return '';
+    throw new Error(`FFmpeg thumbnail failed: ${String(error.message || error).slice(0, 220)}`);
   }
 }
 
 async function importUploadedVideo(req) {
-  const maxBytes = Number(process.env.MAX_UPLOAD_BYTES || 500 * 1024 * 1024);
+  const maxBytes = Number(process.env.MAX_UPLOAD_BYTES || 0);
   const { fields, files } = await readMultipart(req);
   const file = files.find(item => item.field === 'video') || files[0];
   if (!file) throw new Error('No video file was uploaded.');
-  if (file.buffer.length > maxBytes) throw new Error('File too large. Upload a smaller video file.');
+  if (maxBytes > 0 && file.buffer.length > maxBytes) throw new Error(`File too large. Max upload is ${Math.round(maxBytes / 1024 / 1024)}MB.`);
   const ext = path.extname(file.filename || '').toLowerCase();
   const allowed = new Set(['.mp4', '.mov', '.webm', '.m4v']);
   if (!allowed.has(ext)) throw new Error('Unsupported file type. Upload mp4, mov, webm, or m4v.');
@@ -1168,11 +1168,13 @@ async function renderClip(db, video, mediaPath, moment, index) {
   };
 }
 
-function fallbackMomentsForVideo(video) {
+function fallbackMomentsForVideo(video, options = {}) {
   const duration = Math.max(5, Number(video.durationSeconds || 30));
-  const count = duration < 20 ? 1 : Math.min(3, Math.max(1, Math.floor(duration / 20)));
+  const wantedCount = Math.max(1, Math.min(10, Number(options.clipCount || 3)));
+  const wantedLength = Math.max(5, Math.min(60, Number(options.clipLength || 15)));
+  const count = duration < wantedLength ? 1 : Math.min(wantedCount, Math.max(1, Math.floor(duration / wantedLength)));
   return Array.from({ length: count }).map((_, index) => {
-    const segmentLength = Math.min(60, Math.max(5, Math.floor(duration / count)));
+    const segmentLength = Math.min(wantedLength, Math.min(60, Math.max(5, Math.floor(duration / count))));
     const start = Math.min(Math.max(0, index * segmentLength), Math.max(0, duration - 5));
     const end = Math.min(duration, Math.max(start + 5, start + segmentLength));
     return {
@@ -1240,6 +1242,10 @@ function processingSteps(stage, progress) {
 
 async function processVideo(payload) {
   const { videoId, rightsConfirmed, fairUseMode, transformationNote } = payload;
+  const clipOptions = {
+    clipCount: Math.max(1, Math.min(10, Number(payload.clipCount || 3))),
+    clipLength: Math.max(5, Math.min(60, Number(payload.clipLength || 15)))
+  };
   if (!rightsConfirmed) throw new Error('Confirm that you own this video or have permission to reuse it before processing.');
   if (fairUseMode && !String(transformationNote || '').trim()) {
     throw new Error('Fair-use/remix mode requires a commentary, reaction, education, or transformation note.');
@@ -1285,7 +1291,7 @@ async function processVideo(payload) {
       updateJob(job.id, { progress: 44, stage: 'no transcript: using visual edit fallback', steps: processingSteps('transcribing', 44) });
     }
     updateJob(job.id, { progress: 58, stage: 'finding viral moments', steps: processingSteps('viral', 58) });
-    const moments = transcript.length ? await detectViralMoments(db, video, transcript) : fallbackMomentsForVideo(video);
+    const moments = transcript.length ? await detectViralMoments(db, video, transcript, clipOptions) : fallbackMomentsForVideo(video, clipOptions);
     if (!moments.length) throw new Error('Could not create a clipping window for this video.');
     updateJob(job.id, { progress: 72, stage: 'creating vertical clips', steps: processingSteps('vertical', 72) });
     const rendered = [];
@@ -1516,15 +1522,17 @@ async function testAiConnection(db) {
   };
 }
 
-async function detectViralMoments(db, video, segments) {
-  const fallbackMoments = scoreMoments(segments, video.durationSeconds);
+async function detectViralMoments(db, video, segments, options = {}) {
+  const desiredLength = Math.max(5, Math.min(60, Number(options.clipLength || 15)));
+  const desiredCount = Math.max(1, Math.min(10, Number(options.clipCount || 3)));
+  const fallbackMoments = scoreMoments(segments, video.durationSeconds).slice(0, desiredCount);
   const transcript = segments.map(seg => `[${Math.round(seg.start)}-${Math.round(seg.end)}] ${seg.text}`).join('\n').slice(0, 16000);
   try {
     const result = await aiChat(db, {
       purpose: 'viral moment detection',
       messages: [
         { role: 'system', content: 'You find short-form viral moments from transcripts. Return only JSON.' },
-        { role: 'user', content: `Video title: ${video.title}\nDuration seconds: ${video.durationSeconds || 0}\n\nTranscript:\n${transcript}\n\nReturn {"moments":[{"start":number,"end":number,"score":number,"reason":"funny|educational|controversial|emotional|surprising|actionable","hook":"short hook","rationale":"why this clip works"}]}. Each moment must be 15 to 60 seconds.` }
+        { role: 'user', content: `Video title: ${video.title}\nDuration seconds: ${video.durationSeconds || 0}\nTarget clips: ${desiredCount}\nTarget clip length seconds: ${desiredLength}\n\nTranscript:\n${transcript}\n\nReturn {"moments":[{"start":number,"end":number,"score":number,"reason":"funny|educational|controversial|emotional|surprising|actionable","hook":"short hook","rationale":"why this clip works"}]}. Each moment should be close to the target length and never more than 60 seconds.` }
       ]
     });
     const parsed = extractJsonObject(result.content);
@@ -1543,8 +1551,8 @@ async function detectViralMoments(db, video, segments) {
           text: text || item.hook || video.title
         };
       })
-      .filter(item => item.end - item.start >= 15 && item.end - item.start <= 60)
-      .slice(0, 5);
+      .filter(item => item.end > item.start && item.end - item.start <= 60)
+      .slice(0, desiredCount);
     return moments.length ? moments : fallbackMoments;
   } catch {
     return fallbackMoments;
@@ -1856,6 +1864,27 @@ async function handleApi(req, res, pathname) {
       const jobPromise = processVideo(body);
       jobPromise.catch(error => console.error('[job:background-failed]', String(error.message || error).slice(0, 2000)));
       return json(res, 202, { queued: true });
+    }
+    if (pathname === '/api/job' && req.method === 'PATCH') {
+      const body = await readJson(req);
+      const db = loadDb();
+      const job = db.jobs.find(item => item.id === body.jobId);
+      if (!job) throw new Error('Job not found.');
+      if (body.action === 'delete') {
+        db.jobs = db.jobs.filter(item => item.id !== body.jobId);
+        saveDb(db);
+        return json(res, 200, { deleted: true });
+      }
+      if (body.action === 'retry') {
+        const video = db.videos.find(item => item.id === job.videoId);
+        if (!video) throw new Error('Video not found for retry.');
+        db.jobs = db.jobs.filter(item => item.id !== body.jobId);
+        saveDb(db);
+        const retry = processVideo({ videoId: video.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 15 });
+        retry.catch(error => console.error('[job:retry-failed]', String(error.message || error).slice(0, 2000)));
+        return json(res, 202, { queued: true });
+      }
+      throw new Error('Unsupported job action.');
     }
     if (pathname === '/api/clip' && req.method === 'PATCH') {
       const body = await readJson(req);
