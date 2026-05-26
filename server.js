@@ -348,7 +348,7 @@ function run(command, args, options = {}) {
 
 async function hasCommand(command) {
   try {
-    await run(command, ['--version']);
+    await run(command, command === FFMPEG ? ['-version'] : ['--version']);
     return true;
   } catch {
     return false;
@@ -368,7 +368,7 @@ async function workingYtDlpCommand() {
 
 async function commandVersion(command) {
   try {
-    const { stdout, stderr } = await run(command, ['--version']);
+    const { stdout, stderr } = await run(command, command === FFMPEG ? ['-version'] : ['--version']);
     return { ok: true, version: (stdout || stderr).split(/\r?\n/)[0] || 'installed' };
   } catch (error) {
     return { ok: false, version: '', error: error.message };
@@ -1098,25 +1098,6 @@ async function renderClip(db, video, mediaPath, moment, index) {
   };
 }
 
-function demoMoments(video) {
-  const duration = Math.max(90, video.durationSeconds || 600);
-  const reasons = ['educational', 'controversial', 'emotional', 'surprising', 'actionable'];
-  return [0, 1, 2].map(index => {
-    const start = Math.min(duration - 45, 45 + index * 75);
-    return {
-      start,
-      end: Math.min(start + 38 + index * 6, duration),
-      score: 91 - index * 5,
-      reason: reasons[index],
-      text: [
-        `The strongest hook from ${video.title}`,
-        'This part has a clear setup, fast payoff, and short-form pacing.',
-        'Use this as a draft until FFmpeg and transcription are configured.'
-      ][index]
-    };
-  });
-}
-
 function fallbackMomentsForVideo(video) {
   const duration = Math.max(5, Number(video.durationSeconds || 30));
   const count = duration < 20 ? 1 : Math.min(3, Math.max(1, Math.floor(duration / 20)));
@@ -1136,32 +1117,6 @@ function fallbackMomentsForVideo(video) {
   });
 }
 
-async function buildDemoClip(db, video, moment, index) {
-  const title = `${video.title}`.slice(0, 48);
-  const hook = index === 0 ? 'This is the moment people will replay' : index === 1 ? 'Nobody explains this part clearly' : 'The ending changes the whole story';
-  const intelligence = buildViralIntelligence(video, { ...moment, hook }, hook, index);
-  return {
-    id: randomUUID(),
-    title: `${title} #${index + 1}`,
-    hook,
-    startSeconds: moment.start,
-    endSeconds: moment.end,
-    score: moment.score,
-    rationale: `Demo mode: ${moment.reason} moment estimated from metadata because the real media pipeline is not configured.`,
-    reason: moment.reason,
-    transcriptExcerpt: moment.text,
-    outputPath: '',
-    thumbnailPath: video.thumbnailUrl,
-    platform: 'universal',
-    postCaption: `${title}\n\nDraft caption generated in demo mode. Configure yt-dlp, FFmpeg, and LLM settings for richer AI metadata.`,
-    hashtags: ['#shorts', '#reels', '#clipforge'],
-    demoMode: true,
-    postingAssistant: await generatePostingAssistant(db, video, { ...moment, hook }, index === 2 ? 'YouTube Shorts' : 'TikTok'),
-    transformation: defaultTransformation(title),
-    intelligence
-  };
-}
-
 function completeJobWithClips(jobId, videoId, clipRows) {
   const fresh = loadDb();
   const freshJob = fresh.jobs.find(item => item.id === jobId);
@@ -1169,7 +1124,7 @@ function completeJobWithClips(jobId, videoId, clipRows) {
   if (!freshJob || !freshVideo) return;
   freshJob.status = 'complete';
   freshJob.progress = 100;
-  freshJob.stage = clipRows.some(clip => clip.demoMode) ? 'demo clips ready' : 'ready';
+  freshJob.stage = 'completed';
   freshJob.updatedAt = new Date().toISOString();
   freshJob.steps = processingSteps(freshJob.stage, freshJob.progress);
   freshVideo.status = 'complete';
@@ -1199,14 +1154,14 @@ function completeJobWithClips(jobId, videoId, clipRows) {
 }
 
 function processingSteps(stage, progress) {
-  const steps = ['Fetching video', 'Transcribing', 'Finding viral moments', 'Creating vertical clips', 'Adding captions', 'Rendering exports'];
+  const steps = ['Queued', 'Downloading', 'Clipping', 'Captioning', 'Rendering', 'Completed'];
   const stageText = String(stage || '').toLowerCase();
   let active = 0;
-  if (stageText.includes('transcrib')) active = 1;
-  else if (stageText.includes('scoring') || stageText.includes('viral')) active = 2;
-  else if (stageText.includes('vertical') || stageText.includes('creating')) active = 3;
-  else if (stageText.includes('caption')) active = 4;
-  else if (stageText.includes('render') || stageText.includes('ready') || progress >= 100) active = 5;
+  if (stageText.includes('download')) active = 1;
+  else if (stageText.includes('clip') || stageText.includes('viral') || stageText.includes('vertical')) active = 2;
+  else if (stageText.includes('caption') || stageText.includes('transcrib')) active = 3;
+  else if (stageText.includes('render')) active = 4;
+  else if (stageText.includes('complete') || stageText.includes('ready') || progress >= 100) active = 5;
   return steps.map((label, index) => ({
     label,
     status: progress >= 100 || index < active ? 'complete' : index === active ? 'active' : 'waiting'
@@ -1249,15 +1204,8 @@ async function processVideo(payload) {
   try {
     const ytdlpReady = Boolean(await workingYtDlpCommand());
     const ffmpegReady = await hasCommand(FFMPEG);
-    if ((!ytdlpReady && video.sourceKind !== 'upload') || !ffmpegReady) {
-      updateJob(job.id, { progress: 18, stage: 'demo mode: fetching metadata', steps: processingSteps('downloading', 18) });
-      updateJob(job.id, { progress: 45, stage: 'demo mode: estimating viral moments', steps: processingSteps('viral', 45) });
-      const clips = [];
-      for (const [index, moment] of demoMoments(video).entries()) clips.push(await buildDemoClip(db, video, moment, index));
-      updateJob(job.id, { progress: 85, stage: 'demo mode: creating drafts', steps: processingSteps('rendering', 85) });
-      completeJobWithClips(job.id, video.id, clips);
-      return { jobId: job.id, demoMode: true };
-    }
+    if (!ytdlpReady && video.sourceKind !== 'upload') throw new Error('Download blocked: yt-dlp is not available on this server. Use file upload or redeploy with Docker media tools.');
+    if (!ffmpegReady) throw new Error('FFmpeg failed: FFmpeg is not available on this server, so clips cannot be rendered.');
     const mediaPath = video.sourceKind === 'upload' ? video.storagePath : await downloadVideo(video);
     updateJob(job.id, { progress: 30, stage: 'transcribing', steps: processingSteps('transcribing', 30) });
     let transcript = [];

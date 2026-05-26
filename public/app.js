@@ -155,13 +155,14 @@ function jobCard(j) {
 }
 
 function renderClips() {
-  const clips = state.library.clips || [];
-  $('#clips').innerHTML = clips.length ? `<div class="panel-head"><div><span class="eyebrow">Library</span><h2>Ready clips</h2></div><button data-view-jump="create">Create more</button></div><div class="card-grid">${clips.map(clipCard).join('')}</div>` : `<section class="panel empty-state"><h2>No clips yet</h2><p>Create your first batch from a YouTube link. Finished clips show here with previews, downloads, captions, hashtags, and posting steps.</p><button data-view-jump="create">Create clips</button></section>`;
+  const clips = (state.library.clips || []).filter(c => c.outputPath && !c.demoMode);
+  const jobs = (state.library.jobs || []).filter(j => !['complete', 'completed'].includes(j.status));
+  $('#clips').innerHTML = `${jobs.length ? `<section class="panel"><h2>Processing</h2>${jobs.map(jobCard).join('')}</section>` : ''}${clips.length ? `<div class="panel-head"><div><span class="eyebrow">Library</span><h2>Ready clips</h2></div><button data-view-jump="create">Create more</button></div><div class="card-grid">${clips.map(clipCard).join('')}</div>` : `<section class="panel empty-state"><h2>No clips generated yet</h2><p>Create clips from a YouTube link or upload a video file. Real rendered clips will appear here after FFmpeg finishes.</p><button data-view-jump="create">Create clips</button></section>`}`;
 }
 function clipCard(c) {
   const assistant = c.postingAssistant || {};
   const intel = c.intelligence || {};
-  return `<article class="clip-card"><div class="clip-preview">${c.outputPath ? `<video src="${c.outputPath}" muted playsinline></video>` : `<b>${c.hook}</b>`}<span class="pill ${c.demoMode ? 'warn' : 'ok'}">${c.demoMode ? 'Demo' : `${c.score}/100`}</span></div><div class="clip-body"><h3>${assistant.suggestedTitle || c.hook}</h3><div class="meta"><span>${Math.round((c.endSeconds || 0) - (c.startSeconds || 0))}s</span><span>${assistant.bestPlatform || 'TikTok'}</span><span>${intel.smartEditPlan?.mode || 'Smart cut'}</span></div><p>${c.rationale}</p><div class="actions"><button data-open-clip="${c.id}">Open editor</button>${c.outputPath ? `<a class="button ghost" href="${c.outputPath}" download>Download</a>` : '<button disabled>Download</button>'}<button class="ghost" data-copy="${encodeURIComponent(assistant.caption || c.postCaption || '')}">Copy caption</button><button class="ghost" data-copy="${encodeURIComponent((assistant.hashtags || c.hashtags || []).join(' '))}">Copy hashtags</button></div></div></article>`;
+  return `<article class="clip-card"><div class="clip-preview"><video src="${c.outputPath}" muted playsinline></video><span class="pill ok">${c.score}/100</span></div><div class="clip-body"><h3>${assistant.suggestedTitle || c.hook}</h3><div class="meta"><span>${Math.round((c.endSeconds || 0) - (c.startSeconds || 0))}s</span><span>${when(c.createdAt)}</span><span>${assistant.bestPlatform || 'TikTok'}</span><span>${intel.smartEditPlan?.mode || 'Smart cut'}</span></div><p>${c.rationale}</p><div class="actions"><button data-open-clip="${c.id}">Preview</button><a class="button ghost" href="${c.outputPath}" download>Download</a><button class="ghost" data-copy="${encodeURIComponent(assistant.caption || c.postCaption || '')}">Copy caption</button><button class="ghost" data-copy="${encodeURIComponent((assistant.hashtags || c.hashtags || []).join(' '))}">Copy hashtags</button></div></div></article>`;
 }
 
 function renderClipDetail() {
@@ -241,7 +242,7 @@ function originalityChecklist(c) {
   return checklist.map(item => `<label class="permission"><input data-originality="${item.id}" type="checkbox" ${item.done ? 'checked' : ''}>${item.label}</label>`).join('');
 }
 function downloadButton(c) {
-  if (!c.outputPath) return '<button class="wide" disabled>Download unavailable in demo mode</button>';
+  if (!c.outputPath) return '<button class="wide" disabled>Download unavailable until rendering completes</button>';
   return `<a id="downloadClip" class="button wide disabled" href="${c.outputPath}" download title="Complete originality checklist first">Download video</a>`;
 }
 function updateDownloadState() {
