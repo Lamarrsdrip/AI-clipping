@@ -70,6 +70,7 @@ const seed = {
   watchedChannels: [],
   apiSettings: [],
   aiLogs: [],
+  importCache: [],
   bankAccounts: [{
     id: 'bank_default',
     bankName: 'Set bank name in Admin',
@@ -181,6 +182,7 @@ function loadDb() {
   if (!Array.isArray(db.watchedChannels)) db.watchedChannels = [];
   if (!Array.isArray(db.apiSettings)) db.apiSettings = [];
   if (!Array.isArray(db.aiLogs)) db.aiLogs = [];
+  if (!Array.isArray(db.importCache)) db.importCache = [];
   if (!Array.isArray(db.bankAccounts)) db.bankAccounts = seed.bankAccounts;
   if (!Array.isArray(db.paymentRequests)) db.paymentRequests = [];
   if (!Array.isArray(db.billingPlans)) db.billingPlans = defaultPlans();
@@ -208,6 +210,7 @@ function saveDb(db) {
   if (!Array.isArray(db.watchedChannels)) db.watchedChannels = [];
   if (!Array.isArray(db.apiSettings)) db.apiSettings = [];
   if (!Array.isArray(db.aiLogs)) db.aiLogs = [];
+  if (!Array.isArray(db.importCache)) db.importCache = [];
   if (!Array.isArray(db.bankAccounts)) db.bankAccounts = seed.bankAccounts;
   if (!Array.isArray(db.paymentRequests)) db.paymentRequests = [];
   if (!Array.isArray(db.billingPlans)) db.billingPlans = defaultPlans();
@@ -255,29 +258,84 @@ async function hasCommand(command) {
   }
 }
 
+async function commandVersion(command) {
+  try {
+    const { stdout, stderr } = await run(command, ['--version']);
+    return { ok: true, version: (stdout || stderr).split(/\r?\n/)[0] || 'installed' };
+  } catch (error) {
+    return { ok: false, version: '', error: error.message };
+  }
+}
+
+async function verifyMediaBinaries() {
+  const ytdlp = await commandVersion(YTDLP);
+  const ffmpeg = await commandVersion(FFMPEG);
+  if (ytdlp.ok) console.log(`[startup] yt-dlp ready: ${ytdlp.version}`);
+  else console.error(`[startup] yt-dlp missing at "${YTDLP}": ${ytdlp.error}`);
+  if (ffmpeg.ok) console.log(`[startup] FFmpeg ready: ${ffmpeg.version}`);
+  else console.error(`[startup] FFmpeg missing at "${FFMPEG}": ${ffmpeg.error}`);
+  return { ytdlp, ffmpeg };
+}
+
+function importLog(level, message, details = {}) {
+  const cleanDetails = Object.fromEntries(Object.entries(details).filter(([, value]) => value !== undefined && value !== ''));
+  console[level === 'error' ? 'error' : 'log'](`[import:${level}] ${message}`, cleanDetails);
+}
+
+function friendlyYouTubeApiError(status, body = '') {
+  const text = String(body || '');
+  let reason = '';
+  try {
+    const parsed = JSON.parse(text);
+    reason = parsed.error?.errors?.[0]?.reason || parsed.error?.status || parsed.error?.message || '';
+  } catch {
+    reason = text.slice(0, 160);
+  }
+  if (status === 400) return `YouTube API rejected the request${reason ? ` (${reason})` : ''}. Trying yt-dlp fallback.`;
+  if (status === 403 && /quota/i.test(reason)) return 'YouTube API quota exceeded. Trying yt-dlp fallback.';
+  if (status === 403) return `YouTube API key is invalid, restricted, or missing permission${reason ? ` (${reason})` : ''}. Trying yt-dlp fallback.`;
+  return `YouTube API failed with ${status}${reason ? ` (${reason})` : ''}. Trying yt-dlp fallback.`;
+}
+
 function parseYouTubeUrl(input) {
   let url;
   try {
-    url = new URL(input.trim());
+    const value = String(input || '').trim();
+    if (!value) throw new Error('empty');
+    url = new URL(/^https?:\/\//i.test(value) ? value : `https://${value}`);
   } catch {
+    importLog('warn', 'malformed URL', { input });
     throw new Error('Paste a valid YouTube channel or video URL.');
   }
-  const host = url.hostname.replace(/^www\./, '');
-  if (!['youtube.com', 'm.youtube.com', 'youtu.be'].includes(host)) {
+  const host = url.hostname.toLowerCase().replace(/^www\./, '');
+  if (!['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'].includes(host)) {
+    importLog('warn', 'unsupported URL host', { host });
     throw new Error('Only YouTube URLs are supported in this MVP.');
   }
-  if (host === 'youtu.be') return { type: 'video', id: url.pathname.slice(1), canonical: `https://www.youtube.com/watch?v=${url.pathname.slice(1)}` };
+  if (host === 'youtu.be') {
+    const id = url.pathname.split('/').filter(Boolean)[0] || '';
+    if (!/^[\w-]{11}$/.test(id)) throw new Error('That youtu.be link does not contain a valid video ID.');
+    return { type: 'video', id, canonical: `https://www.youtube.com/watch?v=${id}`, original: url.toString() };
+  }
   if (url.pathname === '/watch' && url.searchParams.get('v')) {
     const id = url.searchParams.get('v');
-    return { type: 'video', id, canonical: `https://www.youtube.com/watch?v=${id}` };
+    if (!/^[\w-]{11}$/.test(id)) throw new Error('That YouTube watch link does not contain a valid video ID.');
+    return { type: 'video', id, canonical: `https://www.youtube.com/watch?v=${id}`, original: url.toString() };
   }
   if (url.pathname.startsWith('/shorts/')) {
     const id = url.pathname.split('/')[2];
-    return { type: 'video', id, canonical: `https://www.youtube.com/watch?v=${id}` };
+    if (!/^[\w-]{11}$/.test(id)) throw new Error('That Shorts link does not contain a valid video ID.');
+    return { type: 'video', id, canonical: `https://www.youtube.com/watch?v=${id}`, original: url.toString() };
   }
   if (url.pathname.startsWith('/channel/') || url.pathname.startsWith('/@') || url.pathname.startsWith('/c/') || url.pathname.startsWith('/user/')) {
-    return { type: 'channel', id: url.pathname, canonical: url.toString() };
+    const cleanPath = url.pathname.replace(/\/+$/, '');
+    return { type: 'channel', id: cleanPath, canonical: `https://www.youtube.com${cleanPath}`, original: url.toString() };
   }
+  if (url.pathname === '/' && url.searchParams.get('v')) {
+    const id = url.searchParams.get('v');
+    if (/^[\w-]{11}$/.test(id)) return { type: 'video', id, canonical: `https://www.youtube.com/watch?v=${id}`, original: url.toString() };
+  }
+  importLog('warn', 'unsupported YouTube URL shape', { pathname: url.pathname });
   throw new Error('Use a YouTube video URL or channel URL.');
 }
 
@@ -288,13 +346,20 @@ function isoDurationToSeconds(value = 'PT0S') {
 }
 
 async function fetchYouTubeVideoWithApi(videoId) {
-  if (!process.env.YOUTUBE_API_KEY) return null;
+  const db = loadDb();
+  const apiKey = settingValue(db, 'YOUTUBE_API_KEY');
+  if (!apiKey) return null;
   const url = new URL('https://www.googleapis.com/youtube/v3/videos');
   url.searchParams.set('part', 'snippet,contentDetails,statistics');
   url.searchParams.set('id', videoId);
-  url.searchParams.set('key', process.env.YOUTUBE_API_KEY);
+  url.searchParams.set('key', apiKey);
   const response = await fetch(url);
-  if (!response.ok) throw new Error(`YouTube Data API failed: ${response.status}`);
+  if (!response.ok) {
+    const body = await response.text();
+    const message = friendlyYouTubeApiError(response.status, body);
+    importLog(response.status >= 500 ? 'error' : 'warn', message, { status: response.status, videoId, body: body.slice(0, 500) });
+    throw new Error(message);
+  }
   const data = await response.json();
   const item = data.items?.[0];
   if (!item) throw new Error('No public video found for that URL.');
@@ -302,10 +367,27 @@ async function fetchYouTubeVideoWithApi(videoId) {
 }
 
 async function fetchChannelWithApi(channelUrl) {
-  if (!process.env.YOUTUBE_API_KEY) return null;
+  const db = loadDb();
+  const apiKey = settingValue(db, 'YOUTUBE_API_KEY');
+  if (!apiKey) return null;
   const parsed = parseYouTubeUrl(channelUrl);
   let channelId = null;
   if (parsed.id.startsWith('/channel/')) channelId = parsed.id.split('/')[2];
+  if (parsed.id.startsWith('/@')) {
+    const channels = new URL('https://www.googleapis.com/youtube/v3/channels');
+    channels.searchParams.set('part', 'snippet');
+    channels.searchParams.set('forHandle', parsed.id.slice(2));
+    channels.searchParams.set('key', apiKey);
+    const channelResponse = await fetch(channels);
+    if (channelResponse.ok) {
+      const channelData = await channelResponse.json();
+      channelId = channelData.items?.[0]?.id || null;
+    } else {
+      const body = await channelResponse.text();
+      importLog('warn', friendlyYouTubeApiError(channelResponse.status, body), { status: channelResponse.status, channelUrl, body: body.slice(0, 500) });
+      return null;
+    }
+  }
   if (!channelId) return null;
   const search = new URL('https://www.googleapis.com/youtube/v3/search');
   search.searchParams.set('part', 'snippet');
@@ -313,18 +395,28 @@ async function fetchChannelWithApi(channelUrl) {
   search.searchParams.set('maxResults', '12');
   search.searchParams.set('order', 'date');
   search.searchParams.set('type', 'video');
-  search.searchParams.set('key', process.env.YOUTUBE_API_KEY);
+  search.searchParams.set('key', apiKey);
   const searchResponse = await fetch(search);
-  if (!searchResponse.ok) throw new Error(`YouTube channel import failed: ${searchResponse.status}`);
+  if (!searchResponse.ok) {
+    const body = await searchResponse.text();
+    const message = friendlyYouTubeApiError(searchResponse.status, body);
+    importLog(searchResponse.status >= 500 ? 'error' : 'warn', message, { status: searchResponse.status, channelUrl, body: body.slice(0, 500) });
+    throw new Error(message);
+  }
   const searchData = await searchResponse.json();
   const ids = searchData.items.map(item => item.id.videoId).filter(Boolean).join(',');
   if (!ids) return [];
   const videos = new URL('https://www.googleapis.com/youtube/v3/videos');
   videos.searchParams.set('part', 'snippet,contentDetails,statistics');
   videos.searchParams.set('id', ids);
-  videos.searchParams.set('key', process.env.YOUTUBE_API_KEY);
+  videos.searchParams.set('key', apiKey);
   const videoResponse = await fetch(videos);
-  if (!videoResponse.ok) throw new Error(`YouTube video metadata failed: ${videoResponse.status}`);
+  if (!videoResponse.ok) {
+    const body = await videoResponse.text();
+    const message = friendlyYouTubeApiError(videoResponse.status, body);
+    importLog(videoResponse.status >= 500 ? 'error' : 'warn', message, { status: videoResponse.status, channelUrl, body: body.slice(0, 500) });
+    throw new Error(message);
+  }
   const videoData = await videoResponse.json();
   return videoData.items.map(normalizeApiVideo).filter(video => video.durationSeconds >= 600);
 }
@@ -345,11 +437,20 @@ function normalizeApiVideo(item) {
 
 async function fetchWithYtDlp(source) {
   if (!(await hasCommand(YTDLP))) {
-    throw new Error('Import needs YOUTUBE_API_KEY or yt-dlp installed. No metadata was fabricated.');
+    importLog('error', 'yt-dlp missing', { command: YTDLP });
+    throw new Error('yt-dlp is not installed on the server. Add it to the Render build so imports can fallback when the YouTube API fails.');
   }
-  const args = ['--dump-single-json', '--skip-download', '--playlist-end', '12', source];
-  const { stdout } = await run(YTDLP, args);
-  const data = JSON.parse(stdout);
+  const args = ['--dump-single-json', '--skip-download', '--no-warnings', '--ignore-no-formats-error', '--playlist-end', '12', source];
+  importLog('log', 'yt-dlp metadata fallback started', { source });
+  const { stdout, stderr } = await run(YTDLP, args);
+  if (stderr) importLog('warn', 'yt-dlp metadata warnings', { stderr: stderr.slice(0, 500) });
+  let data;
+  try {
+    data = JSON.parse(stdout);
+  } catch {
+    importLog('error', 'yt-dlp returned invalid JSON', { source, stdout: stdout.slice(0, 500) });
+    throw new Error('yt-dlp could not read metadata for that YouTube link.');
+  }
   const entries = data.entries?.length ? data.entries : [data];
   return entries.map(item => ({
     youtubeId: item.id,
@@ -366,16 +467,50 @@ async function fetchWithYtDlp(source) {
 
 async function fetchSourceVideos(sourceUrl) {
   const parsed = parseYouTubeUrl(sourceUrl);
-  let videos = [];
-  if (parsed.type === 'video') {
-    const apiVideo = await fetchYouTubeVideoWithApi(parsed.id);
-    videos = apiVideo ? [apiVideo] : await fetchWithYtDlp(parsed.canonical);
-  } else {
-    const apiVideos = await fetchChannelWithApi(parsed.canonical);
-    videos = apiVideos || await fetchWithYtDlp(parsed.canonical);
+  const db = loadDb();
+  const cacheKey = createHash('sha256').update(parsed.canonical).digest('hex');
+  const cached = db.importCache.find(item => item.cacheKey === cacheKey && Date.now() - Date.parse(item.createdAt) < 6 * 60 * 60 * 1000);
+  if (cached?.videos?.length) {
+    importLog('log', 'metadata cache hit', { source: parsed.canonical, count: cached.videos.length });
+    return { parsed, videos: cached.videos, source: 'cache', warnings: cached.warnings || [] };
   }
-  if (!videos.length) throw new Error('No long public videos were found. This product only imports long-form videos for clipping.');
-  return { parsed, videos };
+  let videos = [];
+  const warnings = [];
+  let source = 'youtube-api';
+  if (parsed.type === 'video') {
+    try {
+      const apiVideo = await fetchYouTubeVideoWithApi(parsed.id);
+      videos = apiVideo ? [apiVideo] : [];
+    } catch (error) {
+      warnings.push(error.message);
+      videos = [];
+    }
+    if (!videos.length) {
+      source = 'yt-dlp';
+      videos = await fetchWithYtDlp(parsed.canonical);
+    }
+  } else {
+    try {
+      const apiVideos = await fetchChannelWithApi(parsed.canonical);
+      videos = apiVideos || [];
+    } catch (error) {
+      warnings.push(error.message);
+      videos = [];
+    }
+    if (!videos.length) {
+      source = 'yt-dlp';
+      videos = await fetchWithYtDlp(parsed.canonical);
+    }
+  }
+  if (!videos.length) {
+    importLog('warn', 'no long public videos found', { source: parsed.canonical, type: parsed.type });
+    throw new Error('We found the source, but no long public videos were available to clip. Try a long-form video or a channel with recent uploads.');
+  }
+  db.importCache.unshift({ cacheKey, sourceUrl: parsed.canonical, sourceType: parsed.type, videos, warnings, metadataSource: source, createdAt: new Date().toISOString() });
+  db.importCache = db.importCache.slice(0, 80);
+  saveDb(db);
+  importLog('log', 'metadata import ready', { source: parsed.canonical, count: videos.length, metadataSource: source });
+  return { parsed, videos, source, warnings };
 }
 
 function addImportedVideos(db, sourceUrl, sourceType, videos, defaults = {}) {
@@ -425,11 +560,11 @@ function addImportedVideos(db, sourceUrl, sourceType, videos, defaults = {}) {
 }
 
 async function importSource(sourceUrl) {
-  const { parsed, videos } = await fetchSourceVideos(sourceUrl);
+  const { parsed, videos, source, warnings } = await fetchSourceVideos(sourceUrl);
   const db = loadDb();
-  const result = addImportedVideos(db, sourceUrl, parsed.type, videos);
+  const result = addImportedVideos(db, parsed.canonical, parsed.type, videos);
   saveDb(db);
-  return result;
+  return { ...result, source: source || 'youtube-api', warnings: warnings || [], canonicalUrl: parsed.canonical };
 }
 
 function queueBackgroundProcess(videoId, options) {
@@ -1074,9 +1209,15 @@ async function handleApi(req, res, pathname) {
       const db = loadDb();
       const user = currentUser(req, db);
       const { subscription, plan } = subscriptionFor(db, user.id);
+      const ytdlpStatus = await commandVersion(YTDLP);
+      const ffmpegStatus = await commandVersion(FFMPEG);
       const tools = {
-        ytDlp: await hasCommand(YTDLP),
-        ffmpeg: await hasCommand(FFMPEG),
+        ytDlp: ytdlpStatus.ok,
+        ytDlpVersion: ytdlpStatus.version,
+        ytDlpError: ytdlpStatus.error || '',
+        ffmpeg: ffmpegStatus.ok,
+        ffmpegVersion: ffmpegStatus.version,
+        ffmpegError: ffmpegStatus.error || '',
         youtubeApi: settingReady(db, 'YOUTUBE_API_KEY'),
         llm: settingReady(db, 'LLM_API_KEY'),
         postgres: settingReady(db, 'DATABASE_URL')
@@ -1107,13 +1248,13 @@ async function handleApi(req, res, pathname) {
             id: 'ytdlp',
             label: 'yt-dlp binary',
             ready: tools.ytDlp,
-            action: 'Install yt-dlp so owned or permissioned videos can be downloaded after the rights gate.'
+            action: tools.ytDlp ? tools.ytDlpVersion : `Install yt-dlp on Render. Startup error: ${tools.ytDlpError}`
           },
           {
             id: 'ffmpeg',
             label: 'FFmpeg binary',
             ready: tools.ffmpeg,
-            action: 'Install FFmpeg so clips can be cropped to 9:16, captioned, and rendered.'
+            action: tools.ffmpeg ? tools.ffmpegVersion : `Install FFmpeg on Render. Startup error: ${tools.ffmpegError}`
           },
           {
             id: 'llm',
@@ -1623,8 +1764,9 @@ async function pollDueWatchedChannels() {
   }
 }
 
-server.listen(PORT, HOST, () => {
+server.listen(PORT, HOST, async () => {
   console.log(`ClipForge AI running at http://${HOST}:${PORT}`);
+  await verifyMediaBinaries();
   pollDueWatchedChannels().catch(() => {});
   setInterval(() => pollDueWatchedChannels().catch(() => {}), Number(process.env.WATCH_INTERVAL_MINUTES || 15) * 60 * 1000);
 });

@@ -12,7 +12,38 @@ DNS/domain: Cloudflare
 
 For the current single-server MVP, deploy the whole app to Railway or Render first. Split frontend/backend later.
 
-## Railway / Render Backend
+## Render Backend
+
+Use Docker on Render for this project. The repo includes a `Dockerfile` that installs:
+
+- `ffmpeg`
+- `python3`
+- `yt-dlp`
+
+Render settings:
+
+```txt
+Runtime: Docker
+Dockerfile Path: ./Dockerfile
+```
+
+The Docker build runs `yt-dlp --version` and `ffmpeg -version`, so deploy logs will fail early if either binary cannot be installed.
+
+Runtime startup also logs the detected versions:
+
+```txt
+[startup] yt-dlp ready: ...
+[startup] FFmpeg ready: ...
+```
+
+Keep these env vars:
+
+```txt
+YTDLP_PATH=yt-dlp
+FFMPEG_PATH=ffmpeg
+```
+
+## Railway / Native Node Backend
 
 Set start command:
 
@@ -40,7 +71,7 @@ YTDLP_PATH=yt-dlp
 FFMPEG_PATH=ffmpeg
 ```
 
-For production workers, add a Dockerfile later to install `ffmpeg` and `yt-dlp` in the deploy image.
+If using a native Node runtime instead of Docker, you must install `yt-dlp` and `ffmpeg` yourself. Docker is recommended because it makes both binaries detectable in production.
 
 ## Supabase Postgres
 

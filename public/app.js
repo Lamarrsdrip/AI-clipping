@@ -1,6 +1,6 @@
 const $ = s => document.querySelector(s);
 const $$ = s => Array.from(document.querySelectorAll(s));
-const state = { user: null, session: null, library: {}, selected: new Set(), clip: null, authMode: 'login', bank: null };
+const state = { user: null, session: null, library: {}, selected: new Set(), clip: null, authMode: 'login', bank: null, importing: false, importStatus: null, importUrl: '' };
 const nav = [['home', '⌂', 'Home'], ['create', '＋', 'Create'], ['clips', '⇩', 'Clips'], ['billing', '◇', 'Billing'], ['settings', '⚙', 'Settings']];
 const platforms = ['TikTok', 'Instagram Reels', 'Facebook Reels', 'YouTube Shorts', 'X'];
 
@@ -58,8 +58,8 @@ function renderCreate() {
         <span class="eyebrow">Step 1</span>
         <h2>Paste YouTube link</h2>
         <p>Use a video link or channel link. We show the video details first so you can choose what to clip.</p>
-        <form id="importForm" class="source-form"><input id="sourceUrl" type="url" placeholder="Paste YouTube video or channel link" required><button>Fetch videos</button></form>
-        <div id="importMessage" class="message"></div>
+        <form id="importForm" class="source-form"><input id="sourceUrl" type="url" value="${esc(state.importUrl)}" placeholder="Paste YouTube video or channel link" required ${state.importing ? 'disabled' : ''}><button ${state.importing ? 'disabled' : ''}>${state.importing ? 'Fetching...' : 'Fetch videos'}</button></form>
+        <div id="importMessage" class="message ${state.importStatus?.type === 'error' ? 'error' : ''}">${state.importStatus?.text || ''}</div>
         <div class="source-preview">${sourcePreview()}</div>
       </section>
       <section class="panel">
@@ -79,8 +79,10 @@ function renderCreate() {
   $('#processSelected').addEventListener('click', processSelected);
 }
 function sourcePreview() {
+  if (state.importing) return `<div class="import-loading"><div class="spinner"></div><b>Reading YouTube metadata</b><p>Checking the YouTube API first. If it fails, the server will automatically try yt-dlp.</p><div class="progress"><span style="width:62%"></span></div></div>`;
   const v = state.library.videos?.[0];
-  return v ? `<article class="project-card"><img class="project-thumb" src="${v.thumbnailUrl || ''}"><h3>${v.channelTitle || 'YouTube source'}</h3><p>${state.library.videos.length} imported videos. Select which ones to clip.</p></article>` : empty('Paste a YouTube video or channel link. We will show thumbnails, title, duration, views, and upload date.');
+  if (v) return `<article class="project-card import-success"><img class="project-thumb" src="${v.thumbnailUrl || ''}"><span class="pill ok">Ready</span><h3>${v.channelTitle || 'YouTube source'}</h3><p>${state.library.videos.length} imported video${state.library.videos.length === 1 ? '' : 's'}. Select which ones to clip.</p></article>`;
+  return empty(state.importStatus?.type === 'error' ? 'Nothing imported yet. Check the message above, then try another YouTube video/channel or ask admin to install yt-dlp on the server.' : 'Paste a YouTube video or channel link. We will show thumbnails, title, duration, views, and upload date.');
 }
 function videoCards() {
   const videos = state.library.videos || [];
@@ -88,13 +90,23 @@ function videoCards() {
 }
 async function importSource(e) {
   e.preventDefault();
-  const msg = $('#importMessage');
-  msg.className = 'message'; msg.textContent = 'Fetching YouTube metadata...';
+  const sourceUrl = $('#sourceUrl').value;
+  state.importUrl = sourceUrl;
+  state.importing = true;
+  state.importStatus = { type: 'loading', text: 'Fetching YouTube metadata...' };
+  renderCreate();
   try {
-    const res = await api('/api/import', { method: 'POST', body: JSON.stringify({ sourceUrl: $('#sourceUrl').value }) });
-    msg.textContent = `Imported ${res.videos.length} video${res.videos.length === 1 ? '' : 's'}.`;
-    await loadAll(); setView('create');
-  } catch (err) { msg.className = 'message error'; msg.textContent = err.message; }
+    const res = await api('/api/import', { method: 'POST', body: JSON.stringify({ sourceUrl }) });
+    state.importStatus = { type: 'success', text: `Imported ${res.videos.length} video${res.videos.length === 1 ? '' : 's'} using ${res.source || 'metadata'}.` };
+    if (res.warnings?.length) state.importStatus.text += ` ${res.warnings[0]}`;
+    await loadAll();
+    state.importing = false;
+    setView('create');
+  } catch (err) {
+    state.importing = false;
+    state.importStatus = { type: 'error', text: err.message || 'Import failed. Try another YouTube link.' };
+    renderCreate();
+  }
 }
 async function processSelected() {
   if (!$('#rightsBulk').checked) return alert('Confirm permission first.');
