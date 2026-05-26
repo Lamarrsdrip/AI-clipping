@@ -1,10 +1,11 @@
 import http from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import Busboy from 'busboy';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -37,8 +38,16 @@ const CLIP_JOB_CREDIT_COST = Number(process.env.CLIP_JOB_CREDIT_COST || 5);
 const MIN_CLIP_SOURCE_SECONDS = Number(process.env.MIN_CLIP_SOURCE_SECONDS || 15);
 const IMPORT_RATE_LIMIT_MS = Number(process.env.IMPORT_RATE_LIMIT_MS || 8000);
 const YTDLP_BLOCK_COOLDOWN_MS = Number(process.env.YTDLP_BLOCK_COOLDOWN_MS || 15 * 60 * 1000);
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 300 * 1024 * 1024);
+const MAX_CONCURRENT_RENDER_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_RENDER_JOBS || 1));
+const PROCESS_TIMEOUT_MS = Number(process.env.PROCESS_TIMEOUT_MS || 10 * 60 * 1000);
+const MAX_RSS_MB = Number(process.env.MAX_RSS_MB || 420);
+const RENDER_WIDTH = Number(process.env.RENDER_WIDTH || 720);
+const RENDER_HEIGHT = Number(process.env.RENDER_HEIGHT || 1280);
 const importAttempts = new Map();
 const ytdlpBlock = { until: 0, reason: '' };
+let activeRenderJobs = 0;
+const renderQueue = [];
 
 mkdirSync(DATA_DIR, { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'originals'), { recursive: true });
@@ -340,14 +349,50 @@ function run(command, args, options = {}) {
     const child = spawn(executable, [...parts, ...args], { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
-    child.stdout.on('data', chunk => { stdout += chunk.toString(); });
-    child.stderr.on('data', chunk => { stderr += chunk.toString(); });
-    child.on('error', reject);
+    const maxOutput = Number(options.maxOutputBytes || 1024 * 1024);
+    const timeoutMs = Number(options.timeoutMs || PROCESS_TIMEOUT_MS);
+    const timer = timeoutMs > 0 ? setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`${command} timed out after ${Math.round(timeoutMs / 1000)}s`));
+    }, timeoutMs) : null;
+    child.stdout.on('data', chunk => {
+      if (stdout.length < maxOutput) stdout += chunk.toString().slice(0, maxOutput - stdout.length);
+    });
+    child.stderr.on('data', chunk => {
+      if (stderr.length < maxOutput) stderr += chunk.toString().slice(0, maxOutput - stderr.length);
+    });
+    child.on('error', error => {
+      if (timer) clearTimeout(timer);
+      reject(error);
+    });
     child.on('close', code => {
+      if (timer) clearTimeout(timer);
       if (code === 0) resolve({ stdout, stderr });
       else reject(new Error(stderr || `${command} exited with ${code}`));
     });
   });
+}
+
+function memorySnapshot() {
+  const usage = process.memoryUsage();
+  return {
+    rssMb: Math.round(usage.rss / 1024 / 1024),
+    heapUsedMb: Math.round(usage.heapUsed / 1024 / 1024),
+    externalMb: Math.round(usage.external / 1024 / 1024),
+    queueDepth: renderQueue.length,
+    activeRenderJobs
+  };
+}
+
+function logMemory(label) {
+  console.log(`[memory] ${label}`, memorySnapshot());
+}
+
+function assertMemoryAvailable() {
+  const rssMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
+  if (rssMb >= MAX_RSS_MB) {
+    throw new Error(`Server memory is high (${rssMb}MB). Try again in a minute or use a smaller video.`);
+  }
 }
 
 async function hasCommand(command) {
@@ -856,32 +901,72 @@ async function importSource(sourceUrl) {
   return { ...result, source: source || 'youtube-api', warnings: warnings || [], canonicalUrl: parsed.canonical };
 }
 
-function parseMultipart(req, buffer) {
-  const type = req.headers['content-type'] || '';
-  const boundary = type.match(/boundary=(?:"([^"]+)"|([^;]+))/)?.[1] || type.match(/boundary=(?:"([^"]+)"|([^;]+))/)?.[2];
-  if (!boundary) throw new Error('Upload request is missing multipart boundary.');
-  const body = buffer.toString('binary');
-  const parts = body.split(`--${boundary}`);
-  const fields = {};
-  const files = [];
-  for (const part of parts) {
-    if (!part.includes('Content-Disposition')) continue;
-    const [rawHeaders, rawContent = ''] = part.split('\r\n\r\n');
-    const name = rawHeaders.match(/name="([^"]+)"/)?.[1];
-    const filename = rawHeaders.match(/filename="([^"]*)"/)?.[1];
-    const mimeType = rawHeaders.match(/Content-Type:\s*([^\r\n]+)/i)?.[1] || 'application/octet-stream';
-    const content = rawContent.replace(/\r\n$/, '');
-    if (!name) continue;
-    if (filename) files.push({ field: name, filename, mimeType, buffer: Buffer.from(content, 'binary') });
-    else fields[name] = Buffer.from(content, 'binary').toString('utf8');
-  }
-  return { fields, files };
+function unlinkQuiet(filePath) {
+  try {
+    if (filePath && existsSync(filePath)) unlinkSync(filePath);
+  } catch {}
 }
 
-async function readMultipart(req) {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  return parseMultipart(req, Buffer.concat(chunks));
+function streamUploadedVideo(req) {
+  return new Promise((resolve, reject) => {
+    assertMemoryAvailable();
+    const fields = {};
+    let upload = null;
+    let failed = false;
+    const writes = [];
+    const busboy = Busboy({
+      headers: req.headers,
+      limits: {
+        files: 1,
+        fields: 4,
+        fileSize: MAX_UPLOAD_BYTES
+      }
+    });
+    const fail = error => {
+      failed = true;
+      if (upload?.path) unlinkQuiet(upload.path);
+      reject(error);
+    };
+    busboy.on('field', (name, value) => {
+      fields[name] = String(value || '').slice(0, 300);
+    });
+    busboy.on('file', (field, file, info) => {
+      const filename = info.filename || 'upload.mp4';
+      const ext = path.extname(filename).toLowerCase();
+      const allowed = new Set(['.mp4', '.mov', '.webm', '.m4v']);
+      if (!allowed.has(ext)) {
+        file.resume();
+        return fail(new Error('Unsupported format. Upload mp4, mov, webm, or m4v.'));
+      }
+      const uploadId = randomUUID();
+      const storedName = `${uploadId}${ext}`;
+      const uploadPath = path.join(STORAGE_DIR, 'uploads', storedName);
+      const write = createWriteStream(uploadPath);
+      upload = { field, uploadId, filename, mimeType: info.mimeType || 'application/octet-stream', storedName, path: uploadPath, bytes: 0 };
+      file.on('data', chunk => { upload.bytes += chunk.length; });
+      file.on('limit', () => fail(new Error(`File too large. Max upload is ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)}MB on this Render service.`)));
+      file.on('error', fail);
+      write.on('error', fail);
+      writes.push(new Promise((res, rej) => {
+        write.on('finish', res);
+        write.on('error', rej);
+      }));
+      file.pipe(write);
+    });
+    busboy.on('error', fail);
+    busboy.on('close', async () => {
+      if (failed) return;
+      try {
+        await Promise.all(writes);
+        if (!upload) throw new Error('No video file was uploaded.');
+        resolve({ fields, file: upload });
+      } catch (error) {
+        if (upload?.path) unlinkQuiet(upload.path);
+        reject(error);
+      }
+    });
+    req.pipe(busboy);
+  });
 }
 
 async function probeMedia(filePath) {
@@ -900,7 +985,7 @@ async function probeMedia(filePath) {
 async function thumbnailForUpload(filePath, uploadId) {
   const output = path.join(STORAGE_DIR, 'thumbs', `${uploadId}.jpg`);
   try {
-    await run(FFMPEG, ['-y', '-ss', '1', '-i', filePath, '-frames:v', '1', '-q:v', '3', output]);
+    await run(FFMPEG, ['-y', '-ss', '1', '-i', filePath, '-frames:v', '1', '-vf', 'scale=480:-1', '-q:v', '5', output], { timeoutMs: 60 * 1000 });
     return `/media/thumbs/${uploadId}.jpg`;
   } catch (error) {
     importLog('warn', 'thumbnail generation failed', { error: error.message });
@@ -909,24 +994,14 @@ async function thumbnailForUpload(filePath, uploadId) {
 }
 
 async function importUploadedVideo(req) {
-  const maxBytes = Number(process.env.MAX_UPLOAD_BYTES || 0);
-  const { fields, files } = await readMultipart(req);
-  const file = files.find(item => item.field === 'video') || files[0];
-  if (!file) throw new Error('No video file was uploaded.');
-  if (maxBytes > 0 && file.buffer.length > maxBytes) throw new Error(`File too large. Max upload is ${Math.round(maxBytes / 1024 / 1024)}MB.`);
-  const ext = path.extname(file.filename || '').toLowerCase();
-  const allowed = new Set(['.mp4', '.mov', '.webm', '.m4v']);
-  if (!allowed.has(ext)) throw new Error('Unsupported file type. Upload mp4, mov, webm, or m4v.');
-  const uploadId = randomUUID();
-  const storedName = `${uploadId}${ext}`;
-  const uploadPath = path.join(STORAGE_DIR, 'uploads', storedName);
-  writeFileSync(uploadPath, file.buffer);
-  const probe = await probeMedia(uploadPath);
-  const thumbnailUrl = await thumbnailForUpload(uploadPath, uploadId);
+  const { fields, file } = await streamUploadedVideo(req);
+  logMemory('after upload stream');
+  const probe = await probeMedia(file.path);
+  const thumbnailUrl = await thumbnailForUpload(file.path, file.uploadId);
   const title = fields.title || file.filename.replace(/\.[^.]+$/, '') || 'Uploaded video';
   const video = classifyVideoForImport({
-    youtubeId: `upload_${uploadId}`,
-    url: `/media/uploads/${storedName}`,
+    youtubeId: `upload_${file.uploadId}`,
+    url: `/media/uploads/${file.storedName}`,
     title,
     channelTitle: 'Uploaded file',
     durationSeconds: Math.round(probe.durationSeconds || 0),
@@ -935,7 +1010,7 @@ async function importUploadedVideo(req) {
     thumbnailUrl,
     isShort: Number(probe.durationSeconds || 0) <= 90,
     sourceKind: 'upload',
-    storagePath: uploadPath,
+    storagePath: file.path,
     originalFilename: file.filename,
     mimeType: file.mimeType,
     status: 'imported'
@@ -949,11 +1024,33 @@ async function importUploadedVideo(req) {
 function queueBackgroundProcess(videoId, options) {
   setTimeout(async () => {
     try {
-      await processVideo({ videoId, ...options });
+      await enqueueRenderJob({ videoId, ...options });
     } catch {
       // processVideo records the failed job; the watcher keeps running.
     }
   }, 10);
+}
+
+function enqueueRenderJob(payload) {
+  return new Promise((resolve, reject) => {
+    renderQueue.push({ payload, resolve, reject });
+    drainRenderQueue();
+  });
+}
+
+function drainRenderQueue() {
+  if (activeRenderJobs >= MAX_CONCURRENT_RENDER_JOBS) return;
+  const next = renderQueue.shift();
+  if (!next) return;
+  activeRenderJobs += 1;
+  logMemory('render job start');
+  processVideo(next.payload)
+    .then(next.resolve, next.reject)
+    .finally(() => {
+      activeRenderJobs -= 1;
+      logMemory('render job finish');
+      drainRenderQueue();
+    });
 }
 
 async function addWatchedChannel(payload) {
@@ -1130,11 +1227,11 @@ async function renderClip(db, video, mediaPath, moment, index) {
     .filter(segment => Number(segment.end) - Number(segment.start) > 1)
     .slice(0, 3);
   const visualFilters = [
-    "scale=1080:1920:force_original_aspect_ratio=increase",
-    "crop=1080:1920",
+    `scale=${RENDER_WIDTH}:${RENDER_HEIGHT}:force_original_aspect_ratio=increase`,
+    `crop=${RENDER_WIDTH}:${RENDER_HEIGHT}`,
     "setsar=1",
-    `drawtext=text='${ffmpegText(title)}':x=(w-text_w)/2:y=140:fontsize=58:fontcolor=white:box=1:boxcolor=black@0.48:boxborderw=24`,
-    `drawtext=text='${ffmpegText(hook)}':x=(w-text_w)/2:y=h-360:fontsize=48:fontcolor=white:box=1:boxcolor=black@0.58:boxborderw=22:enable='between(t,0,${Math.min(8, moment.end - moment.start)})'`
+    `drawtext=text='${ffmpegText(title)}':x=(w-text_w)/2:y=90:fontsize=40:fontcolor=white:box=1:boxcolor=black@0.48:boxborderw=18`,
+    `drawtext=text='${ffmpegText(hook)}':x=(w-text_w)/2:y=h-240:fontsize=34:fontcolor=white:box=1:boxcolor=black@0.58:boxborderw=16:enable='between(t,0,${Math.min(8, moment.end - moment.start)})'`
   ].join(',');
   if (renderSegments.length > 1) {
     const trims = renderSegments.map((segment, i) => [
@@ -1225,6 +1322,17 @@ function completeJobWithClips(jobId, videoId, clipRows) {
   saveDb(fresh);
 }
 
+function markSourceCleaned(videoId) {
+  const fresh = loadDb();
+  const video = fresh.videos.find(item => item.id === videoId);
+  if (video) {
+    video.storagePath = '';
+    video.sourceCleanedAt = new Date().toISOString();
+    video.status = 'complete';
+    saveDb(fresh);
+  }
+}
+
 function processingSteps(stage, progress) {
   const steps = ['Queued', 'Downloading', 'Clipping', 'Captioning', 'Rendering', 'Completed'];
   const stageText = String(stage || '').toLowerCase();
@@ -1241,6 +1349,7 @@ function processingSteps(stage, progress) {
 }
 
 async function processVideo(payload) {
+  assertMemoryAvailable();
   const { videoId, rightsConfirmed, fairUseMode, transformationNote } = payload;
   const clipOptions = {
     clipCount: Math.max(1, Math.min(10, Number(payload.clipCount || 3))),
@@ -1254,6 +1363,8 @@ async function processVideo(payload) {
   const user = db.users[0];
   const video = db.videos.find(item => item.id === videoId);
   if (!video) throw new Error('Video not found.');
+  const existingJob = db.jobs.find(item => item.videoId === videoId && ['queued', 'running'].includes(item.status));
+  if (existingJob) return { jobId: existingJob.id, duplicate: true };
   if (CREDITS_ENABLED && user.credits < CLIP_JOB_CREDIT_COST) throw new Error(`Not enough credits. Each video job uses ${CLIP_JOB_CREDIT_COST} credits.`);
   video.rightsConfirmed = true;
   video.fairUseMode = Boolean(fairUseMode);
@@ -1277,12 +1388,14 @@ async function processVideo(payload) {
   };
   db.jobs.unshift(job);
   saveDb(db);
+  let downloadedPath = '';
   try {
     const ytdlpReady = Boolean(await workingYtDlpCommand());
     const ffmpegReady = await hasCommand(FFMPEG);
     if (!ytdlpReady && video.sourceKind !== 'upload') throw new Error('Download blocked: yt-dlp is not available on this server. Use file upload or redeploy with Docker media tools.');
     if (!ffmpegReady) throw new Error('FFmpeg failed: FFmpeg is not available on this server, so clips cannot be rendered.');
     const mediaPath = video.sourceKind === 'upload' ? video.storagePath : await downloadVideo(video);
+    if (video.sourceKind !== 'upload') downloadedPath = mediaPath;
     updateJob(job.id, { progress: 30, stage: 'transcribing', steps: processingSteps('transcribing', 30) });
     let transcript = [];
     try {
@@ -1297,6 +1410,11 @@ async function processVideo(payload) {
     const rendered = [];
     for (let i = 0; i < moments.length; i += 1) rendered.push(await renderClip(db, video, mediaPath, moments[i], i));
     completeJobWithClips(job.id, video.id, rendered);
+    if (downloadedPath) unlinkQuiet(downloadedPath);
+    if (video.sourceKind === 'upload') {
+      unlinkQuiet(mediaPath);
+      markSourceCleaned(video.id);
+    }
     return { jobId: job.id };
   } catch (error) {
     const rawError = String(error.message || error);
@@ -1305,6 +1423,7 @@ async function processVideo(payload) {
       : rawError;
     if (cleanError !== rawError) console.error('[job:error]', { jobId: job.id, raw: rawError.slice(0, 2000), clean: cleanError });
     updateJob(job.id, { status: 'failed', progress: 100, stage: 'failed', error: cleanError });
+    if (downloadedPath) unlinkQuiet(downloadedPath);
     throw error;
   }
 }
@@ -1604,7 +1723,10 @@ async function handleApi(req, res, pathname) {
         ffmpegError: ffmpegStatus.error || '',
         youtubeApi: settingReady(db, 'YOUTUBE_API_KEY'),
         llm: settingReady(db, 'LLM_API_KEY'),
-        postgres: settingReady(db, 'DATABASE_URL')
+        postgres: settingReady(db, 'DATABASE_URL'),
+        memory: memorySnapshot(),
+        maxUploadMb: Math.round(MAX_UPLOAD_BYTES / 1024 / 1024),
+        maxConcurrentRenderJobs: MAX_CONCURRENT_RENDER_JOBS
       };
       return json(res, 200, {
         user: publicUser(user),
@@ -1861,9 +1983,9 @@ async function handleApi(req, res, pathname) {
     }
     if (pathname === '/api/process' && req.method === 'POST') {
       const body = await readJson(req);
-      const jobPromise = processVideo(body);
+      const jobPromise = enqueueRenderJob(body);
       jobPromise.catch(error => console.error('[job:background-failed]', String(error.message || error).slice(0, 2000)));
-      return json(res, 202, { queued: true });
+      return json(res, 202, { queued: true, queueDepth: renderQueue.length, activeRenderJobs });
     }
     if (pathname === '/api/job' && req.method === 'PATCH') {
       const body = await readJson(req);
@@ -1880,9 +2002,9 @@ async function handleApi(req, res, pathname) {
         if (!video) throw new Error('Video not found for retry.');
         db.jobs = db.jobs.filter(item => item.id !== body.jobId);
         saveDb(db);
-        const retry = processVideo({ videoId: video.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 15 });
+        const retry = enqueueRenderJob({ videoId: video.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 15 });
         retry.catch(error => console.error('[job:retry-failed]', String(error.message || error).slice(0, 2000)));
-        return json(res, 202, { queued: true });
+        return json(res, 202, { queued: true, queueDepth: renderQueue.length, activeRenderJobs });
       }
       throw new Error('Unsupported job action.');
     }
@@ -2206,6 +2328,8 @@ async function pollDueWatchedChannels() {
 server.listen(PORT, HOST, async () => {
   console.log(`ClipForge AI running at http://${HOST}:${PORT}`);
   await verifyMediaBinaries();
+  logMemory('startup');
   pollDueWatchedChannels().catch(() => {});
   setInterval(() => pollDueWatchedChannels().catch(() => {}), Number(process.env.WATCH_INTERVAL_MINUTES || 15) * 60 * 1000);
+  setInterval(() => logMemory('heartbeat'), Number(process.env.MEMORY_LOG_INTERVAL_MS || 60_000));
 });

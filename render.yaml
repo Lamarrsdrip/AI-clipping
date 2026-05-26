@@ -15,6 +15,16 @@ services:
         value: ffmpeg
       - key: YTDLP_JS_RUNTIME
         value: node
+      - key: MAX_UPLOAD_BYTES
+        value: 314572800
+      - key: MAX_CONCURRENT_RENDER_JOBS
+        value: 1
+      - key: MAX_RSS_MB
+        value: 420
+      - key: RENDER_WIDTH
+        value: 720
+      - key: RENDER_HEIGHT
+        value: 1280
       - key: CLIP_JOB_CREDIT_COST
         value: 5
       - key: LLM_PROVIDER
