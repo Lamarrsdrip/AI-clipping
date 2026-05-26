@@ -9,3 +9,4 @@ storage/clips/*
 screenshots/*
 *.log
 .DS_Store
+!requirements.txt

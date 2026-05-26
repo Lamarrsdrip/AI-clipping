@@ -43,6 +43,27 @@ YTDLP_PATH=yt-dlp
 FFMPEG_PATH=ffmpeg
 ```
 
+If your existing Render service was created as a Node service and Render will not let you switch it to Docker, create a new Web Service:
+
+1. Render dashboard > New > Web Service.
+2. Select `Lamarrsdrip/AI-clipping`.
+3. Choose `Docker` runtime.
+4. Dockerfile path: `./Dockerfile`.
+5. Add the same environment variables from the old service.
+6. Deploy.
+7. After it works, point your custom domain to the new Docker service and delete/suspend the old Node service.
+
+The backend checks yt-dlp in this order:
+
+```txt
+YTDLP_PATH
+yt-dlp
+python3 -m yt_dlp
+python -m yt_dlp
+```
+
+This means the app still works if Render can run the Python module but the binary shim is unreliable.
+
 ## Railway / Native Node Backend
 
 Set start command:

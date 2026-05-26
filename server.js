@@ -236,7 +236,10 @@ async function readJson(req) {
 
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
+    const parts = String(command).trim().split(/\s+/).filter(Boolean);
+    const executable = parts.shift();
+    if (!executable) return reject(new Error('No command provided.'));
+    const child = spawn(executable, [...parts, ...args], { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', chunk => { stdout += chunk.toString(); });
@@ -258,6 +261,17 @@ async function hasCommand(command) {
   }
 }
 
+function ytdlpCandidates() {
+  return Array.from(new Set([YTDLP, 'yt-dlp', 'python3 -m yt_dlp', 'python -m yt_dlp'].filter(Boolean)));
+}
+
+async function workingYtDlpCommand() {
+  for (const candidate of ytdlpCandidates()) {
+    if (await hasCommand(candidate)) return candidate;
+  }
+  return '';
+}
+
 async function commandVersion(command) {
   try {
     const { stdout, stderr } = await run(command, ['--version']);
@@ -268,10 +282,11 @@ async function commandVersion(command) {
 }
 
 async function verifyMediaBinaries() {
-  const ytdlp = await commandVersion(YTDLP);
+  const ytdlpCommand = await workingYtDlpCommand();
+  const ytdlp = ytdlpCommand ? await commandVersion(ytdlpCommand) : { ok: false, version: '', error: `Tried: ${ytdlpCandidates().join(', ')}` };
   const ffmpeg = await commandVersion(FFMPEG);
-  if (ytdlp.ok) console.log(`[startup] yt-dlp ready: ${ytdlp.version}`);
-  else console.error(`[startup] yt-dlp missing at "${YTDLP}": ${ytdlp.error}`);
+  if (ytdlp.ok) console.log(`[startup] yt-dlp ready via "${ytdlpCommand}": ${ytdlp.version}`);
+  else console.error(`[startup] yt-dlp missing. ${ytdlp.error}`);
   if (ffmpeg.ok) console.log(`[startup] FFmpeg ready: ${ffmpeg.version}`);
   else console.error(`[startup] FFmpeg missing at "${FFMPEG}": ${ffmpeg.error}`);
   return { ytdlp, ffmpeg };
@@ -436,13 +451,14 @@ function normalizeApiVideo(item) {
 }
 
 async function fetchWithYtDlp(source) {
-  if (!(await hasCommand(YTDLP))) {
-    importLog('error', 'yt-dlp missing', { command: YTDLP });
-    throw new Error('yt-dlp is not installed on the server. Add it to the Render build so imports can fallback when the YouTube API fails.');
+  const ytdlpCommand = await workingYtDlpCommand();
+  if (!ytdlpCommand) {
+    importLog('error', 'yt-dlp missing', { tried: ytdlpCandidates().join(', ') });
+    throw new Error('yt-dlp is not installed on the server. Deploy with Docker or install yt-dlp from requirements.txt so imports can fallback when the YouTube API fails.');
   }
   const args = ['--dump-single-json', '--skip-download', '--no-warnings', '--ignore-no-formats-error', '--playlist-end', '12', source];
-  importLog('log', 'yt-dlp metadata fallback started', { source });
-  const { stdout, stderr } = await run(YTDLP, args);
+  importLog('log', 'yt-dlp metadata fallback started', { source, command: ytdlpCommand });
+  const { stdout, stderr } = await run(ytdlpCommand, args);
   if (stderr) importLog('warn', 'yt-dlp metadata warnings', { stderr: stderr.slice(0, 500) });
   let data;
   try {
@@ -651,9 +667,10 @@ async function pollWatchedChannel(watchId) {
 }
 
 async function downloadVideo(video) {
-  if (!(await hasCommand(YTDLP))) throw new Error('yt-dlp is required to download owned or permissioned source videos.');
+  const ytdlpCommand = await workingYtDlpCommand();
+  if (!ytdlpCommand) throw new Error('yt-dlp is required to download owned or permissioned source videos.');
   const output = path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.%(ext)s`);
-  await run(YTDLP, ['-f', 'bv*[height<=1080]+ba/b[height<=1080]', '--merge-output-format', 'mp4', '-o', output, video.url]);
+  await run(ytdlpCommand, ['-f', 'bv*[height<=1080]+ba/b[height<=1080]', '--merge-output-format', 'mp4', '-o', output, video.url]);
   const files = await readdir(path.join(STORAGE_DIR, 'originals'));
   const found = files.find(file => file.startsWith(video.youtubeId) && file.endsWith('.mp4'));
   if (!found) throw new Error('yt-dlp completed but no mp4 output was found.');
@@ -667,8 +684,9 @@ async function getTranscript(video, mediaPath) {
     if (Array.isArray(cached.segments) && cached.segments.length) return cached.segments;
   }
   try {
-    if (await hasCommand(YTDLP)) {
-      await run(YTDLP, ['--skip-download', '--write-auto-subs', '--sub-lang', 'en', '--sub-format', 'json3', '-o', path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.%(ext)s`), video.url]);
+    const ytdlpCommand = await workingYtDlpCommand();
+    if (ytdlpCommand) {
+      await run(ytdlpCommand, ['--skip-download', '--write-auto-subs', '--sub-lang', 'en', '--sub-format', 'json3', '-o', path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.%(ext)s`), video.url]);
     }
   } catch {
     // Keep the pipeline provider-neutral. LLM calls analyze transcripts; audio transcription is configured separately.
@@ -1209,11 +1227,13 @@ async function handleApi(req, res, pathname) {
       const db = loadDb();
       const user = currentUser(req, db);
       const { subscription, plan } = subscriptionFor(db, user.id);
-      const ytdlpStatus = await commandVersion(YTDLP);
+      const ytdlpCommand = await workingYtDlpCommand();
+      const ytdlpStatus = ytdlpCommand ? await commandVersion(ytdlpCommand) : { ok: false, version: '', error: `Tried: ${ytdlpCandidates().join(', ')}` };
       const ffmpegStatus = await commandVersion(FFMPEG);
       const tools = {
         ytDlp: ytdlpStatus.ok,
         ytDlpVersion: ytdlpStatus.version,
+        ytDlpCommand: ytdlpCommand || '',
         ytDlpError: ytdlpStatus.error || '',
         ffmpeg: ffmpegStatus.ok,
         ffmpegVersion: ffmpegStatus.version,
@@ -1248,7 +1268,7 @@ async function handleApi(req, res, pathname) {
             id: 'ytdlp',
             label: 'yt-dlp binary',
             ready: tools.ytDlp,
-            action: tools.ytDlp ? tools.ytDlpVersion : `Install yt-dlp on Render. Startup error: ${tools.ytDlpError}`
+            action: tools.ytDlp ? `${tools.ytDlpVersion} via ${tools.ytDlpCommand}` : `Install yt-dlp on Render. Startup error: ${tools.ytDlpError}`
           },
           {
             id: 'ffmpeg',
