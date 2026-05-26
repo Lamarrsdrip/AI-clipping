@@ -907,6 +907,26 @@ function unlinkQuiet(filePath) {
   } catch {}
 }
 
+function cleanupOldSourcesForNewUpload(db) {
+  const clipVideoIds = new Set(db.clips.map(clip => clip.videoId).filter(Boolean));
+  const keepJobIds = new Set(db.clips.map(clip => clip.jobId).filter(Boolean));
+  const activeJobVideoIds = new Set(db.jobs.filter(job => ['queued', 'running'].includes(job.status)).map(job => job.videoId));
+  const removeVideoIds = new Set();
+  for (const video of db.videos) {
+    const generatedClipExists = clipVideoIds.has(video.id);
+    const activeJobExists = activeJobVideoIds.has(video.id);
+    if (!generatedClipExists && !activeJobExists) {
+      removeVideoIds.add(video.id);
+      if (video.storagePath) unlinkQuiet(video.storagePath);
+    }
+  }
+  db.videos = db.videos.filter(video => !removeVideoIds.has(video.id));
+  db.jobs = db.jobs.filter(job => keepJobIds.has(job.id) || (!removeVideoIds.has(job.videoId) && job.status !== 'failed'));
+  db.imports = db.imports.slice(0, 12);
+  db.projects = db.projects.filter(project => db.videos.some(video => video.projectId === project.id) || db.clips.some(clip => db.videos.some(video => video.id === clip.videoId && video.projectId === project.id))).slice(0, 12);
+  return { removedVideos: removeVideoIds.size };
+}
+
 function streamUploadedVideo(req) {
   return new Promise((resolve, reject) => {
     assertMemoryAvailable();
@@ -1016,9 +1036,10 @@ async function importUploadedVideo(req) {
     status: 'imported'
   }, { source: 'upload' }).video;
   const db = loadDb();
+  const cleanup = cleanupOldSourcesForNewUpload(db);
   const result = addImportedVideos(db, 'upload', 'upload', [video]);
   saveDb(db);
-  return { ...result, source: 'upload', warnings: [], canonicalUrl: 'upload' };
+  return { ...result, source: 'upload', warnings: [], canonicalUrl: 'upload', cleanup };
 }
 
 function queueBackgroundProcess(videoId, options) {

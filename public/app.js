@@ -164,7 +164,8 @@ async function uploadSource(e) {
     state.activeVideoIds = (data.videos || []).map(v => v.id);
     state.selected = new Set(state.activeVideoIds);
     state.uploadProgress = 100;
-    state.importStatus = { type: 'success', text: `Uploaded ${data.videos.length} video file. Thumbnail ready. Select clip length and generate clips.` };
+    const removed = data.cleanup?.removedVideos ? ` Removed ${data.cleanup.removedVideos} old source video${data.cleanup.removedVideos === 1 ? '' : 's'}.` : '';
+    state.importStatus = { type: 'success', text: `Uploaded ${data.videos.length} video file. Thumbnail ready. Select clip length and generate clips.${removed}` };
     await loadAll();
     state.importing = false;
     state.uploadProgress = 0;
