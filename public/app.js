@@ -125,17 +125,20 @@ function renderClips() {
 }
 function clipCard(c) {
   const assistant = c.postingAssistant || {};
-  return `<article class="clip-card"><div class="clip-preview">${c.outputPath ? `<video src="${c.outputPath}" muted playsinline></video>` : `<b>${c.hook}</b>`}<span class="pill ${c.demoMode ? 'warn' : 'ok'}">${c.demoMode ? 'Demo' : `${c.score}/100`}</span></div><div class="clip-body"><h3>${assistant.suggestedTitle || c.hook}</h3><div class="meta"><span>${Math.round((c.endSeconds || 0) - (c.startSeconds || 0))}s</span><span>${assistant.bestPlatform || 'TikTok'}</span><span>${assistant.bestTime || '6-9 PM'}</span></div><p>${c.rationale}</p><div class="actions"><button data-open-clip="${c.id}">Posting guide</button>${c.outputPath ? `<a class="button ghost" href="${c.outputPath}" download>Download</a>` : '<button disabled>Download</button>'}<button class="ghost" data-copy="${encodeURIComponent(assistant.caption || c.postCaption || '')}">Copy caption</button><button class="ghost" data-copy="${encodeURIComponent((assistant.hashtags || c.hashtags || []).join(' '))}">Copy hashtags</button></div></div></article>`;
+  const intel = c.intelligence || {};
+  return `<article class="clip-card"><div class="clip-preview">${c.outputPath ? `<video src="${c.outputPath}" muted playsinline></video>` : `<b>${c.hook}</b>`}<span class="pill ${c.demoMode ? 'warn' : 'ok'}">${c.demoMode ? 'Demo' : `${c.score}/100`}</span></div><div class="clip-body"><h3>${assistant.suggestedTitle || c.hook}</h3><div class="meta"><span>${Math.round((c.endSeconds || 0) - (c.startSeconds || 0))}s</span><span>${assistant.bestPlatform || 'TikTok'}</span><span>${intel.smartEditPlan?.mode || 'Smart cut'}</span></div><p>${c.rationale}</p><div class="actions"><button data-open-clip="${c.id}">Open editor</button>${c.outputPath ? `<a class="button ghost" href="${c.outputPath}" download>Download</a>` : '<button disabled>Download</button>'}<button class="ghost" data-copy="${encodeURIComponent(assistant.caption || c.postCaption || '')}">Copy caption</button><button class="ghost" data-copy="${encodeURIComponent((assistant.hashtags || c.hashtags || []).join(' '))}">Copy hashtags</button></div></div></article>`;
 }
 
 function renderClipDetail() {
   const c = state.clip;
   if (!c) { $('#clipDetail').innerHTML = empty('Choose a clip first.'); return; }
   const a = c.postingAssistant || {};
+  const intel = c.intelligence || {};
   $('#clipDetail').innerHTML = `<div class="grid-two">
-    <section class="panel"><div class="phone">${c.outputPath ? `<video src="${c.outputPath}" controls></video>` : `<div class="demo">${c.hook}</div>`}</div>${downloadButton(c)}</section>
+    <section class="panel stack"><div class="phone">${c.outputPath ? `<video src="${c.outputPath}" controls></video>` : `<div class="demo">${c.hook}</div>`}</div>${downloadButton(c)}${viralRecipePanel(intel)}${smartEditPanel(intel)}</section>
     <section class="panel stack">
       <h2>${a.suggestedTitle || c.title}</h2>
+      ${hookBattlePanel(intel)}
       ${transformationPanel(c)}
       <div class="copy-box"><b>Caption</b><p>${a.caption || c.postCaption}</p><button class="ghost" data-copy="${encodeURIComponent(a.caption || c.postCaption || '')}">Copy caption</button></div>
       <div class="copy-box"><b>Hashtags</b><p>${(a.hashtags || c.hashtags || []).join(' ')}</p><button class="ghost" data-copy="${encodeURIComponent((a.hashtags || c.hashtags || []).join(' '))}">Copy hashtags</button></div>
@@ -145,11 +148,41 @@ function renderClipDetail() {
       <button id="saveTransform" class="ghost">Save transformation settings</button>
     </section>
   </div>
+  ${viralLabPanel(intel)}
   <section class="panel"><h2>Platform upload instructions</h2><div class="card-grid">${Object.entries(a.instructions || {}).map(([platform, steps]) => `<article class="project-card"><h3>${platform}</h3><ol>${steps.map(s => `<li>${s}</li>`).join('')}</ol></article>`).join('')}</div></section>`;
   $('#markPosted')?.addEventListener('click', markPosted);
   $('#saveTransform')?.addEventListener('click', saveTransformation);
   $$('#clipDetail [data-originality]').forEach(input => input.addEventListener('change', updateDownloadState));
   updateDownloadState();
+}
+
+function viralRecipePanel(intel) {
+  const recipe = intel.viralRecipe || {};
+  const rows = [
+    ['Hook', recipe.hookStrength],
+    ['Emotion', recipe.emotionalPunch],
+    ['Share', recipe.shareability],
+    ['Clarity', recipe.clarity]
+  ];
+  return `<div class="viral-panel"><h2>Viral recipe</h2>${rows.map(([label, value]) => `<div class="score-row"><span>${label}</span><b>${value || 0}/10</b><i style="width:${(value || 0) * 10}%"></i></div>`).join('')}<p>${esc(recipe.retentionRisk || 'Retention analysis will appear here.')}</p></div>`;
+}
+function smartEditPanel(intel) {
+  const plan = intel.smartEditPlan || {};
+  return `<div class="viral-panel"><h2>${esc(plan.mode || 'Smart edit')}</h2><p>Removed dead air estimate: <b>${plan.removedDeadAirSeconds || 0}s</b></p><div class="mini-list">${(plan.segments || []).map(s => `<span>${esc(s.label || 'segment')}: ${dur(s.start)}-${dur(s.end)}</span>`).join('')}</div><p>Zoom cuts: ${(plan.zoomCuts || []).map(z => `${z.amount} at ${z.at}s`).join(', ') || 'None'}</p></div>`;
+}
+function hookBattlePanel(intel) {
+  const hooks = (intel.hookBattle || []).slice(0, 5);
+  return `<div class="viral-panel"><h2>Hook battle</h2>${hooks.length ? hooks.map(h => `<button class="ghost wide" data-copy="${encodeURIComponent(h.text)}">#${h.rank} ${esc(h.text)} · ${h.score}</button>`).join('') : empty('Hook variants will appear after clip generation.')}</div>`;
+}
+function viralLabPanel(intel) {
+  return `<section class="panel stack"><div class="panel-head"><div><span class="eyebrow">Viral lab</span><h2>Make this clip stronger</h2></div></div><div class="card-grid">
+    <article class="project-card"><h3>Retention timeline</h3>${(intel.retentionTimeline || []).map(i => `<p><b>${esc(i.range)} ${esc(i.label)}:</b> ${esc(i.note)}</p>`).join('') || '<p>No retention notes yet.</p>'}</article>
+    <article class="project-card"><h3>Platform variants</h3>${(intel.platformVariants || []).map(v => `<p><b>${esc(v.platform)}:</b> ${esc(v.edit)} <span class="pill ok">${esc(v.scoreBoost)}</span></p>`).join('')}</article>
+    <article class="project-card"><h3>Originality booster</h3><p>Current score: <b>${intel.originalityBooster?.score || 0}%</b></p>${(intel.originalityBooster?.upgrades || []).map(u => `<p>+${u.boost}% ${esc(u.label)}</p>`).join('')}</article>
+    <article class="project-card"><h3>B-roll prompts</h3>${(intel.brollPrompts || []).map(p => `<p>${esc(p)}</p>`).join('')}</article>
+    <article class="project-card"><h3>Clip series</h3>${(intel.clipSeries || []).map(p => `<p><b>Part ${p.part}: ${esc(p.title)}</b><br>${esc(p.angle)}</p>`).join('')}</article>
+    <article class="project-card"><h3>Creator memory</h3><p>${esc(intel.creatorVoiceMemory?.tone || 'No voice saved yet.')}</p><p>${esc(intel.learningTracker?.note || '')}</p></article>
+  </div></section>`;
 }
 function transformationPanel(c) {
   const t = c.transformation || {};

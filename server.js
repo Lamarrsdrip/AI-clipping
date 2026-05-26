@@ -128,6 +128,9 @@ function defaultTransformation(title = '') {
     verticalFrame: 'Blurred background',
     effects: ['Zoom cuts', 'Highlight keywords'],
     brollPlaceholders: ['Add relevant screenshot', 'Add product/page visual'],
+    editMode: 'Smart cut',
+    pacingStyle: 'Fast TikTok cut',
+    creatorVoice: 'Direct, clear, high-retention hooks',
     originalityChecklist: [
       { id: 'commentary', label: 'Added commentary or context', done: false },
       { id: 'captions', label: 'Added captions', done: true },
@@ -136,6 +139,94 @@ function defaultTransformation(title = '') {
       { id: 'credit', label: 'Added source credit if needed', done: false },
       { id: 'rights', label: 'I confirm I have rights or a valid reuse purpose', done: false }
     ]
+  };
+}
+
+function buildViralIntelligence(video, moment, hook, index = 0) {
+  const duration = Math.max(1, Math.round((moment.end || 0) - (moment.start || 0)));
+  const score = Number(moment.score || 75);
+  const reason = moment.reason || 'educational';
+  const hookStrength = Math.min(10, Math.max(5, Math.round(score / 10)));
+  const emotionalPunch = ['emotional', 'controversial', 'surprising'].includes(reason) ? 9 : 7;
+  const shareability = ['controversial', 'actionable', 'surprising'].includes(reason) ? 9 : 7;
+  const retentionRisk = duration > 45 ? 'Watch for a slow middle section. Use smart cut to tighten pacing.' : 'Low risk. Clip is short enough for strong retention.';
+  const baseHook = hook || 'Watch this before you scroll';
+  return {
+    viralRecipe: {
+      hookStrength,
+      controversy: reason === 'controversial' ? 9 : 5,
+      emotionalPunch,
+      shareability,
+      clarity: reason === 'educational' || reason === 'actionable' ? 9 : 7,
+      retentionRisk
+    },
+    hookBattle: [
+      baseHook,
+      `Nobody talks about this part of ${video.channelTitle || 'the story'}`,
+      `This is the moment most people miss`,
+      `Watch this before you make the same mistake`,
+      `The ending changes the whole point`,
+      `This explains why it actually worked`,
+      `Most people get this completely wrong`,
+      `Here is the part that matters`,
+      `This one detail changed everything`,
+      `Save this before you forget it`
+    ].map((text, rank) => ({ text: text.slice(0, 96), rank: rank + 1, score: Math.max(70, score - rank * 2) })),
+    retentionTimeline: [
+      { range: '0-3s', label: 'Hook', note: hookStrength >= 8 ? 'Strong scroll-stopper.' : 'Needs a sharper opening.' },
+      { range: '4-12s', label: 'Context', note: 'Add context overlay so viewers understand fast.' },
+      { range: '13-25s', label: 'Proof', note: 'Keep only the sentence that proves the hook.' },
+      { range: 'Final 5s', label: 'Payoff', note: 'End on the strongest line, not a fade-out.' }
+    ],
+    smartEditPlan: {
+      mode: duration > 35 ? 'Cut and join' : 'Smart trim',
+      removedDeadAirSeconds: duration > 35 ? 2 : 0,
+      segments: duration > 35 ? [
+        { start: moment.start, end: Math.min(moment.start + 14, moment.end), label: 'hook/context' },
+        { start: Math.min(moment.start + 16, moment.end - 8), end: moment.end, label: 'proof/payoff' }
+      ] : [{ start: moment.start, end: moment.end, label: 'full moment' }],
+      fillerWordsRemoved: ['um', 'uh', 'you know', 'like'],
+      zoomCuts: [
+        { at: 1.2, amount: '108%' },
+        { at: Math.min(8, duration / 2), amount: '114%' }
+      ]
+    },
+    platformVariants: [
+      { platform: 'TikTok', edit: 'Fast hook, bigger captions, 24-35s target', scoreBoost: '+8%' },
+      { platform: 'YouTube Shorts', edit: 'Clearer title, less slang, 35-55s target', scoreBoost: '+5%' },
+      { platform: 'Instagram Reels', edit: 'Cleaner captions, visual polish, saveable caption', scoreBoost: '+6%' },
+      { platform: 'X', edit: 'More context in title, direct first sentence', scoreBoost: '+4%' }
+    ],
+    originalityBooster: {
+      score: 62,
+      upgrades: [
+        { label: 'Add commentary or personal take', boost: 15 },
+        { label: 'Add source credit', boost: 5 },
+        { label: 'Add brand watermark', boost: 8 },
+        { label: 'Add AI summary overlay', boost: 10 }
+      ]
+    },
+    brollPrompts: [
+      `Fast visual showing the main idea from: ${video.title}`.slice(0, 120),
+      'Close-up of analytics or comments proving the point',
+      'Screenshot-style overlay highlighting the key phrase',
+      'Quick reaction shot or split-screen commentary placeholder'
+    ],
+    clipSeries: [
+      { part: 1, title: 'The hook', angle: 'Problem or surprising claim' },
+      { part: 2, title: 'The proof', angle: 'Why the claim matters' },
+      { part: 3, title: 'The lesson', angle: 'What viewers should do next' }
+    ],
+    learningTracker: {
+      status: 'Ready after posting',
+      metrics: ['views', 'saves', 'shares', 'comments', 'watch-through estimate'],
+      note: 'Enter results after posting so the app can learn which hooks perform best.'
+    },
+    creatorVoiceMemory: {
+      tone: 'Direct, energetic, useful',
+      captionPreference: 'Bold captions with highlighted keywords',
+      defaultCTA: 'Save this and post your take.'
+    }
   };
 }
 
@@ -745,32 +836,38 @@ function buildCaptionText(text) {
     .replace(/'/g, "\\'");
 }
 
+function ffmpegText(value = '') {
+  return String(value).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'");
+}
+
 async function renderClip(db, video, mediaPath, moment, index) {
   if (!(await hasCommand(FFMPEG))) throw new Error('FFmpeg is required to render 9:16 clips.');
   const clipId = randomUUID();
   const output = path.join(STORAGE_DIR, 'clips', `${clipId}.mp4`);
   const title = `${video.title}`.slice(0, 42).replace(/:/g, ' ');
   const hook = (moment.hook || buildCaptionText(moment.text)).slice(0, 96);
-  const vf = [
+  const intelligence = buildViralIntelligence(video, moment, hook, index);
+  const renderSegments = (intelligence.smartEditPlan?.segments || [{ start: moment.start, end: moment.end }])
+    .filter(segment => Number(segment.end) - Number(segment.start) > 1)
+    .slice(0, 3);
+  const visualFilters = [
     "scale=1080:1920:force_original_aspect_ratio=increase",
     "crop=1080:1920",
     "setsar=1",
-    `drawtext=text='${title.replace(/'/g, "\\'")}':x=(w-text_w)/2:y=140:fontsize=58:fontcolor=white:box=1:boxcolor=black@0.48:boxborderw=24`,
-    `drawtext=text='${hook}':x=(w-text_w)/2:y=h-360:fontsize=48:fontcolor=white:box=1:boxcolor=black@0.58:boxborderw=22:enable='between(t,0,${Math.min(8, moment.end - moment.start)})'`
+    `drawtext=text='${ffmpegText(title)}':x=(w-text_w)/2:y=140:fontsize=58:fontcolor=white:box=1:boxcolor=black@0.48:boxborderw=24`,
+    `drawtext=text='${ffmpegText(hook)}':x=(w-text_w)/2:y=h-360:fontsize=48:fontcolor=white:box=1:boxcolor=black@0.58:boxborderw=22:enable='between(t,0,${Math.min(8, moment.end - moment.start)})'`
   ].join(',');
-  await run(FFMPEG, [
-    '-y',
-    '-ss', String(moment.start),
-    '-to', String(moment.end),
-    '-i', mediaPath,
-    '-vf', vf,
-    '-c:v', 'libx264',
-    '-preset', 'veryfast',
-    '-crf', '23',
-    '-c:a', 'aac',
-    '-movflags', '+faststart',
-    output
-  ]);
+  if (renderSegments.length > 1) {
+    const trims = renderSegments.map((segment, i) => [
+      `[0:v]trim=start=${segment.start}:end=${segment.end},setpts=PTS-STARTPTS[v${i}]`,
+      `[0:a]atrim=start=${segment.start}:end=${segment.end},asetpts=PTS-STARTPTS[a${i}]`
+    ].join(';')).join(';');
+    const concatInputs = renderSegments.map((_, i) => `[v${i}][a${i}]`).join('');
+    const filterComplex = `${trims};${concatInputs}concat=n=${renderSegments.length}:v=1:a=1[cv][ca];[cv]${visualFilters}[outv]`;
+    await run(FFMPEG, ['-y', '-i', mediaPath, '-filter_complex', filterComplex, '-map', '[outv]', '-map', '[ca]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-c:a', 'aac', '-movflags', '+faststart', output]);
+  } else {
+    await run(FFMPEG, ['-y', '-ss', String(moment.start), '-to', String(moment.end), '-i', mediaPath, '-vf', visualFilters, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-c:a', 'aac', '-movflags', '+faststart', output]);
+  }
   return {
     id: clipId,
     title: `${title} #${index + 1}`,
@@ -787,7 +884,8 @@ async function renderClip(db, video, mediaPath, moment, index) {
     postCaption: `${hook}\n\nDesigned for TikTok, Reels, Shorts, and Facebook Reels.`,
     hashtags: ['#shorts', '#reels', '#tiktok', '#creator'],
     postingAssistant: await generatePostingAssistant(db, video, { ...moment, hook }, 'TikTok'),
-    transformation: defaultTransformation(title)
+    transformation: defaultTransformation(title),
+    intelligence
   };
 }
 
@@ -813,6 +911,7 @@ function demoMoments(video) {
 async function buildDemoClip(db, video, moment, index) {
   const title = `${video.title}`.slice(0, 48);
   const hook = index === 0 ? 'This is the moment people will replay' : index === 1 ? 'Nobody explains this part clearly' : 'The ending changes the whole story';
+  const intelligence = buildViralIntelligence(video, { ...moment, hook }, hook, index);
   return {
     id: randomUUID(),
     title: `${title} #${index + 1}`,
@@ -830,7 +929,8 @@ async function buildDemoClip(db, video, moment, index) {
     hashtags: ['#shorts', '#reels', '#clipforge'],
     demoMode: true,
     postingAssistant: await generatePostingAssistant(db, video, { ...moment, hook }, index === 2 ? 'YouTube Shorts' : 'TikTok'),
-    transformation: defaultTransformation(title)
+    transformation: defaultTransformation(title),
+    intelligence
   };
 }
 
