@@ -223,7 +223,12 @@ async function processSelected() {
 function jobCard(j) {
   const v = state.library.videos?.find(x => x.id === j.videoId);
   const blocked = /Upload the video file instead/i.test(j.error || '');
-  return `<article class="admin-card"><div class="panel-head"><div><b>${v?.title || 'Video'}</b><p>${j.stage}${j.error ? ` • ${esc(j.error)}` : ''}</p></div><span class="pill ${j.status === 'complete' ? 'ok' : j.status === 'failed' ? 'bad' : 'warn'}">${j.status}</span></div><div class="progress"><span style="width:${j.progress || 0}%"></span></div>${j.status === 'failed' ? `<div class="actions"><button data-retry-job="${j.id}">Retry</button><button class="ghost" data-delete-job="${j.id}">Delete</button>${blocked ? '<button data-view-jump="create">Upload file instead</button>' : ''}</div>` : ''}</article>`;
+  const stale = !['failed', 'complete', 'completed'].includes(j.status) && Date.now() - new Date(j.updatedAt || j.createdAt).getTime() > 3 * 60 * 1000;
+  const statusText = stale ? `${j.status} · no recent update` : j.status;
+  const actions = j.status === 'failed'
+    ? `<button data-retry-job="${j.id}">Retry</button><button class="ghost" data-delete-job="${j.id}">Delete</button>${blocked ? '<button data-view-jump="create">Upload file instead</button>' : ''}`
+    : `<button class="ghost" data-cancel-job="${j.id}">Cancel job</button>`;
+  return `<article class="admin-card"><div class="panel-head"><div><b>${v?.title || 'Video'}</b><p>${j.stage}${j.error ? ` • ${esc(j.error)}` : ''}</p></div><span class="pill ${j.status === 'complete' ? 'ok' : j.status === 'failed' ? 'bad' : stale ? 'bad' : 'warn'}">${statusText}</span></div><div class="progress"><span style="width:${j.progress || 0}%"></span></div><div class="actions">${actions}</div></article>`;
 }
 
 function renderClips() {
@@ -536,6 +541,8 @@ document.addEventListener('click', e => {
   if (retryJob) api('/api/job', { method: 'PATCH', body: JSON.stringify({ jobId: retryJob.dataset.retryJob, action: 'retry' }) }).then(loadAll).then(() => setView('clips'));
   const deleteJob = e.target.closest('[data-delete-job]');
   if (deleteJob) api('/api/job', { method: 'PATCH', body: JSON.stringify({ jobId: deleteJob.dataset.deleteJob, action: 'delete' }) }).then(loadAll).then(() => setView('clips'));
+  const cancelJob = e.target.closest('[data-cancel-job]');
+  if (cancelJob) api('/api/job', { method: 'PATCH', body: JSON.stringify({ jobId: cancelJob.dataset.cancelJob, action: 'cancel' }) }).then(loadAll).then(() => setView('clips'));
 });
 $('#authForm').addEventListener('submit', async e => {
   e.preventDefault();

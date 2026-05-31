@@ -41,6 +41,7 @@ const YTDLP_BLOCK_COOLDOWN_MS = Number(process.env.YTDLP_BLOCK_COOLDOWN_MS || 15
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 300 * 1024 * 1024);
 const MAX_CONCURRENT_RENDER_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_RENDER_JOBS || 1));
 const PROCESS_TIMEOUT_MS = Number(process.env.PROCESS_TIMEOUT_MS || 10 * 60 * 1000);
+const JOB_STALE_MS = Number(process.env.JOB_STALE_MS || 12 * 60 * 1000);
 const MAX_RSS_MB = Number(process.env.MAX_RSS_MB || 420);
 const RENDER_WIDTH = Number(process.env.RENDER_WIDTH || 720);
 const RENDER_HEIGHT = Number(process.env.RENDER_HEIGHT || 1280);
@@ -48,6 +49,7 @@ const importAttempts = new Map();
 const ytdlpBlock = { until: 0, reason: '' };
 let activeRenderJobs = 0;
 const renderQueue = [];
+const activeJobProcesses = new Map();
 
 mkdirSync(DATA_DIR, { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'originals'), { recursive: true });
@@ -343,17 +345,39 @@ async function readJson(req) {
 
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
+    const { timeoutMs: rawTimeoutMs, maxOutputBytes: rawMaxOutputBytes, jobId, label, ...spawnOptions } = options;
     const parts = String(command).trim().split(/\s+/).filter(Boolean);
     const executable = parts.shift();
     if (!executable) return reject(new Error('No command provided.'));
-    const child = spawn(executable, [...parts, ...args], { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
+    const startedAt = Date.now();
+    const commandLabel = label || command;
+    console.log(`[process:start] ${commandLabel}`, { jobId: jobId || '', command, args: args.slice(0, 8).join(' '), memory: memorySnapshot() });
+    const child = spawn(executable, [...parts, ...args], { ...spawnOptions, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (jobId) {
+      if (!activeJobProcesses.has(jobId)) activeJobProcesses.set(jobId, new Set());
+      activeJobProcesses.get(jobId).add(child);
+    }
     let stdout = '';
     let stderr = '';
-    const maxOutput = Number(options.maxOutputBytes || 1024 * 1024);
-    const timeoutMs = Number(options.timeoutMs || PROCESS_TIMEOUT_MS);
+    const maxOutput = Number(rawMaxOutputBytes || 1024 * 1024);
+    const timeoutMs = Number(rawTimeoutMs || PROCESS_TIMEOUT_MS);
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (jobId) {
+        const set = activeJobProcesses.get(jobId);
+        if (set) {
+          set.delete(child);
+          if (!set.size) activeJobProcesses.delete(jobId);
+        }
+      }
+      fn(value);
+    };
     const timer = timeoutMs > 0 ? setTimeout(() => {
       child.kill('SIGKILL');
-      reject(new Error(`${command} timed out after ${Math.round(timeoutMs / 1000)}s`));
+      finish(reject, new Error(`${commandLabel} timed out after ${Math.round(timeoutMs / 1000)}s`));
     }, timeoutMs) : null;
     child.stdout.on('data', chunk => {
       if (stdout.length < maxOutput) stdout += chunk.toString().slice(0, maxOutput - stdout.length);
@@ -362,15 +386,29 @@ function run(command, args, options = {}) {
       if (stderr.length < maxOutput) stderr += chunk.toString().slice(0, maxOutput - stderr.length);
     });
     child.on('error', error => {
-      if (timer) clearTimeout(timer);
-      reject(error);
+      finish(reject, error);
     });
     child.on('close', code => {
-      if (timer) clearTimeout(timer);
-      if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(stderr || `${command} exited with ${code}`));
+      const durationMs = Date.now() - startedAt;
+      console.log(`[process:exit] ${commandLabel}`, { jobId: jobId || '', code, durationMs, memory: memorySnapshot() });
+      if (code === 0) finish(resolve, { stdout, stderr, durationMs });
+      else finish(reject, new Error(stderr || `${commandLabel} exited with ${code}`));
     });
   });
+}
+
+function killActiveJobProcesses(jobId) {
+  const set = activeJobProcesses.get(jobId);
+  if (!set?.size) return 0;
+  let killed = 0;
+  for (const child of set) {
+    try {
+      child.kill('SIGKILL');
+      killed += 1;
+    } catch {}
+  }
+  activeJobProcesses.delete(jobId);
+  return killed;
 }
 
 function memorySnapshot() {
@@ -393,6 +431,37 @@ function assertMemoryAvailable() {
   if (rssMb >= MAX_RSS_MB) {
     throw new Error(`Server memory is high (${rssMb}MB). Try again in a minute or use a smaller video.`);
   }
+}
+
+function recoverStaleJobs(reason = 'startup') {
+  const db = loadDb();
+  const now = Date.now();
+  let changed = 0;
+  for (const job of db.jobs) {
+    if (!['queued', 'running'].includes(job.status)) continue;
+    const last = Date.parse(job.updatedAt || job.createdAt || 0) || 0;
+    const created = Date.parse(job.createdAt || 0) || last;
+    if (now - last > JOB_STALE_MS || now - created > PROCESS_TIMEOUT_MS + JOB_STALE_MS) {
+      job.status = 'failed';
+      job.progress = 100;
+      job.stage = 'failed';
+      job.error = `Job stopped responding after restart or timeout. Start a retry.`;
+      job.updatedAt = new Date().toISOString();
+      job.recoveredBy = reason;
+      changed += 1;
+    }
+  }
+  if (changed) {
+    saveDb(db);
+    console.error('[jobs:recovered-stale]', { reason, changed, memory: memorySnapshot() });
+  }
+  return changed;
+}
+
+function isJobStopped(jobId) {
+  const db = loadDb();
+  const job = db.jobs.find(item => item.id === jobId);
+  return !job || ['failed', 'cancelled', 'complete', 'completed'].includes(job.status);
 }
 
 async function hasCommand(command) {
@@ -1065,6 +1134,12 @@ function drainRenderQueue() {
   if (!next) return;
   activeRenderJobs += 1;
   logMemory('render job start');
+  if (next.payload.jobId && isJobStopped(next.payload.jobId)) {
+    activeRenderJobs -= 1;
+    next.reject(new Error('Job was cancelled before it started.'));
+    drainRenderQueue();
+    return;
+  }
   processVideo(next.payload)
     .then(next.resolve, next.reject)
     .finally(() => {
@@ -1147,13 +1222,13 @@ async function pollWatchedChannel(watchId) {
   }
 }
 
-async function downloadVideo(video) {
+async function downloadVideo(video, jobId = '') {
   const ytdlpCommand = await workingYtDlpCommand();
   if (!ytdlpCommand) throw new Error('yt-dlp is required to download owned or permissioned source videos.');
   assertYtDlpNotCoolingDown();
   const output = path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.%(ext)s`);
   try {
-    await run(ytdlpCommand, [...(await ytDlpBaseArgs()), '-f', 'bv*[height<=1080]+ba/b[height<=1080]', '--merge-output-format', 'mp4', '-o', output, video.url]);
+    await run(ytdlpCommand, [...(await ytDlpBaseArgs()), '-f', 'bv*[height<=1080]+ba/b[height<=1080]', '--merge-output-format', 'mp4', '-o', output, video.url], { jobId, label: 'yt-dlp download', timeoutMs: PROCESS_TIMEOUT_MS });
   } catch (error) {
     rememberYtDlpBlock(error);
     importLog('error', 'yt-dlp download failed', { videoId: video.youtubeId, title: video.title, raw: String(error.message || error).slice(0, 1600) });
@@ -1237,10 +1312,13 @@ function ffmpegText(value = '') {
   return String(value).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'");
 }
 
-async function renderClip(db, video, mediaPath, moment, index) {
+async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   if (!(await hasCommand(FFMPEG))) throw new Error('FFmpeg is required to render 9:16 clips.');
+  if (jobId && isJobStopped(jobId)) throw new Error('Job was cancelled before rendering finished.');
   const clipId = randomUUID();
   const output = path.join(STORAGE_DIR, 'clips', `${clipId}.mp4`);
+  const startedAt = Date.now();
+  console.log('[ffmpeg:render-start]', { jobId, clipId, index, start: moment.start, end: moment.end, output, memory: memorySnapshot() });
   const title = `${video.title}`.slice(0, 42).replace(/:/g, ' ');
   const hook = (moment.hook || buildCaptionText(moment.text)).slice(0, 96);
   const intelligence = buildViralIntelligence(video, moment, hook, index);
@@ -1261,10 +1339,14 @@ async function renderClip(db, video, mediaPath, moment, index) {
     ].join(';')).join(';');
     const concatInputs = renderSegments.map((_, i) => `[v${i}][a${i}]`).join('');
     const filterComplex = `${trims};${concatInputs}concat=n=${renderSegments.length}:v=1:a=1[cv][ca];[cv]${visualFilters}[outv]`;
-    await run(FFMPEG, ['-y', '-i', mediaPath, '-filter_complex', filterComplex, '-map', '[outv]', '-map', '[ca]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-c:a', 'aac', '-movflags', '+faststart', output]);
+    await run(FFMPEG, ['-y', '-i', mediaPath, '-filter_complex', filterComplex, '-map', '[outv]', '-map', '[ca]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-maxrate', '1600k', '-bufsize', '3200k', '-c:a', 'aac', '-movflags', '+faststart', output], { jobId, label: 'ffmpeg render', timeoutMs: PROCESS_TIMEOUT_MS });
   } else {
-    await run(FFMPEG, ['-y', '-ss', String(moment.start), '-to', String(moment.end), '-i', mediaPath, '-vf', visualFilters, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-c:a', 'aac', '-movflags', '+faststart', output]);
+    await run(FFMPEG, ['-y', '-ss', String(moment.start), '-to', String(moment.end), '-i', mediaPath, '-vf', visualFilters, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-maxrate', '1600k', '-bufsize', '3200k', '-c:a', 'aac', '-movflags', '+faststart', output], { jobId, label: 'ffmpeg render', timeoutMs: PROCESS_TIMEOUT_MS });
   }
+  if (!existsSync(output) || statSync(output).size < 1024) {
+    throw new Error('FFmpeg finished but no valid clip output was created.');
+  }
+  console.log('[ffmpeg:render-complete]', { jobId, clipId, durationMs: Date.now() - startedAt, sizeBytes: statSync(output).size, memory: memorySnapshot() });
   return {
     id: clipId,
     title: `${title} #${index + 1}`,
@@ -1369,6 +1451,36 @@ function processingSteps(stage, progress) {
   }));
 }
 
+function createQueuedProcessingJob(payload) {
+  const { videoId, rightsConfirmed, fairUseMode, transformationNote } = payload;
+  if (!rightsConfirmed) throw new Error('Confirm that you own this video or have permission to reuse it before processing.');
+  const db = loadDb();
+  const user = db.users[0];
+  const video = db.videos.find(item => item.id === videoId);
+  if (!video) throw new Error('Video not found.');
+  const existingJob = db.jobs.find(item => item.videoId === videoId && ['queued', 'running'].includes(item.status));
+  if (existingJob) return { ...existingJob, duplicate: true };
+  video.rightsConfirmed = true;
+  video.fairUseMode = Boolean(fairUseMode);
+  video.transformationNote = transformationNote || '';
+  video.status = 'queued';
+  const job = {
+    id: randomUUID(),
+    userId: user.id,
+    videoId,
+    status: 'queued',
+    progress: 1,
+    stage: 'queued',
+    steps: processingSteps('queued', 1),
+    error: '',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+  db.jobs.unshift(job);
+  saveDb(db);
+  return job;
+}
+
 async function processVideo(payload) {
   assertMemoryAvailable();
   const { videoId, rightsConfirmed, fairUseMode, transformationNote } = payload;
@@ -1384,7 +1496,7 @@ async function processVideo(payload) {
   const user = db.users[0];
   const video = db.videos.find(item => item.id === videoId);
   if (!video) throw new Error('Video not found.');
-  const existingJob = db.jobs.find(item => item.videoId === videoId && ['queued', 'running'].includes(item.status));
+  const existingJob = db.jobs.find(item => item.videoId === videoId && ['queued', 'running'].includes(item.status) && item.id !== payload.jobId);
   if (existingJob) return { jobId: existingJob.id, duplicate: true };
   if (CREDITS_ENABLED && user.credits < CLIP_JOB_CREDIT_COST) throw new Error(`Not enough credits. Each video job uses ${CLIP_JOB_CREDIT_COST} credits.`);
   video.rightsConfirmed = true;
@@ -1395,19 +1507,25 @@ async function processVideo(payload) {
     user.credits -= CLIP_JOB_CREDIT_COST;
     db.creditTransactions.unshift({ id: randomUUID(), userId: user.id, amount: -CLIP_JOB_CREDIT_COST, reason: `Clip job for ${video.title}`, createdAt: new Date().toISOString() });
   }
-  const job = {
-    id: randomUUID(),
-    userId: user.id,
-    videoId,
+  let job = payload.jobId ? db.jobs.find(item => item.id === payload.jobId) : null;
+  if (!job) {
+    job = {
+      id: randomUUID(),
+      userId: user.id,
+      videoId,
+      createdAt: new Date().toISOString()
+    };
+    db.jobs.unshift(job);
+  }
+  Object.assign(job, {
     status: 'running',
     progress: 5,
     stage: 'downloading',
     steps: processingSteps('downloading', 5),
     error: '',
-    createdAt: new Date().toISOString(),
+    startedAt: job.startedAt || new Date().toISOString(),
     updatedAt: new Date().toISOString()
-  };
-  db.jobs.unshift(job);
+  });
   saveDb(db);
   let downloadedPath = '';
   try {
@@ -1415,7 +1533,8 @@ async function processVideo(payload) {
     const ffmpegReady = await hasCommand(FFMPEG);
     if (!ytdlpReady && video.sourceKind !== 'upload') throw new Error('Download blocked: yt-dlp is not available on this server. Use file upload or redeploy with Docker media tools.');
     if (!ffmpegReady) throw new Error('FFmpeg failed: FFmpeg is not available on this server, so clips cannot be rendered.');
-    const mediaPath = video.sourceKind === 'upload' ? video.storagePath : await downloadVideo(video);
+    const mediaPath = video.sourceKind === 'upload' ? video.storagePath : await downloadVideo(video, job.id);
+    if (!mediaPath || !existsSync(mediaPath)) throw new Error('Source video file is missing. Upload the video again and retry.');
     if (video.sourceKind !== 'upload') downloadedPath = mediaPath;
     updateJob(job.id, { progress: 30, stage: 'transcribing', steps: processingSteps('transcribing', 30) });
     let transcript = [];
@@ -1429,7 +1548,16 @@ async function processVideo(payload) {
     if (!moments.length) throw new Error('Could not create a clipping window for this video.');
     updateJob(job.id, { progress: 72, stage: 'creating vertical clips', steps: processingSteps('vertical', 72) });
     const rendered = [];
-    for (let i = 0; i < moments.length; i += 1) rendered.push(await renderClip(db, video, mediaPath, moments[i], i));
+    for (let i = 0; i < moments.length; i += 1) {
+      if (isJobStopped(job.id)) throw new Error('Job was cancelled.');
+      updateJob(job.id, {
+        progress: Math.min(94, 72 + Math.round((i / Math.max(1, moments.length)) * 22)),
+        stage: `rendering clip ${i + 1} of ${moments.length}`,
+        steps: processingSteps('rendering', 80)
+      });
+      rendered.push(await renderClip(db, video, mediaPath, moments[i], i, job.id));
+    }
+    if (!rendered.length || rendered.some(clip => !clip.outputPath)) throw new Error('Rendering failed: no clips were saved.');
     completeJobWithClips(job.id, video.id, rendered);
     if (downloadedPath) unlinkQuiet(downloadedPath);
     if (video.sourceKind === 'upload') {
@@ -1944,6 +2072,7 @@ async function handleApi(req, res, pathname) {
       return json(res, 200, { checked: active.length, results });
     }
     if (pathname === '/api/library') {
+      recoverStaleJobs('library-check');
       const db = loadDb();
       if (!Array.isArray(db.scheduledPosts)) db.scheduledPosts = [];
       if (!Array.isArray(db.socialAccounts)) db.socialAccounts = [];
@@ -2004,9 +2133,11 @@ async function handleApi(req, res, pathname) {
     }
     if (pathname === '/api/process' && req.method === 'POST') {
       const body = await readJson(req);
-      const jobPromise = enqueueRenderJob(body);
+      const job = createQueuedProcessingJob(body);
+      if (job.duplicate) return json(res, 202, { queued: true, duplicate: true, jobId: job.id, queueDepth: renderQueue.length, activeRenderJobs });
+      const jobPromise = enqueueRenderJob({ ...body, jobId: job.id });
       jobPromise.catch(error => console.error('[job:background-failed]', String(error.message || error).slice(0, 2000)));
-      return json(res, 202, { queued: true, queueDepth: renderQueue.length, activeRenderJobs });
+      return json(res, 202, { queued: true, jobId: job.id, queueDepth: renderQueue.length, activeRenderJobs });
     }
     if (pathname === '/api/job' && req.method === 'PATCH') {
       const body = await readJson(req);
@@ -2014,18 +2145,30 @@ async function handleApi(req, res, pathname) {
       const job = db.jobs.find(item => item.id === body.jobId);
       if (!job) throw new Error('Job not found.');
       if (body.action === 'delete') {
+        killActiveJobProcesses(job.id);
         db.jobs = db.jobs.filter(item => item.id !== body.jobId);
         saveDb(db);
         return json(res, 200, { deleted: true });
+      }
+      if (body.action === 'cancel') {
+        const killed = killActiveJobProcesses(job.id);
+        job.status = 'failed';
+        job.progress = 100;
+        job.stage = 'cancelled';
+        job.error = 'Job cancelled.';
+        job.updatedAt = new Date().toISOString();
+        saveDb(db);
+        return json(res, 200, { cancelled: true, killed });
       }
       if (body.action === 'retry') {
         const video = db.videos.find(item => item.id === job.videoId);
         if (!video) throw new Error('Video not found for retry.');
         db.jobs = db.jobs.filter(item => item.id !== body.jobId);
         saveDb(db);
-        const retry = enqueueRenderJob({ videoId: video.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 15 });
+        const queued = createQueuedProcessingJob({ videoId: video.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 15 });
+        const retry = enqueueRenderJob({ videoId: video.id, jobId: queued.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 15 });
         retry.catch(error => console.error('[job:retry-failed]', String(error.message || error).slice(0, 2000)));
-        return json(res, 202, { queued: true, queueDepth: renderQueue.length, activeRenderJobs });
+        return json(res, 202, { queued: true, jobId: queued.id, queueDepth: renderQueue.length, activeRenderJobs });
       }
       throw new Error('Unsupported job action.');
     }
@@ -2349,8 +2492,10 @@ async function pollDueWatchedChannels() {
 server.listen(PORT, HOST, async () => {
   console.log(`ClipForge AI running at http://${HOST}:${PORT}`);
   await verifyMediaBinaries();
+  recoverStaleJobs('startup');
   logMemory('startup');
   pollDueWatchedChannels().catch(() => {});
   setInterval(() => pollDueWatchedChannels().catch(() => {}), Number(process.env.WATCH_INTERVAL_MINUTES || 15) * 60 * 1000);
   setInterval(() => logMemory('heartbeat'), Number(process.env.MEMORY_LOG_INTERVAL_MS || 60_000));
+  setInterval(() => recoverStaleJobs('interval'), 60_000);
 });

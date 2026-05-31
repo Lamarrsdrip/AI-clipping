@@ -21,6 +21,10 @@ services:
         value: 1
       - key: MAX_RSS_MB
         value: 420
+      - key: PROCESS_TIMEOUT_MS
+        value: 600000
+      - key: JOB_STALE_MS
+        value: 720000
       - key: RENDER_WIDTH
         value: 720
       - key: RENDER_HEIGHT
