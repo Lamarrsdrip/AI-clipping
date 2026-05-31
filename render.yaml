@@ -25,6 +25,8 @@ services:
         value: 600000
       - key: JOB_STALE_MS
         value: 720000
+      - key: AI_TIMEOUT_MS
+        value: 45000
       - key: RENDER_WIDTH
         value: 720
       - key: RENDER_HEIGHT

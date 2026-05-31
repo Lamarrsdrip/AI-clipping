@@ -42,6 +42,7 @@ const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 300 * 1024 * 102
 const MAX_CONCURRENT_RENDER_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_RENDER_JOBS || 1));
 const PROCESS_TIMEOUT_MS = Number(process.env.PROCESS_TIMEOUT_MS || 10 * 60 * 1000);
 const JOB_STALE_MS = Number(process.env.JOB_STALE_MS || 12 * 60 * 1000);
+const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 45 * 1000);
 const MAX_RSS_MB = Number(process.env.MAX_RSS_MB || 420);
 const RENDER_WIDTH = Number(process.env.RENDER_WIDTH || 720);
 const RENDER_HEIGHT = Number(process.env.RENDER_HEIGHT || 1280);
@@ -1572,6 +1573,13 @@ async function processVideo(payload) {
       : rawError;
     if (cleanError !== rawError) console.error('[job:error]', { jobId: job.id, raw: rawError.slice(0, 2000), clean: cleanError });
     updateJob(job.id, { status: 'failed', progress: 100, stage: 'failed', error: cleanError });
+    const failedDb = loadDb();
+    const failedVideo = failedDb.videos.find(item => item.id === video.id);
+    if (failedVideo) {
+      failedVideo.status = 'failed';
+      failedVideo.lastError = cleanError;
+      saveDb(failedDb);
+    }
     if (downloadedPath) unlinkQuiet(downloadedPath);
     throw error;
   }
@@ -1733,6 +1741,8 @@ async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat
       continue;
     }
     for (const endpoint of aiEndpointCandidates(config)) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
       try {
         const body = {
           model: config.model,
@@ -1747,8 +1757,10 @@ async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat
             'content-type': 'application/json',
             'x-clipforge-provider': config.provider
           },
+          signal: controller.signal,
           body: JSON.stringify(body)
         });
+        clearTimeout(timeout);
         const text = await response.text();
         if (!response.ok) throw new Error(`${response.status} ${text.slice(0, 500)}`);
         const data = JSON.parse(text);
@@ -1764,8 +1776,9 @@ async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat
         });
         return { content, data, provider: config.provider, model: config.model, usage: data.usage || {} };
       } catch (error) {
+        clearTimeout(timeout);
         lastError = error;
-        recordAiLog({ ...config, baseUrl: endpoint, purpose, ok: false, error: error.message });
+        recordAiLog({ ...config, baseUrl: endpoint, purpose, ok: false, error: error.name === 'AbortError' ? `AI request timed out after ${Math.round(AI_TIMEOUT_MS / 1000)}s` : error.message });
       }
     }
   }
