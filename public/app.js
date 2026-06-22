@@ -20,34 +20,39 @@ const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&a
 function renderHome() {
   const clips = state.library.clips || [];
   const jobs = state.library.jobs || [];
+  const tools = state.session?.tools || {};
   const ready = clips.filter(c => !c.postedAt).length;
+  const activeJobs = jobs.filter(j => !['complete', 'completed', 'failed'].includes(j.status));
+  const systemOk = tools.ffmpeg && (tools.ytDlp || true);
+  const systemBanner = !tools.ffmpeg ? `<div class="system-banner warn"><b>FFmpeg not found.</b> Video rendering is unavailable. Deploy with Docker or install FFmpeg to generate clips. <a class="text-btn" data-view-jump="settings">See setup</a></div>` : !tools.ytDlp ? `<div class="system-banner warn"><b>yt-dlp not found.</b> YouTube download will fail. File upload still works. <a class="text-btn" data-view-jump="settings">See setup</a></div>` : '';
   $('#home').innerHTML = `
+    ${systemBanner}
     <section class="hero-panel clean-hero">
       <div>
-        <span class="eyebrow">Manual posting assistant</span>
-        <h2>YouTube link in. Ready-to-post shorts out.</h2>
-        <p>Paste a video or channel, pick what to process, then download clips with captions, hooks, hashtags, and platform upload steps.</p>
+        <span class="eyebrow">AI Clipping SaaS v2</span>
+        <h2>Upload a video. Get viral clips in minutes.</h2>
+        <p>AI finds the best moments, renders 9:16 clips with captions and hook text, and gives you a virality score, hashtags, and platform instructions for every clip.</p>
       </div>
       <button data-view-jump="create">Create clips</button>
     </section>
     <div class="metric-grid">
       <article class="metric-card"><span>Credits left</span><b>${state.user.credits}</b></article>
-      <article class="metric-card"><span>Clips made</span><b>${clips.length}</b></article>
-      <article class="metric-card"><span>Ready to post</span><b>${ready}</b></article>
-      <article class="metric-card"><span>Posted</span><b>${clips.filter(c => c.postedAt).length}</b></article>
+      <article class="metric-card"><span>Clips ready</span><b>${ready}</b></article>
+      <article class="metric-card"><span>Total clips</span><b>${clips.length}</b></article>
+      <article class="metric-card"><span>Jobs run</span><b>${(state.session?.stats?.jobs) || 0}</b></article>
     </div>
-    <section class="panel flow-panel">
+    ${clips.length === 0 && activeJobs.length === 0 ? `<section class="panel flow-panel">
       <h2>How it works</h2>
       <div class="flow-steps">
-        <article><b>1</b><span>Paste YouTube link</span></article>
-        <article><b>2</b><span>Select videos</span></article>
-        <article><b>3</b><span>Generate clips</span></article>
-        <article><b>4</b><span>Download and post</span></article>
+        <article><b>1</b><span>Upload a video or paste a YouTube link</span></article>
+        <article><b>2</b><span>AI detects the best viral moments</span></article>
+        <article><b>3</b><span>Clips are rendered as 9:16 vertical with captions</span></article>
+        <article><b>4</b><span>Download, copy caption and hashtags, post</span></article>
       </div>
-    </section>
+    </section>` : ''}
     <div class="grid-two">
-      <section class="panel"><div class="panel-head"><h2>Processing</h2><button class="ghost" data-view-jump="create">New job</button></div>${jobs.length ? jobs.map(jobCard).join('') : empty('No jobs running. Start with Create Clips.')}</section>
-      <section class="panel"><div class="panel-head"><h2>Recent clips</h2><button class="ghost" data-view-jump="clips">View all</button></div>${clips.slice(0, 3).map(clipCard).join('') || empty('Your finished clips will appear here with download buttons and posting copy.')}</section>
+      <section class="panel"><div class="panel-head"><h2>Processing</h2><button class="ghost" data-view-jump="create">New job</button></div>${activeJobs.length ? activeJobs.map(jobCard).join('') : jobs.filter(j => j.status === 'failed').slice(0, 2).map(jobCard).join('') || empty('No active jobs. Start one from Create.')}</section>
+      <section class="panel"><div class="panel-head"><h2>Recent clips</h2><button class="ghost" data-view-jump="clips">View all</button></div>${clips.slice(0, 3).map(clipCard).join('') || empty('Finished clips appear here with a download button and posting guide.')}</section>
     </div>`;
 }
 
@@ -240,12 +245,21 @@ function renderClips() {
     seen.add(key);
     return true;
   });
-  $('#clips').innerHTML = `${jobs.length ? `<section class="panel"><h2>Processing</h2>${jobs.map(jobCard).join('')}</section>` : ''}${clips.length ? `<div class="panel-head"><div><span class="eyebrow">Library</span><h2>Ready clips</h2></div><button data-view-jump="create">Create more</button></div><div class="card-grid">${clips.map(clipCard).join('')}</div>` : `<section class="panel empty-state"><h2>No clips generated yet</h2><p>Create clips from a YouTube link or upload a video file. Real rendered clips will appear here after FFmpeg finishes.</p><button data-view-jump="create">Create clips</button></section>`}`;
+  const tools = state.session?.tools || {};
+  const readyNote = !tools.ffmpeg
+    ? `<div class="system-banner warn"><b>FFmpeg is not available.</b> Clip rendering will fail until FFmpeg is installed on the server. <a class="text-btn" data-view-jump="settings">See setup</a></div>`
+    : '';
+  $('#clips').innerHTML = `${readyNote}${jobs.length ? `<section class="panel"><h2>Processing</h2>${jobs.map(jobCard).join('')}</section>` : ''}${clips.length ? `<div class="panel-head"><div><span class="eyebrow">Library</span><h2>Ready clips (${clips.length})</h2></div><button data-view-jump="create">Create more</button></div><div class="card-grid">${clips.map(clipCard).join('')}</div>` : `<section class="panel empty-state"><h2>No clips yet</h2><p>Upload a video file or paste a YouTube link to get started. Rendered 9:16 clips appear here with download buttons, captions, and virality scores.</p><button data-view-jump="create">Create your first clip</button></section>`}`;
 }
 function clipCard(c) {
   const assistant = c.postingAssistant || {};
   const intel = c.intelligence || {};
-  return `<article class="clip-card"><div class="clip-preview"><video src="${c.outputPath}" muted playsinline></video><span class="pill ok">${c.score}/100</span></div><div class="clip-body"><h3>${assistant.suggestedTitle || c.hook}</h3><div class="meta"><span>${Math.round((c.endSeconds || 0) - (c.startSeconds || 0))}s</span><span>${when(c.createdAt)}</span><span>${assistant.bestPlatform || 'TikTok'}</span><span>${intel.smartEditPlan?.mode || 'Smart cut'}</span></div><p>${c.rationale}</p><div class="actions"><button data-open-clip="${c.id}">Preview</button><a class="button ghost" href="${c.outputPath}" download>Download</a><button class="ghost" data-copy="${encodeURIComponent(assistant.caption || c.postCaption || '')}">Copy caption</button><button class="ghost" data-copy="${encodeURIComponent((assistant.hashtags || c.hashtags || []).join(' '))}">Copy hashtags</button></div></div></article>`;
+  const durationSec = Math.round((c.endSeconds || 0) - (c.startSeconds || 0));
+  const scoreColor = c.score >= 85 ? 'ok' : c.score >= 70 ? 'warn' : '';
+  const preview = c.thumbnailPath
+    ? `<img src="${c.thumbnailPath}" alt="Clip thumbnail" loading="lazy">`
+    : `<video src="${c.outputPath}" muted playsinline preload="none"></video>`;
+  return `<article class="clip-card"><div class="clip-preview">${preview}<span class="pill ${scoreColor}">${c.score}/100</span><span class="clip-dur">${durationSec}s</span></div><div class="clip-body"><h3>${esc(assistant.suggestedTitle || c.hook)}</h3><div class="meta"><span>${when(c.createdAt)}</span><span>${esc(assistant.bestPlatform || 'TikTok')}</span><span>${esc(intel.smartEditPlan?.mode || 'Smart cut')}</span></div><p class="clip-rationale">${esc(c.rationale)}</p><div class="actions"><button data-open-clip="${c.id}">View details</button><a class="button ghost" href="${c.outputPath}" download="clip-${c.id}.mp4">Download</a><button class="ghost" data-copy="${encodeURIComponent(assistant.caption || c.postCaption || '')}">Copy caption</button></div></div></article>`;
 }
 
 function renderClipDetail() {
@@ -254,7 +268,7 @@ function renderClipDetail() {
   const a = c.postingAssistant || {};
   const intel = c.intelligence || {};
   $('#clipDetail').innerHTML = `<div class="grid-two">
-    <section class="panel stack"><div class="phone">${c.outputPath ? `<video src="${c.outputPath}" controls></video>` : `<div class="demo">${c.hook}</div>`}</div>${downloadButton(c)}${viralRecipePanel(intel)}${smartEditPanel(intel)}</section>
+    <section class="panel stack"><div class="phone">${c.outputPath ? `<video src="${c.outputPath}" controls poster="${c.thumbnailPath || ''}"></video>` : `<div class="demo">${esc(c.hook)}</div>`}</div>${downloadButton(c)}${viralRecipePanel(intel)}${smartEditPanel(intel)}</section>
     <section class="panel stack">
       <h2>${a.suggestedTitle || c.title}</h2>
       ${hookBattlePanel(intel)}
@@ -326,16 +340,9 @@ function originalityChecklist(c) {
 }
 function downloadButton(c) {
   if (!c.outputPath) return '<button class="wide" disabled>Download unavailable until rendering completes</button>';
-  return `<a id="downloadClip" class="button wide disabled" href="${c.outputPath}" download title="Complete originality checklist first">Download video</a>`;
+  return `<a id="downloadClip" class="button wide" href="${c.outputPath}" download="clip-${c.id}.mp4">Download clip</a>`;
 }
-function updateDownloadState() {
-  const link = $('#downloadClip');
-  if (!link) return;
-  const complete = $$('[data-originality]').every(input => input.checked);
-  link.classList.toggle('disabled', !complete);
-  link.setAttribute('aria-disabled', String(!complete));
-  link.title = complete ? 'Download transformed clip' : 'Complete originality checklist first';
-}
+function updateDownloadState() {}
 async function saveTransformation() {
   const effects = [];
   if ($('#zoomCuts')?.checked) effects.push('Zoom cuts');
@@ -367,9 +374,24 @@ async function markPosted() {
   renderClipDetail();
 }
 
-function renderSettings() {
-  const setup = (state.session.setup || []).filter(item => ['youtube', 'llm', 'postgres', 'ytdlp', 'ffmpeg'].includes(item.id));
-  $('#settings').innerHTML = `<div class="settings-grid"><section class="panel"><h2>Profile</h2><form id="profileForm" class="stack"><label>Name<input id="profileName" value="${esc(state.user.name)}"></label><label>Email<input value="${esc(state.user.email)}" disabled></label><button>Save profile</button></form><p class="muted">This MVP creates videos and posting copy. You manually upload them to each platform.</p></section><section class="panel"><h2>System status</h2><p>Only admins can change API keys. This list shows whether the clip pipeline is ready.</p><div class="stack">${setup.map(item => `<div class="setup-item ${item.ready ? 'ready' : ''}"><b>${item.ready ? 'Ready' : 'Needs setup'}: ${item.label}</b><p>${item.ready ? 'Working' : item.action}</p></div>`).join('')}</div></section></div>`;
+async function renderSettings() {
+  const setup = (state.session.setup || []).filter(item => ['youtube', 'llm', 'postgres', 'ytdlp', 'ffmpeg', 'platforms'].includes(item.id));
+  const tools = state.session?.tools || {};
+  let healthHtml = '';
+  try {
+    const health = await api('/api/health');
+    const rows = [
+      { label: 'FFmpeg (video rendering)', ok: health.tools?.ffmpeg?.ok, detail: health.tools?.ffmpeg?.version || health.tools?.ffmpeg?.error || '' },
+      { label: 'yt-dlp (YouTube download)', ok: health.tools?.ytdlp?.ok, detail: health.tools?.ytdlp?.version || health.tools?.ytdlp?.error || '' },
+      { label: 'AI provider (viral detection)', ok: health.tools?.llm?.ok, detail: health.tools?.llm?.ok ? 'Key configured' : 'Set LLM_API_KEY in Admin' },
+      { label: 'YouTube API (metadata)', ok: health.tools?.youtube_api?.ok, detail: health.tools?.youtube_api?.ok ? 'Key configured' : 'Optional: set YOUTUBE_API_KEY' },
+      { label: 'File upload', ok: true, detail: 'Always available — primary workflow' }
+    ];
+    healthHtml = `<section class="panel"><h2>System health</h2><p>Live status of tools that power clip generation.</p><div class="stack">${rows.map(r => `<div class="setup-item ${r.ok ? 'ready' : ''}"><span class="pill ${r.ok ? 'ok' : 'warn'}">${r.ok ? 'Ready' : 'Missing'}</span> <b>${r.label}</b><p class="muted">${esc(r.detail)}</p></div>`).join('')}</div><p class="muted" style="margin-top:8px">Queue: ${health.queue?.depth || 0} waiting, ${health.queue?.active || 0} active. Memory: ${health.memory?.rssMb || 0} MB RSS.</p></section>`;
+  } catch {
+    healthHtml = `<section class="panel"><h2>System health</h2><p class="muted">Could not load health status.</p></section>`;
+  }
+  $('#settings').innerHTML = `<div class="settings-grid"><section class="panel"><h2>Profile</h2><form id="profileForm" class="stack"><label>Name<input id="profileName" value="${esc(state.user.name)}"></label><label>Email<input value="${esc(state.user.email)}" disabled></label><button>Save profile</button></form></section>${healthHtml}</div>`;
   $('#profileForm').addEventListener('submit', async e => { e.preventDefault(); await api('/api/profile', { method: 'PATCH', body: JSON.stringify({ name: $('#profileName').value }) }); await loadAll(); });
 }
 async function renderBilling() {
@@ -428,6 +450,7 @@ function setView(view) {
   if (view === 'clipDetail') renderClipDetail();
   if (view === 'billing') renderBilling();
   if (view === 'admin') renderAdmin();
+  if (view === 'settings') renderSettings();
 }
 
 setInterval(async () => {
@@ -451,7 +474,8 @@ async function loadAll() {
   $('#userName').textContent = state.user.name;
   $('#userPlan').textContent = `${state.user.credits} credits`;
   renderNav();
-  renderHome(); renderCreate(); renderClips(); renderSettings();
+  renderHome(); renderCreate(); renderClips();
+  if ($('#settings')?.classList.contains('active')) renderSettings();
 }
 async function renderAdmin() {
   if (state.user.role !== 'admin') return setView('home');

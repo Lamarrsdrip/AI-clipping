@@ -1241,6 +1241,56 @@ async function downloadVideo(video, jobId = '') {
   return path.join(STORAGE_DIR, 'originals', found);
 }
 
+async function transcribeAudioWithWhisper(db, mediaPath, videoId) {
+  const apiKey = settingValue(db, 'LLM_API_KEY');
+  const provider = settingValue(db, 'LLM_PROVIDER') || 'openai';
+  if (!apiKey) return [];
+  const audioPath = path.join(STORAGE_DIR, 'originals', `${videoId}_audio.mp3`);
+  try {
+    await run(FFMPEG, ['-y', '-i', mediaPath, '-vn', '-ar', '16000', '-ac', '1', '-b:a', '64k', '-t', '600', audioPath], { timeoutMs: 3 * 60 * 1000, label: 'extract audio for whisper' });
+    if (!existsSync(audioPath) || statSync(audioPath).size < 512) return [];
+    const audioBytes = readFileSync(audioPath);
+    const boundary = `--------whisper${randomUUID().replace(/-/g, '')}`;
+    const fileName = 'audio.mp3';
+    const modelName = provider === 'openai' ? 'whisper-1' : 'whisper-1';
+    const part1 = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: audio/mpeg\r\n\r\n`);
+    const part2 = Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${modelName}\r\n--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\nverbose_json\r\n--${boundary}\r\nContent-Disposition: form-data; name="timestamp_granularities[]"\r\n\r\nsegment\r\n--${boundary}--\r\n`);
+    const body = Buffer.concat([part1, audioBytes, part2]);
+    const whisperEndpoint = provider === 'openai' ? 'https://api.openai.com/v1/audio/transcriptions' : 'https://api.openai.com/v1/audio/transcriptions';
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120_000);
+    let response;
+    try {
+      response = await fetch(whisperEndpoint, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${apiKey}`, 'content-type': `multipart/form-data; boundary=${boundary}` },
+        body,
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!response.ok) {
+      const errText = await response.text();
+      importLog('warn', 'Whisper transcription failed', { status: response.status, body: errText.slice(0, 400) });
+      return [];
+    }
+    const data = await response.json();
+    const segs = (data.segments || []).map(seg => ({
+      start: Number(seg.start || 0),
+      end: Number(seg.end || seg.start + 2),
+      text: String(seg.text || '').trim()
+    })).filter(seg => seg.text);
+    importLog('log', 'Whisper transcription succeeded', { videoId, segments: segs.length });
+    return segs;
+  } catch (error) {
+    importLog('warn', 'Whisper transcription error', { videoId, error: String(error.message || error).slice(0, 400) });
+    return [];
+  } finally {
+    unlinkQuiet(audioPath);
+  }
+}
+
 async function getTranscript(video, mediaPath) {
   const transcriptPath = path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.transcript.json`);
   if (existsSync(transcriptPath)) {
@@ -1348,6 +1398,14 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     throw new Error('FFmpeg finished but no valid clip output was created.');
   }
   console.log('[ffmpeg:render-complete]', { jobId, clipId, durationMs: Date.now() - startedAt, sizeBytes: statSync(output).size, memory: memorySnapshot() });
+  let thumbnailPath = '';
+  try {
+    const thumbFile = path.join(STORAGE_DIR, 'thumbs', `clip_${clipId}.jpg`);
+    await run(FFMPEG, ['-y', '-ss', '0.5', '-i', output, '-frames:v', '1', '-vf', 'scale=360:-1', '-q:v', '4', thumbFile], { timeoutMs: 30_000, label: 'clip thumbnail' });
+    if (existsSync(thumbFile)) thumbnailPath = `/media/thumbs/clip_${clipId}.jpg`;
+  } catch (thumbError) {
+    console.warn('[ffmpeg:thumb-failed]', { clipId, error: String(thumbError.message || thumbError).slice(0, 300) });
+  }
   return {
     id: clipId,
     title: `${title} #${index + 1}`,
@@ -1359,7 +1417,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     reason: moment.reason || 'educational',
     transcriptExcerpt: moment.text.slice(0, 420),
     outputPath: `/media/clips/${clipId}.mp4`,
-    thumbnailPath: '',
+    thumbnailPath,
     platform: 'universal',
     postCaption: `${hook}\n\nDesigned for TikTok, Reels, Shorts, and Facebook Reels.`,
     hashtags: ['#shorts', '#reels', '#tiktok', '#creator'],
@@ -1540,7 +1598,13 @@ async function processVideo(payload) {
     updateJob(job.id, { progress: 30, stage: 'transcribing', steps: processingSteps('transcribing', 30) });
     let transcript = [];
     try {
-      transcript = video.sourceKind === 'upload' ? [] : await getTranscript(video, mediaPath);
+      if (video.sourceKind === 'upload') {
+        updateJob(job.id, { progress: 35, stage: 'transcribing audio with Whisper', steps: processingSteps('transcribing', 35) });
+        transcript = await transcribeAudioWithWhisper(db, mediaPath, video.id);
+        if (!transcript.length) updateJob(job.id, { progress: 44, stage: 'no transcript: using visual edit fallback', steps: processingSteps('transcribing', 44) });
+      } else {
+        transcript = await getTranscript(video, mediaPath);
+      }
     } catch (error) {
       updateJob(job.id, { progress: 44, stage: 'no transcript: using visual edit fallback', steps: processingSteps('transcribing', 44) });
     }
@@ -1598,6 +1662,9 @@ function mimeFor(file) {
   if (file.endsWith('.js')) return 'application/javascript; charset=utf-8';
   if (file.endsWith('.svg')) return 'image/svg+xml';
   if (file.endsWith('.mp4')) return 'video/mp4';
+  if (file.endsWith('.jpg') || file.endsWith('.jpeg')) return 'image/jpeg';
+  if (file.endsWith('.png')) return 'image/png';
+  if (file.endsWith('.webp')) return 'image/webp';
   return 'application/octet-stream';
 }
 
@@ -2461,6 +2528,27 @@ async function handleApi(req, res, pathname) {
         saveDb(db);
       }
       return json(res, 200, { jobs: db.jobs });
+    }
+    if (pathname === '/api/health') {
+      const db = loadDb();
+      const ytdlpCommand = await workingYtDlpCommand();
+      const ytdlpStatus = ytdlpCommand ? await commandVersion(ytdlpCommand) : { ok: false, version: '', error: `Tried: ${ytdlpCandidates().join(', ')}` };
+      const ffmpegStatus = await commandVersion(FFMPEG);
+      const llmReady = settingReady(db, 'LLM_API_KEY');
+      const youtubeReady = settingReady(db, 'YOUTUBE_API_KEY');
+      const allReady = ytdlpStatus.ok && ffmpegStatus.ok && llmReady;
+      return json(res, 200, {
+        status: allReady ? 'ready' : 'degraded',
+        tools: {
+          ffmpeg: { ok: ffmpegStatus.ok, version: ffmpegStatus.version, error: ffmpegStatus.error || '' },
+          ytdlp: { ok: ytdlpStatus.ok, version: ytdlpStatus.version, command: ytdlpCommand || '', error: ytdlpStatus.error || '' },
+          llm: { ok: llmReady },
+          youtube_api: { ok: youtubeReady },
+          upload: { ok: true, note: 'File upload always available as primary workflow' }
+        },
+        memory: memorySnapshot(),
+        queue: { depth: renderQueue.length, active: activeRenderJobs }
+      });
     }
     return json(res, 404, { error: 'Not found' });
   } catch (error) {
