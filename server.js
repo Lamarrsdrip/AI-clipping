@@ -57,6 +57,9 @@ mkdirSync(path.join(STORAGE_DIR, 'originals'), { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'clips'), { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'uploads'), { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'thumbs'), { recursive: true });
+mkdirSync(path.join(STORAGE_DIR, 'transcripts'), { recursive: true });
+mkdirSync(path.join(STORAGE_DIR, 'thumbnails'), { recursive: true });
+mkdirSync(path.join(STORAGE_DIR, 'generations'), { recursive: true });
 
 const seed = {
   users: [{
@@ -101,7 +104,9 @@ const seed = {
   }],
   paymentRequests: [],
   billingPlans: defaultPlans(),
-  usageEvents: []
+  usageEvents: [],
+  transcriptions: [],
+  studioGenerations: []
 };
 
 const PLATFORMS = ['TikTok', 'YouTube Shorts', 'Instagram Reels', 'Facebook Reels', 'X'];
@@ -272,6 +277,9 @@ const API_SETTING_META = [
   ['LLM_FALLBACK_API_KEY', 'Fallback LLM API key'],
   ['LLM_FALLBACK_BASE_URL', 'Fallback LLM base URL'],
   ['LLM_FALLBACK_MODEL', 'Fallback LLM model'],
+  ['MUAPI_API_KEY', 'Muapi.ai API key (text-to-video, image-to-video, FLUX, Kling, Seedance)'],
+  ['HIGGSFIELD_API_KEY', 'Higgsfield AI API key (cinematic video & image generation)'],
+  ['ELEVENLABS_API_KEY', 'ElevenLabs API key (AI voiceover / TTS)'],
   ['STRIPE_SECRET_KEY', 'Stripe secret key'],
   ['STRIPE_WEBHOOK_SECRET', 'Stripe webhook secret'],
   ['S3_ENDPOINT', 'Cloudflare R2/S3 endpoint'],
@@ -325,6 +333,8 @@ function saveDb(db) {
   if (!Array.isArray(db.paymentRequests)) db.paymentRequests = [];
   if (!Array.isArray(db.billingPlans)) db.billingPlans = defaultPlans();
   if (!Array.isArray(db.usageEvents)) db.usageEvents = [];
+  if (!Array.isArray(db.studioGenerations)) db.studioGenerations = [];
+  if (!Array.isArray(db.transcriptions)) db.transcriptions = [];
   writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 }
 
@@ -352,7 +362,8 @@ function run(command, args, options = {}) {
     if (!executable) return reject(new Error('No command provided.'));
     const startedAt = Date.now();
     const commandLabel = label || command;
-    console.log(`[process:start] ${commandLabel}`, { jobId: jobId || '', command, args: args.slice(0, 8).join(' '), memory: memorySnapshot() });
+    // Log the complete command so filter chains can be audited
+    console.log(`[process:start] ${commandLabel}`, { jobId: jobId || '', fullCommand: `${executable} ${[...parts, ...args].join(' ')}`, memory: memorySnapshot() });
     const child = spawn(executable, [...parts, ...args], { ...spawnOptions, stdio: ['ignore', 'pipe', 'pipe'] });
     if (jobId) {
       if (!activeJobProcesses.has(jobId)) activeJobProcesses.set(jobId, new Set());
@@ -503,6 +514,23 @@ async function commandVersion(command) {
   } catch (error) {
     return { ok: false, version: '', error: error.message };
   }
+}
+
+// Cache result — probe runs once per process lifetime
+let _drawtextOk = null;
+async function drawtextSupported() {
+  if (_drawtextOk !== null) return _drawtextOk;
+  try {
+    await run(FFMPEG, [
+      '-y', '-f', 'lavfi', '-i', 'color=c=black:size=64x64:duration=0.1',
+      '-vf', "drawtext=text='x':fontsize=12", '-f', 'null', '-'
+    ]);
+    _drawtextOk = true;
+  } catch {
+    _drawtextOk = false;
+    console.warn('[ffmpeg] drawtext filter unavailable (no libfreetype). Captions will be skipped. Install ffmpeg-full for text overlay support: brew install ffmpeg-full');
+  }
+  return _drawtextOk;
 }
 
 async function verifyMediaBinaries() {
@@ -1360,7 +1388,49 @@ function buildCaptionText(text) {
 }
 
 function ffmpegText(value = '') {
-  return String(value).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'");
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/[,;]/g, ' ')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, "\\'");
+}
+
+function captionStyleFilters(hook, title, style = 'bold', canDrawText = true) {
+  if (!canDrawText) return [];
+  const h = ffmpegText(hook.slice(0, 80));
+  const t = ffmpegText(title.slice(0, 36));
+  const base = `drawtext=text='${t}':x=(w-text_w)/2:y=72:fontsize=32:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=14`;
+  switch (style) {
+    case 'hormozi':
+      return [
+        base,
+        `drawtext=text='${h}':x=(w-text_w)/2:y=h-220:fontsize=46:fontcolor=yellow:box=1:boxcolor=black@0.92:boxborderw=22`
+      ];
+    case 'luxury':
+      return [
+        `drawtext=text='${t}':x=(w-text_w)/2:y=80:fontsize=30:fontcolor=white:box=1:boxcolor=black@0.40:boxborderw=12`,
+        `drawtext=text='${h}':x=(w-text_w)/2:y=h-240:fontsize=38:fontcolor=white:box=1:boxcolor=black@0.50:boxborderw=18`
+      ];
+    case 'neon':
+      return [
+        base,
+        `drawtext=text='${h}':x=(w-text_w)/2:y=h-210:fontsize=44:fontcolor=0x00ffcc:box=1:boxcolor=black@0.88:boxborderw=20`
+      ];
+    case 'minimal':
+      return [
+        `drawtext=text='${h}':x=(w-text_w)/2:y=h-180:fontsize=32:fontcolor=white:box=1:boxcolor=black@0.30:boxborderw=10`
+      ];
+    case 'karaoke':
+      return [
+        base,
+        `drawtext=text='${h}':x=(w-text_w)/2:y=h-200:fontsize=42:fontcolor=white:box=1:boxcolor=0x6600cc@0.85:boxborderw=20`
+      ];
+    default:
+      return [
+        base,
+        `drawtext=text='${h}':x=(w-text_w)/2:y=h-240:fontsize=34:fontcolor=white:box=1:boxcolor=black@0.58:boxborderw=16`
+      ];
+  }
 }
 
 async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
@@ -1376,12 +1446,13 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   const renderSegments = (intelligence.smartEditPlan?.segments || [{ start: moment.start, end: moment.end }])
     .filter(segment => Number(segment.end) - Number(segment.start) > 1)
     .slice(0, 3);
+  const canDrawText = await drawtextSupported();
+  const captionStyle = moment.captionStyle || 'bold';
   const visualFilters = [
     `scale=${RENDER_WIDTH}:${RENDER_HEIGHT}:force_original_aspect_ratio=increase`,
     `crop=${RENDER_WIDTH}:${RENDER_HEIGHT}`,
-    "setsar=1",
-    `drawtext=text='${ffmpegText(title)}':x=(w-text_w)/2:y=90:fontsize=40:fontcolor=white:box=1:boxcolor=black@0.48:boxborderw=18`,
-    `drawtext=text='${ffmpegText(hook)}':x=(w-text_w)/2:y=h-240:fontsize=34:fontcolor=white:box=1:boxcolor=black@0.58:boxborderw=16:enable='between(t,0,${Math.min(8, moment.end - moment.start)})'`
+    'setsar=1',
+    ...captionStyleFilters(hook, title, captionStyle, canDrawText)
   ].join(',');
   if (renderSegments.length > 1) {
     const trims = renderSegments.map((segment, i) => [
@@ -1406,24 +1477,38 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   } catch (thumbError) {
     console.warn('[ffmpeg:thumb-failed]', { clipId, error: String(thumbError.message || thumbError).slice(0, 300) });
   }
+  const thumbnailOptions = await generateThumbnailOptions(clipId, output, hook, title, canDrawText);
+  const postingData = await generatePostingAssistant(db, video, { ...moment, hook }, 'TikTok');
   return {
     id: clipId,
     title: `${title} #${index + 1}`,
     hook,
+    hooks: moment.hooks || { curiosity: hook, shock: hook, value: hook, story: hook, controversy: hook, sales: hook },
+    captionStyle,
     startSeconds: moment.start,
     endSeconds: moment.end,
     score: moment.score,
+    hookStrength: moment.hookStrength || 7,
+    emotionalPunch: moment.emotionalPunch || 7,
+    controversy: moment.controversy || 5,
+    usefulness: moment.usefulness || 7,
+    shareability: moment.shareability || 7,
     rationale: moment.rationale || 'High-density transcript window with hook language and clean 15-60 second duration.',
     reason: moment.reason || 'educational',
+    brollKeywords: moment.brollKeywords || [],
+    bestPlatform: moment.bestPlatform || 'TikTok',
     transcriptExcerpt: moment.text.slice(0, 420),
     outputPath: `/media/clips/${clipId}.mp4`,
     thumbnailPath,
+    thumbnailOptions,
     platform: 'universal',
     postCaption: `${hook}\n\nDesigned for TikTok, Reels, Shorts, and Facebook Reels.`,
     hashtags: ['#shorts', '#reels', '#tiktok', '#creator'],
-    postingAssistant: await generatePostingAssistant(db, video, { ...moment, hook }, 'TikTok'),
+    postingAssistant: postingData,
+    platformContent: postingData.platformContent || null,
     transformation: defaultTransformation(title),
-    intelligence
+    intelligence,
+    createdAt: new Date().toISOString()
   };
 }
 
@@ -1495,14 +1580,34 @@ function markSourceCleaned(videoId) {
   }
 }
 
+function saveTranscriptToDb(videoId, segments) {
+  const db = loadDb();
+  if (!Array.isArray(db.transcriptions)) db.transcriptions = [];
+  const existing = db.transcriptions.findIndex(t => t.videoId === videoId);
+  const record = {
+    id: existing >= 0 ? db.transcriptions[existing].id : randomUUID(),
+    videoId,
+    segments,
+    fullText: segments.map(s => s.text).join(' '),
+    wordCount: segments.map(s => s.text.split(/\s+/).length).reduce((a, b) => a + b, 0),
+    createdAt: existing >= 0 ? db.transcriptions[existing].createdAt : new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+  if (existing >= 0) db.transcriptions[existing] = record;
+  else db.transcriptions.unshift(record);
+  saveDb(db);
+  return record;
+}
+
 function processingSteps(stage, progress) {
-  const steps = ['Queued', 'Downloading', 'Clipping', 'Captioning', 'Rendering', 'Completed'];
+  const steps = ['Queued', 'Transcribing', 'AI Analysis', 'Rendering', 'Thumbnails', 'Completed'];
   const stageText = String(stage || '').toLowerCase();
   let active = 0;
-  if (stageText.includes('download')) active = 1;
-  else if (stageText.includes('clip') || stageText.includes('viral') || stageText.includes('vertical')) active = 2;
-  else if (stageText.includes('caption') || stageText.includes('transcrib')) active = 3;
-  else if (stageText.includes('render')) active = 4;
+  if (stageText.includes('download')) active = 0;
+  else if (stageText.includes('transcrib')) active = 1;
+  else if (stageText.includes('viral') || stageText.includes('clip') || stageText.includes('hook') || stageText.includes('platform') || stageText.includes('analysis')) active = 2;
+  else if (stageText.includes('render') || stageText.includes('vertical')) active = 3;
+  else if (stageText.includes('thumb') || stageText.includes('caption')) active = 4;
   else if (stageText.includes('complete') || stageText.includes('ready') || progress >= 100) active = 5;
   return steps.map((label, index) => ({
     label,
@@ -1608,7 +1713,12 @@ async function processVideo(payload) {
     } catch (error) {
       updateJob(job.id, { progress: 44, stage: 'no transcript: using visual edit fallback', steps: processingSteps('transcribing', 44) });
     }
-    updateJob(job.id, { progress: 58, stage: 'finding viral moments', steps: processingSteps('viral', 58) });
+    if (transcript.length) {
+      saveTranscriptToDb(video.id, transcript);
+      updateJob(job.id, { progress: 50, stage: 'extracting B-roll suggestions', steps: processingSteps('analysis', 50) });
+      suggestBrollKeywords(db, transcript, video.title).catch(() => {});
+    }
+    updateJob(job.id, { progress: 58, stage: 'AI analysis — scoring viral moments', steps: processingSteps('analysis', 58) });
     const moments = transcript.length ? await detectViralMoments(db, video, transcript, clipOptions) : fallbackMomentsForVideo(video, clipOptions);
     if (!moments.length) throw new Error('Could not create a clipping window for this video.');
     updateJob(job.id, { progress: 72, stage: 'creating vertical clips', steps: processingSteps('vertical', 72) });
@@ -1735,6 +1845,153 @@ function aiConfig(db, fallback = false) {
   const baseUrl = customBaseUrl ? normalizeOpenAiBaseUrl(customBaseUrl) : (providerDefaults[provider] || '');
   const model = settingValue(db, `${prefix}MODEL`) || 'gpt-4o-mini';
   return { provider, apiKey, baseUrl, model, customBaseUrl: Boolean(customBaseUrl) };
+}
+
+// ── Higgsfield / Muapi AI media generation ────────────────────────
+// Supports two providers: Muapi.ai (multi-model hub) + Higgsfield cloud
+// Both use the same submit-then-poll pattern.
+const MUAPI_BASE = 'https://api.muapi.ai/api/v1';
+const HIGGSFIELD_BASE = 'https://cloud.higgsfield.ai/v1';
+
+const AI_MEDIA_MODELS = {
+  // Text-to-video
+  't2v-kling-5-1': { label: 'Kling 2.1 (5s)', endpoint: 'kling/v2.1/standard/text-to-video', provider: 'muapi', category: 't2v', seconds: 5 },
+  't2v-kling-10':  { label: 'Kling 2.1 (10s)', endpoint: 'kling/v2.1/standard/text-to-video', provider: 'muapi', category: 't2v', seconds: 10, extra: { duration: 10 } },
+  't2v-seedance':  { label: 'Seedance v1 (5s)', endpoint: 'bytedance/seedance/v1/lite/t2v', provider: 'muapi', category: 't2v', seconds: 5 },
+  't2v-wan':       { label: 'Wan2.1 (480p)', endpoint: 'wan/v2.1/1.3b/t2v-480p', provider: 'muapi', category: 't2v', seconds: 5 },
+  't2v-higgsfield':{ label: 'Higgsfield Cinematic', endpoint: 'text-to-video', provider: 'higgsfield', category: 't2v', seconds: 6 },
+  // Image-to-video
+  'i2v-kling':     { label: 'Kling i2v (5s)', endpoint: 'kling/v2.1/standard/image-to-video', provider: 'muapi', category: 'i2v', seconds: 5 },
+  'i2v-seedance':  { label: 'Seedance i2v', endpoint: 'bytedance/seedance/v1/lite/i2v', provider: 'muapi', category: 'i2v', seconds: 5 },
+  'i2v-wan':       { label: 'Wan2.1 i2v', endpoint: 'wan/v2.1/1.3b/i2v-480p', provider: 'muapi', category: 'i2v', seconds: 5 },
+  // Text-to-image
+  't2i-flux':      { label: 'FLUX 1.1 Pro', endpoint: 'flux/v1.1/pro', provider: 'muapi', category: 't2i' },
+  't2i-flux-ultra':{ label: 'FLUX 1.1 Ultra', endpoint: 'flux/v1.1/pro/ultra', provider: 'muapi', category: 't2i' },
+  't2i-ideogram':  { label: 'Ideogram 3.0', endpoint: 'ideogram/v3/txt-to-img', provider: 'muapi', category: 't2i' },
+  't2i-higgsfield':{ label: 'Higgsfield t2i', endpoint: 'text-to-image', provider: 'higgsfield', category: 't2i' },
+  // Lip sync
+  'lipsync-wav2lip':{ label: 'Wav2Lip', endpoint: 'wav2lip', provider: 'muapi', category: 'lipsync' },
+};
+
+async function muapiSubmit(apiKey, endpoint, payload) {
+  const res = await fetch(`${MUAPI_BASE}/${endpoint}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': apiKey },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(30000)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || data.message || `Muapi error ${res.status}`);
+  return data; // { request_id, status, ... }
+}
+
+async function muapiPoll(apiKey, requestId, maxMs = 120000) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 4000));
+    const res = await fetch(`${MUAPI_BASE}/predictions/${requestId}/result`, {
+      headers: { 'x-api-key': apiKey },
+      signal: AbortSignal.timeout(15000)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (data.status === 'completed' || data.status === 'succeeded') return data;
+    if (data.status === 'failed' || data.error) throw new Error(data.error || 'Generation failed');
+  }
+  throw new Error('Generation timed out after 2 minutes');
+}
+
+async function higgsfieldSubmit(apiKey, endpoint, payload) {
+  const res = await fetch(`${HIGGSFIELD_BASE}/${endpoint}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(30000)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || data.message || `Higgsfield error ${res.status}`);
+  return data;
+}
+
+async function higgsfieldPoll(apiKey, jobId, maxMs = 180000) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 5000));
+    const res = await fetch(`${HIGGSFIELD_BASE}/status/${jobId}`, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(15000)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (data.status === 'completed' || data.status === 'succeeded') return data;
+    if (data.status === 'failed') throw new Error(data.error || 'Higgsfield generation failed');
+  }
+  throw new Error('Generation timed out');
+}
+
+async function downloadGeneratedMedia(url, destPath) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(60000) });
+  if (!res.ok) throw new Error(`Failed to download generated media: ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  writeFileSync(destPath, buf);
+}
+
+async function runAiMediaGeneration(db, generation) {
+  const model = AI_MEDIA_MODELS[generation.model];
+  if (!model) throw new Error(`Unknown model: ${generation.model}`);
+
+  const muapiKey = settingValue(db, 'MUAPI_API_KEY');
+  const higgsfieldKey = settingValue(db, 'HIGGSFIELD_API_KEY');
+
+  generation.status = 'generating';
+  generation.startedAt = new Date().toISOString();
+  saveDb(db);
+
+  try {
+    let outputUrl = '';
+
+    if (model.provider === 'muapi') {
+      if (!muapiKey) throw new Error('MUAPI_API_KEY not configured. Add it in Admin → API Configuration.');
+      const payload = {
+        prompt: generation.prompt,
+        negative_prompt: generation.negativePrompt || '',
+        ...(generation.imageUrl ? { image_url: generation.imageUrl } : {}),
+        ...(model.extra || {})
+      };
+      const submitted = await muapiSubmit(muapiKey, model.endpoint, payload);
+      generation.externalId = submitted.request_id || submitted.id;
+      saveDb(db);
+      const result = await muapiPoll(muapiKey, generation.externalId);
+      outputUrl = result.output?.[0] || result.video_url || result.image_url || result.url || '';
+    } else if (model.provider === 'higgsfield') {
+      if (!higgsfieldKey) throw new Error('HIGGSFIELD_API_KEY not configured. Add it in Admin → API Configuration.');
+      const submitted = await higgsfieldSubmit(higgsfieldKey, model.endpoint, {
+        prompt: generation.prompt,
+        ...(generation.imageUrl ? { image_url: generation.imageUrl } : {})
+      });
+      generation.externalId = submitted.id || submitted.job_id;
+      saveDb(db);
+      const result = await higgsfieldPoll(higgsfieldKey, generation.externalId);
+      outputUrl = result.output_url || result.video_url || result.url || '';
+    }
+
+    if (!outputUrl) throw new Error('No output URL in API response');
+
+    const ext = model.category === 't2i' ? 'jpg' : 'mp4';
+    const filename = `gen_${generation.id}.${ext}`;
+    const destPath = path.join(STORAGE_DIR, 'generations', filename);
+    await downloadGeneratedMedia(outputUrl, destPath);
+
+    generation.outputPath = `/media/generations/${filename}`;
+    generation.status = 'completed';
+    generation.completedAt = new Date().toISOString();
+  } catch (err) {
+    generation.status = 'failed';
+    generation.error = String(err.message || err).slice(0, 500);
+  }
+  saveDb(db);
+}
+
+function aiMediaReady(db) {
+  return Boolean(settingValue(db, 'MUAPI_API_KEY') || settingValue(db, 'HIGGSFIELD_API_KEY'));
 }
 
 function aiEndpointCandidates(config) {
@@ -1874,32 +2131,51 @@ async function detectViralMoments(db, video, segments, options = {}) {
   const desiredLength = Math.max(5, Math.min(60, Number(options.clipLength || 15)));
   const desiredCount = Math.max(1, Math.min(10, Number(options.clipCount || 3)));
   const fallbackMoments = scoreMoments(segments, video.durationSeconds).slice(0, desiredCount);
-  const transcript = segments.map(seg => `[${Math.round(seg.start)}-${Math.round(seg.end)}] ${seg.text}`).join('\n').slice(0, 16000);
+  const transcript = segments.map(seg => `[${Math.round(seg.start)}-${Math.round(seg.end)}s] ${seg.text}`).join('\n').slice(0, 18000);
   try {
     const result = await aiChat(db, {
       purpose: 'viral moment detection',
       messages: [
-        { role: 'system', content: 'You find short-form viral moments from transcripts. Return only JSON.' },
-        { role: 'user', content: `Video title: ${video.title}\nDuration seconds: ${video.durationSeconds || 0}\nTarget clips: ${desiredCount}\nTarget clip length seconds: ${desiredLength}\n\nTranscript:\n${transcript}\n\nReturn {"moments":[{"start":number,"end":number,"score":number,"reason":"funny|educational|controversial|emotional|surprising|actionable","hook":"short hook","rationale":"why this clip works"}]}. Each moment should be close to the target length and never more than 60 seconds.` }
+        { role: 'system', content: `You are a world-class short-form video strategist who has studied 10 million viral videos. You find moments that will explode on TikTok, Reels, and Shorts. You understand hook psychology, pattern interrupts, emotional triggers, and scroll-stopping power. Return only valid JSON.` },
+        { role: 'user', content: `Analyze this video transcript and find the ${desiredCount} most viral-worthy moments.\n\nVideo title: "${video.title}"\nDuration: ${video.durationSeconds || 0}s\nTarget clip length: ${desiredLength}s (never exceed 60s)\n\nTranscript:\n${transcript}\n\nFor each moment, score it on:\n- hookStrength (1-10): How powerful is the opening sentence as a scroll stopper?\n- emotionalPunch (1-10): Does it trigger curiosity, shock, joy, anger, or inspiration?\n- controversy (1-10): Does it make people want to debate, share, or comment?\n- usefulness (1-10): Does it give actionable value viewers want to save?\n- storytelling (1-10): Does it have a beginning, tension, and payoff?\n- shareability (1-10): Would viewers share this to their story/friends?\n- overallScore (1-100): Weighted viral potential\n\nAlso generate:\n- 3 different hooks for each moment (curiosity hook, shock hook, value hook)\n- B-roll keyword suggestions (what visuals would enhance this moment)\n- Best platform for this specific clip\n- Caption style recommendation (hormozi/karaoke/minimal/luxury/neon)\n\nReturn exactly: {"moments":[{"start":number,"end":number,"overallScore":number,"hookStrength":number,"emotionalPunch":number,"controversy":number,"usefulness":number,"storytelling":number,"shareability":number,"reason":"funny|educational|controversial|emotional|surprising|actionable|inspiring|shocking","rationale":"detailed explanation of why this moment goes viral and what makes it special","hooks":{"curiosity":"hook text under 96 chars","shock":"hook text under 96 chars","value":"hook text under 96 chars","story":"hook text under 96 chars","controversy":"hook text under 96 chars","sales":"hook text under 96 chars"},"brollKeywords":["keyword1","keyword2","keyword3"],"bestPlatform":"TikTok|Instagram Reels|YouTube Shorts|X|LinkedIn","captionStyle":"hormozi|karaoke|minimal|luxury|neon"}]}` }
       ]
     });
     const parsed = extractJsonObject(result.content);
     const moments = (parsed?.moments || [])
       .map(item => {
         const start = Math.max(0, Number(item.start || 0));
-        const end = Math.min(Number(video.durationSeconds || start + 60), Number(item.end || start + 45));
+        const end = Math.min(Number(video.durationSeconds || start + 60), Number(item.end || start + desiredLength));
         const text = segments.filter(seg => seg.end >= start && seg.start <= end).map(seg => seg.text).join(' ');
+        const hooks = item.hooks || {};
+        const primaryHook = hooks.curiosity || hooks.shock || hooks.value || buildCaptionText(text);
         return {
           start,
           end,
-          score: Math.max(1, Math.min(100, Number(item.score || 75))),
+          score: Math.max(1, Math.min(100, Number(item.overallScore || item.score || 75))),
+          hookStrength: Number(item.hookStrength || 7),
+          emotionalPunch: Number(item.emotionalPunch || 7),
+          controversy: Number(item.controversy || 5),
+          usefulness: Number(item.usefulness || 7),
+          storytelling: Number(item.storytelling || 6),
+          shareability: Number(item.shareability || 7),
           reason: item.reason || 'educational',
-          hook: item.hook || buildCaptionText(text),
-          rationale: item.rationale || 'AI-selected transcript window with short-form potential.',
-          text: text || item.hook || video.title
+          hook: primaryHook.slice(0, 96),
+          hooks: {
+            curiosity: (hooks.curiosity || primaryHook).slice(0, 96),
+            shock: (hooks.shock || primaryHook).slice(0, 96),
+            value: (hooks.value || primaryHook).slice(0, 96),
+            story: (hooks.story || primaryHook).slice(0, 96),
+            controversy: (hooks.controversy || primaryHook).slice(0, 96),
+            sales: (hooks.sales || primaryHook).slice(0, 96)
+          },
+          brollKeywords: Array.isArray(item.brollKeywords) ? item.brollKeywords.slice(0, 8) : [],
+          bestPlatform: item.bestPlatform || 'TikTok',
+          captionStyle: item.captionStyle || 'hormozi',
+          rationale: item.rationale || 'AI-selected viral moment.',
+          text: text || primaryHook || video.title
         };
       })
-      .filter(item => item.end > item.start && item.end - item.start <= 60)
+      .filter(item => item.end > item.start && item.end - item.start <= 62)
       .slice(0, desiredCount);
     return moments.length ? moments : fallbackMoments;
   } catch {
@@ -1907,26 +2183,147 @@ async function detectViralMoments(db, video, segments, options = {}) {
   }
 }
 
-async function generatePostingAssistant(db, video, moment, platform = 'TikTok') {
-  const fallback = postingAssistant(video.title, moment.hook || buildCaptionText(moment.text || video.title), platform);
+async function generateMultipleHooks(db, video, moment) {
   try {
     const result = await aiChat(db, {
-      purpose: 'posting guide generation',
+      purpose: 'multi-hook generation',
       messages: [
-        { role: 'system', content: 'You generate ready-to-post short video metadata and manual upload guidance. Return only JSON.' },
-        { role: 'user', content: `Video title: ${video.title}\nClip hook: ${moment.hook || ''}\nClip reason: ${moment.reason || ''}\nTranscript excerpt: ${(moment.text || '').slice(0, 1200)}\nPlatforms: ${PLATFORMS.join(', ')}\n\nReturn {"suggestedTitle":"","caption":"","hashtags":[""],"bestPlatform":"","bestTime":"","firstComment":"","instructions":{"TikTok":[""],"Instagram Reels":[""],"Facebook Reels":[""],"YouTube Shorts":[""],"X":[""]}}.` }
+        { role: 'system', content: 'You write viral short-form video hooks. Each hook must be under 96 characters. Return only JSON.' },
+        { role: 'user', content: `Video: "${video.title}"\nClip transcript: "${(moment.text || moment.hook || '').slice(0, 800)}"\nClip reason: ${moment.reason || 'educational'}\n\nGenerate 6 powerful hooks:\n- curiosity: Creates an open loop, makes viewer need to know more\n- shock: Pattern interrupt, unexpected statement or fact\n- value: Promises clear immediate benefit or lesson\n- story: Personal story opener that hooks emotionally\n- controversy: Bold contrarian take that sparks debate\n- sales: Direct benefit-driven hook with urgency\n\nReturn: {"hooks":{"curiosity":"","shock":"","value":"","story":"","controversy":"","sales":""},"recommended":"curiosity|shock|value|story|controversy|sales","reasoning":"why this is the best hook type for this clip"}` }
       ]
     });
     const parsed = extractJsonObject(result.content) || {};
     return {
+      hooks: parsed.hooks || moment.hooks || {},
+      recommended: parsed.recommended || 'curiosity',
+      reasoning: parsed.reasoning || ''
+    };
+  } catch {
+    return { hooks: moment.hooks || {}, recommended: 'curiosity', reasoning: '' };
+  }
+}
+
+async function generateAllPlatformContent(db, video, clip) {
+  const hook = clip.hook || clip.title || video.title;
+  const excerpt = (clip.transcriptExcerpt || clip.hook || '').slice(0, 1200);
+  try {
+    const result = await aiChat(db, {
+      purpose: 'multi-platform content generation',
+      messages: [
+        { role: 'system', content: 'You are a social media expert who writes platform-native viral content. Each platform has a different voice, format, and algorithm. Return only JSON.' },
+        { role: 'user', content: `Video: "${video.title}"\nClip hook: "${hook}"\nClip transcript: "${excerpt}"\nViral score: ${clip.score}/100\nReason: ${clip.reason || 'educational'}\n\nGenerate platform-optimized content for each platform.\n\nTikTok: Casual, trend-aware, Gen-Z energy, conversational\nYouTube Shorts: SEO-optimized title, curiosity gap, searchable\nInstagram Reels: Aesthetic, lifestyle, aspirational, save-worthy\nX (Twitter): Punchy, opinionated, debate-starting, 1-3 tweets thread format\nLinkedIn: Professional insights, value-driven, thought leadership\nFacebook: Broad appeal, story-driven, community-focused\n\nReturn: {"tiktok":{"caption":"","hashtags":[],"firstComment":"","bestTime":"","tip":""},"youtube":{"title":"","description":"","tags":[],"thumbnail":"text overlay suggestion"},"instagram":{"caption":"","hashtags":[],"reelCover":"description","tip":""},"x":{"tweet":"","thread":["tweet1","tweet2"],"hashtags":[]},"linkedin":{"post":"","hashtags":[],"insight":"key professional takeaway"},"facebook":{"caption":"","tip":""},"seo":{"keywords":[],"searchQuery":"what someone would Google to find this content"},"postingSchedule":{"bestDay":"","bestTime":"","notes":""}}` }
+      ]
+    });
+    const parsed = extractJsonObject(result.content) || {};
+    return parsed;
+  } catch {
+    return {
+      tiktok: { caption: hook, hashtags: ['#viral', '#shorts', '#fyp'], firstComment: '', bestTime: '6-9pm', tip: 'Add trending audio.' },
+      youtube: { title: hook, description: `${hook}\n\n${excerpt.slice(0, 200)}`, tags: ['shorts', 'viral'], thumbnail: 'Bold text on left, face on right' },
+      instagram: { caption: `${hook} 🔥`, hashtags: ['#reels', '#viral', '#creator'], reelCover: 'Close-up face frame', tip: 'Use trending audio.' },
+      x: { tweet: hook, thread: [hook, excerpt.slice(0, 240)], hashtags: [] },
+      linkedin: { post: `${hook}\n\n${excerpt.slice(0, 400)}`, hashtags: ['#business', '#growth'], insight: hook },
+      facebook: { caption: hook, tip: 'Post to Reels and your page feed.' },
+      seo: { keywords: [], searchQuery: video.title },
+      postingSchedule: { bestDay: 'Tuesday-Thursday', bestTime: '6pm-9pm local', notes: 'Post consistently' }
+    };
+  }
+}
+
+async function generateThumbnailOptions(clipId, clipPath, hook, title, canDraw) {
+  if (!canDraw) return [];
+  const styles = [
+    { name: 'viral', label: 'Viral Bold', textColor: 'white', boxColor: 'black@0.85', fontSize: 52, textY: 'h-280', titleY: '60' },
+    { name: 'luxury', label: 'Luxury Clean', textColor: 'white', boxColor: 'black@0.60', fontSize: 42, textY: 'h-320', titleY: '80' },
+    { name: 'neon', label: 'Neon Pop', textColor: '#00ffcc', boxColor: 'black@0.90', fontSize: 48, textY: 'h-260', titleY: '70' }
+  ];
+  const results = [];
+  for (const style of styles) {
+    const outPath = path.join(STORAGE_DIR, 'thumbnails', `thumb_${clipId}_${style.name}.jpg`);
+    try {
+      const hookSafe = ffmpegText(hook.slice(0, 52));
+      const titleSafe = ffmpegText(title.slice(0, 36));
+      const filters = [
+        'scale=1280:720:force_original_aspect_ratio=increase',
+        'crop=1280:720',
+        `drawtext=text='${titleSafe}':x=(w-text_w)/2:y=${style.titleY}:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=14`,
+        `drawtext=text='${hookSafe}':x=(w-text_w)/2:y=${style.textY}:fontsize=${style.fontSize}:fontcolor=${style.textColor}:box=1:boxcolor=${style.boxColor}:boxborderw=22`
+      ].join(',');
+      await run(FFMPEG, ['-y', '-ss', '1', '-i', clipPath, '-frames:v', '1', '-vf', filters, '-q:v', '2', outPath], { timeoutMs: 15_000, label: 'thumbnail gen' });
+      if (existsSync(outPath)) {
+        results.push({ name: style.name, label: style.label, path: `/media/thumbnails/thumb_${clipId}_${style.name}.jpg` });
+      }
+    } catch { /* skip failed styles */ }
+  }
+  return results;
+}
+
+async function suggestBrollKeywords(db, transcript, title) {
+  const text = transcript.map(s => s.text).join(' ').slice(0, 6000);
+  try {
+    const result = await aiChat(db, {
+      purpose: 'broll keyword extraction',
+      messages: [
+        { role: 'system', content: 'You suggest B-roll footage keywords for video editors. Return only JSON.' },
+        { role: 'user', content: `Video: "${title}"\nTranscript: "${text}"\n\nIdentify key topics and suggest specific B-roll footage that would enhance each section. Think like a professional video editor.\n\nReturn: {"suggestions":[{"timestamp":"0-15s","topic":"what speaker is discussing","brollKeywords":["specific","footage","keywords"],"stockQuery":"exact phrase to search on Pexels/Shutterstock","mood":"energy level: calm|moderate|high|intense"}],"overallTheme":"","recommendedStyle":"talking-head|cinematic|dynamic|documentary"}` }
+      ]
+    });
+    const parsed = extractJsonObject(result.content) || {};
+    return parsed;
+  } catch {
+    return { suggestions: [], overallTheme: title, recommendedStyle: 'talking-head' };
+  }
+}
+
+async function generateFacelessScript(db, topic, style, targetSeconds = 45) {
+  const styleGuides = {
+    documentary: 'Cinematic documentary narration, mysterious, factual, authoritative',
+    motivation: 'High-energy motivational, direct, punchy sentences, calls to action',
+    finance: 'Professional financial analysis, data-driven, confident, expert tone',
+    crypto: 'Crypto-native, alpha-focused, community language, bullish energy',
+    education: 'Clear educational breakdown, step-by-step, relatable examples',
+    comedy: 'Absurdist humor, self-aware, gen-Z energy, meme references',
+    luxury: 'Premium lifestyle, aspirational, exclusive tone, elite perspective',
+    horror: 'Dark, suspenseful, slow burn reveal, chilling delivery'
+  };
+  const guide = styleGuides[style] || styleGuides.documentary;
+  try {
+    const result = await aiChat(db, {
+      purpose: 'faceless video script',
+      messages: [
+        { role: 'system', content: 'You write viral faceless video scripts. Return only JSON.' },
+        { role: 'user', content: `Create a ${targetSeconds}-second faceless short video script.\nTopic: "${topic}"\nStyle: ${guide}\n\nThe script should:\n- Open with an INSANE hook in the first 3 seconds\n- Build curiosity or tension through the middle\n- End with a powerful payoff or CTA\n- Be exactly ${targetSeconds} seconds when spoken at normal pace (~2.5 words/second)\n\nReturn: {"title":"","hook":"opening line (first 3 seconds)","script":"full narration text","scenes":[{"timestamp":"0-5s","narration":"","visualDirection":"what to show on screen","brollQuery":"stock footage search term"}],"voiceStyle":"calm|energetic|mysterious|authoritative|conversational","backgroundMusic":"genre and energy: e.g. dark ambient, upbeat electronic","wordCount":number,"estimatedSeconds":number,"captions":["line 1","line 2","line 3"]}` }
+      ]
+    });
+    const parsed = extractJsonObject(result.content) || {};
+    return { ok: true, ...parsed };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+async function generatePostingAssistant(db, video, moment, platform = 'TikTok') {
+  const fallback = postingAssistant(video.title, moment.hook || buildCaptionText(moment.text || video.title), platform);
+  try {
+    const platformContent = await generateAllPlatformContent(db, video, {
+      hook: moment.hook || '',
+      score: moment.score || 75,
+      reason: moment.reason || 'educational',
+      transcriptExcerpt: (moment.text || '').slice(0, 1200)
+    });
+    const tiktok = platformContent.tiktok || {};
+    const youtube = platformContent.youtube || {};
+    const allHashtags = [...(tiktok.hashtags || []), ...(youtube.tags || [])].slice(0, 12);
+    return {
       ...fallback,
-      suggestedTitle: parsed.suggestedTitle || fallback.suggestedTitle,
-      caption: parsed.caption || fallback.caption,
-      hashtags: Array.isArray(parsed.hashtags) && parsed.hashtags.length ? parsed.hashtags.slice(0, 12) : fallback.hashtags,
-      bestPlatform: parsed.bestPlatform || fallback.bestPlatform,
-      bestTime: parsed.bestTime || fallback.bestTime,
-      firstComment: parsed.firstComment || fallback.firstComment,
-      instructions: parsed.instructions || fallback.instructions
+      suggestedTitle: youtube.title || fallback.suggestedTitle,
+      caption: tiktok.caption || fallback.caption,
+      hashtags: allHashtags.length ? allHashtags : fallback.hashtags,
+      bestPlatform: moment.bestPlatform || platform,
+      bestTime: platformContent.postingSchedule?.bestTime || fallback.bestTime,
+      firstComment: tiktok.firstComment || fallback.firstComment,
+      platformContent,
+      instructions: fallback.instructions
     };
   } catch {
     return fallback;
@@ -2156,7 +2553,158 @@ async function handleApi(req, res, pathname) {
       const db = loadDb();
       if (!Array.isArray(db.scheduledPosts)) db.scheduledPosts = [];
       if (!Array.isArray(db.socialAccounts)) db.socialAccounts = [];
+      if (!Array.isArray(db.transcriptions)) db.transcriptions = [];
+      if (!Array.isArray(db.studioGenerations)) db.studioGenerations = [];
       return json(res, 200, db);
+    }
+    if (pathname === '/api/transcript' && req.method === 'GET') {
+      const videoId = new URL(req.url, `http://${req.headers.host}`).searchParams.get('videoId');
+      const db = loadDb();
+      if (!Array.isArray(db.transcriptions)) db.transcriptions = [];
+      const t = db.transcriptions.find(r => r.videoId === videoId);
+      return json(res, 200, t || { segments: [], fullText: '', wordCount: 0 });
+    }
+    if (pathname === '/api/hooks/generate' && req.method === 'POST') {
+      const body = await readJson(req);
+      const db = loadDb();
+      const clip = db.clips.find(c => c.id === body.clipId);
+      const video = clip ? db.videos.find(v => v.id === clip.videoId) : null;
+      if (!clip || !video) throw new Error('Clip not found.');
+      const result = await generateMultipleHooks(db, video, clip);
+      clip.hooks = result.hooks;
+      saveDb(db);
+      return json(res, 200, result);
+    }
+    if (pathname === '/api/social/generate' && req.method === 'POST') {
+      const body = await readJson(req);
+      const db = loadDb();
+      const clip = db.clips.find(c => c.id === body.clipId);
+      const video = clip ? db.videos.find(v => v.id === clip.videoId) : null;
+      if (!clip || !video) throw new Error('Clip not found.');
+      const result = await generateAllPlatformContent(db, video, clip);
+      clip.platformContent = result;
+      saveDb(db);
+      return json(res, 200, result);
+    }
+    if (pathname === '/api/thumbnail/generate' && req.method === 'POST') {
+      const body = await readJson(req);
+      const db = loadDb();
+      const clip = db.clips.find(c => c.id === body.clipId);
+      if (!clip) throw new Error('Clip not found.');
+      const clipPath = path.join(STORAGE_DIR, 'clips', path.basename(clip.outputPath));
+      const canDraw = await drawtextSupported();
+      const options = await generateThumbnailOptions(clip.id, clipPath, clip.hook || clip.title, clip.title || '', canDraw);
+      clip.thumbnailOptions = options;
+      saveDb(db);
+      return json(res, 200, { options });
+    }
+    if (pathname === '/api/broll/suggest' && req.method === 'POST') {
+      const body = await readJson(req);
+      const db = loadDb();
+      const video = db.videos.find(v => v.id === body.videoId);
+      if (!video) throw new Error('Video not found.');
+      const transcription = db.transcriptions?.find(t => t.videoId === body.videoId);
+      const segments = transcription?.segments || [];
+      const result = await suggestBrollKeywords(db, segments, video.title);
+      return json(res, 200, result);
+    }
+    if (pathname === '/api/faceless/generate' && req.method === 'POST') {
+      const body = await readJson(req);
+      if (!body.topic) throw new Error('Topic is required.');
+      const db = loadDb();
+      const result = await generateFacelessScript(db, String(body.topic), String(body.style || 'documentary'), Number(body.duration || 45));
+      if (result.ok) {
+        if (!Array.isArray(db.studioGenerations)) db.studioGenerations = [];
+        db.studioGenerations.unshift({ id: randomUUID(), type: 'faceless_script', topic: body.topic, style: body.style, result, createdAt: new Date().toISOString() });
+        db.studioGenerations = db.studioGenerations.slice(0, 50);
+        saveDb(db);
+      }
+      return json(res, 200, result);
+    }
+    // ── AI Media Generation (Higgsfield / Muapi) ─────────────────────
+    if (pathname === '/api/ai/models') {
+      const db = loadDb();
+      currentUser(req, db);
+      const ready = aiMediaReady(db);
+      const models = Object.entries(AI_MEDIA_MODELS).map(([id, m]) => ({ id, label: m.label, category: m.category, provider: m.provider, seconds: m.seconds }));
+      return json(res, 200, { models, ready });
+    }
+    if (pathname === '/api/ai/generate' && req.method === 'POST') {
+      const body = await readJson(req);
+      const db = loadDb();
+      const user = currentUser(req, db);
+      if (!body.model || !body.prompt) throw new Error('model and prompt are required');
+      if (!AI_MEDIA_MODELS[body.model]) throw new Error(`Unknown model: ${body.model}`);
+      const generation = {
+        id: randomUUID(),
+        userId: user.id,
+        model: body.model,
+        prompt: String(body.prompt).slice(0, 800),
+        negativePrompt: String(body.negativePrompt || '').slice(0, 400),
+        imageUrl: body.imageUrl || '',
+        clipId: body.clipId || '',
+        status: 'queued',
+        externalId: '',
+        outputPath: '',
+        error: '',
+        createdAt: new Date().toISOString(),
+        startedAt: null,
+        completedAt: null
+      };
+      if (!db.studioGenerations) db.studioGenerations = [];
+      db.studioGenerations.unshift(generation);
+      saveDb(db);
+      // run async
+      setImmediate(() => {
+        const db2 = loadDb();
+        const gen = db2.studioGenerations.find(g => g.id === generation.id);
+        if (gen) runAiMediaGeneration(db2, gen).catch(e => console.error('[ai-gen]', e.message));
+      });
+      return json(res, 202, { id: generation.id, status: 'queued' });
+    }
+    if (pathname === '/api/ai/generations') {
+      const db = loadDb();
+      const user = currentUser(req, db);
+      const gens = (db.studioGenerations || []).filter(g => g.userId === user.id);
+      return json(res, 200, { generations: gens });
+    }
+    if (pathname.startsWith('/api/ai/generation/') && req.method === 'DELETE') {
+      const genId = pathname.split('/').pop();
+      const db = loadDb();
+      const user = currentUser(req, db);
+      const gen = (db.studioGenerations || []).find(g => g.id === genId && g.userId === user.id);
+      if (gen?.outputPath) {
+        const fp = path.join(STORAGE_DIR, gen.outputPath.replace('/media/', ''));
+        if (existsSync(fp)) unlinkSync(fp);
+      }
+      db.studioGenerations = (db.studioGenerations || []).filter(g => !(g.id === genId && g.userId === user.id));
+      saveDb(db);
+      return json(res, 200, { ok: true });
+    }
+    if (pathname === '/api/studio/status') {
+      const db = loadDb();
+      const llmReady = settingReady(db, 'LLM_API_KEY');
+      const ffmpegReady = await hasCommand(FFMPEG);
+      const canDraw = ffmpegReady ? await drawtextSupported() : false;
+      const mediaReady = aiMediaReady(db);
+      return json(res, 200, {
+        features: {
+          transcription:   { available: llmReady,   label: 'AI Transcription',            description: 'Requires LLM API key (OpenAI Whisper compatible)' },
+          viralDetection:  { available: llmReady,   label: 'Viral Moment Detection',       description: 'AI scores every moment across 6 dimensions' },
+          hookGeneration:  { available: llmReady,   label: '6-Style Hook Generation',      description: 'Curiosity, Shock, Value, Story, Controversy, Sales' },
+          platformContent: { available: llmReady,   label: 'Platform Content Generation',  description: 'TikTok, YouTube, Instagram, X, LinkedIn, Facebook posts' },
+          captions:        { available: canDraw,    label: 'Styled Captions',              description: 'Hormozi, Karaoke, Minimal, Luxury, Neon styles' },
+          thumbnails:      { available: canDraw,    label: 'Thumbnail Generation',         description: '3 styles: Viral Bold, Luxury Clean, Neon Pop' },
+          brollSuggestions:{ available: llmReady,   label: 'B-Roll Keyword Extraction',    description: 'AI suggests stock footage keywords per transcript section' },
+          facelessContent: { available: llmReady,   label: 'Faceless Content Mode',        description: 'AI writes complete script + scene directions for faceless videos' },
+          aiImageGen:      { available: mediaReady, label: 'AI Image Generation',          description: 'FLUX 1.1 Pro, Ideogram 3.0, Higgsfield — text-to-image', setupKey: 'MUAPI_API_KEY' },
+          aiVideoGen:      { available: mediaReady, label: 'AI Video / B-Roll Studio',     description: 'Kling 2.1, Seedance, Wan2.1, Higgsfield — text-to-video & image-to-video', setupKey: 'MUAPI_API_KEY' },
+          lipSync:         { available: mediaReady, label: 'Lip Sync Studio',              description: 'Sync any voice-over to a video clip with Wav2Lip', setupKey: 'MUAPI_API_KEY' },
+          aiVoice:         { available: false,      label: 'AI Voiceover (TTS)',            description: 'Configure ElevenLabs or OpenAI TTS API key', setupKey: 'ELEVENLABS_API_KEY' },
+          translation:     { available: llmReady,   label: 'Caption Translation',           description: 'Translate captions to 10+ languages via LLM' },
+          socialPosting:   { available: false,      label: 'Direct Social Posting',         description: 'Configure TikTok/Instagram OAuth credentials', setupKey: 'TIKTOK_CLIENT_ID' }
+        }
+      });
     }
     if (pathname === '/api/onboarding' && req.method === 'POST') {
       const body = await readJson(req);
@@ -2251,6 +2799,48 @@ async function handleApi(req, res, pathname) {
         return json(res, 202, { queued: true, jobId: queued.id, queueDepth: renderQueue.length, activeRenderJobs });
       }
       throw new Error('Unsupported job action.');
+    }
+    if (pathname === '/api/video' && req.method === 'DELETE') {
+      const body = await readJson(req);
+      const db = loadDb();
+      const video = db.videos.find(v => v.id === body.videoId);
+      if (!video) throw new Error('Video not found.');
+      killActiveJobProcesses(video.id);
+      // Delete source file from disk
+      if (video.storagePath) unlinkQuiet(video.storagePath);
+      // Delete all clips and their files that belong to this video
+      const videoClips = db.clips.filter(c => c.videoId === video.id);
+      for (const clip of videoClips) {
+        if (clip.outputPath) unlinkQuiet(path.join(STORAGE_DIR, 'clips', path.basename(clip.outputPath)));
+        if (clip.thumbnailPath) unlinkQuiet(path.join(STORAGE_DIR, 'thumbs', path.basename(clip.thumbnailPath)));
+      }
+      // Remove from db
+      db.clips = db.clips.filter(c => c.videoId !== video.id);
+      db.jobs = db.jobs.filter(j => j.videoId !== video.id);
+      db.videos = db.videos.filter(v => v.id !== video.id);
+      db.projects = db.projects.filter(p => db.videos.some(v => v.projectId === p.id));
+      saveDb(db);
+      return json(res, 200, { deleted: true });
+    }
+    if (pathname === '/api/clip' && req.method === 'DELETE') {
+      const body = await readJson(req);
+      const db = loadDb();
+      if (body.all) {
+        for (const clip of db.clips) {
+          if (clip.outputPath) unlinkQuiet(path.join(STORAGE_DIR, 'clips', path.basename(clip.outputPath)));
+          if (clip.thumbnailPath) unlinkQuiet(path.join(STORAGE_DIR, 'thumbs', path.basename(clip.thumbnailPath)));
+        }
+        db.clips = [];
+        saveDb(db);
+        return json(res, 200, { deleted: true, count: db.clips.length });
+      }
+      const clip = db.clips.find(c => c.id === body.clipId);
+      if (!clip) throw new Error('Clip not found.');
+      if (clip.outputPath) unlinkQuiet(path.join(STORAGE_DIR, 'clips', path.basename(clip.outputPath)));
+      if (clip.thumbnailPath) unlinkQuiet(path.join(STORAGE_DIR, 'thumbs', path.basename(clip.thumbnailPath)));
+      db.clips = db.clips.filter(c => c.id !== body.clipId);
+      saveDb(db);
+      return json(res, 200, { deleted: true });
     }
     if (pathname === '/api/clip' && req.method === 'PATCH') {
       const body = await readJson(req);

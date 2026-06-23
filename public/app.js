@@ -1,589 +1,1293 @@
-const $ = s => document.querySelector(s);
-const $$ = s => Array.from(document.querySelectorAll(s));
-const state = { user: null, session: null, library: {}, selected: new Set(), activeVideoIds: null, clip: null, authMode: 'login', bank: null, importing: false, importStatus: null, importUrl: '', uploadProgress: 0 };
-const nav = [['home', '⌂', 'Home'], ['create', '＋', 'Create'], ['clips', '⇩', 'Clips'], ['billing', '◇', 'Billing'], ['settings', '⚙', 'Settings']];
-const platforms = ['TikTok', 'Instagram Reels', 'Facebook Reels', 'YouTube Shorts', 'X'];
-
+/* ── ClipForge AI — 2026 Content Repurposing Studio ─────────────── */
+const $ = sel => document.querySelector(sel);
+const $$ = sel => [...document.querySelectorAll(sel)];
+const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const fmt = n => Number(n) >= 1e6 ? (n/1e6).toFixed(1)+'M' : Number(n) >= 1e3 ? (n/1e3).toFixed(1)+'K' : String(n||0);
+const dur = s => { const n=Number(s||0); if(!n) return '--'; const m=Math.floor(n/60); return m>0?`${m}m ${n%60|0}s`:`${n|0}s`; };
+const when = d => { if(!d) return ''; const ms=Date.now()-new Date(d).getTime(); const m=Math.floor(ms/60000); return m<1?'just now':m<60?`${m}m ago`:m<1440?`${Math.floor(m/60)}h ago`:`${Math.floor(m/1440)}d ago`; };
 function uid() { return localStorage.getItem('clipforge:userId') || ''; }
-async function api(path, options = {}) {
-  const res = await fetch(path, { headers: { 'content-type': 'application/json', 'x-user-id': uid() }, ...options });
-  const data = await res.json();
-  if (!res.ok || data.error) throw new Error(data.error || 'Request failed');
-  return data;
+function api(path, opts = {}) {
+  return fetch(path, { ...opts, headers: { 'content-type': 'application/json', 'x-user-id': uid(), ...(opts.headers || {}) } })
+    .then(r => r.json().then(d => { if (d.error) throw new Error(d.error); return d; }));
 }
-const fmt = n => Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(n || 0);
-const dur = s => `${Math.floor((s || 0) / 60)}:${String(Math.floor((s || 0) % 60)).padStart(2, '0')}`;
-const when = d => d ? new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : 'No date';
-const empty = text => `<div class="empty">${text}</div>`;
-const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+function empty(msg) { return `<div class="empty-state"><div class="empty-icon">✦</div><p>${esc(msg)}</p></div>`; }
+function pill(label, cls='') { return `<span class="pill ${cls}">${esc(label)}</span>`; }
+function scoreColor(n) { return n>=85?'ok':n>=70?'warn':''; }
 
+const PLATFORMS = ['TikTok','YouTube Shorts','Instagram Reels','X','LinkedIn','Facebook'];
+const CAPTION_STYLES = ['bold','hormozi','luxury','neon','minimal','karaoke'];
+const FACELESS_STYLES = ['documentary','motivation','finance','crypto','education','comedy','luxury','horror'];
+const HOOK_LABELS = { curiosity:'Curiosity','shock':'Shock','value':'Value','story':'Story','controversy':'Controversy','sales':'Sales' };
+
+const state = {
+  authMode: 'login',
+  view: 'home',
+  library: { videos:[], clips:[], jobs:[], transcriptions:[], studioGenerations:[] },
+  session: null,
+  clip: null,
+  importing: false,
+  importUrl: '',
+  importStatus: null,
+  uploadProgress: 0,
+  activeVideoIds: null,
+  selected: new Set(),
+  studioTab: 'aiVideoGen',
+  facelessStyle: 'documentary',
+  facelessTopic: '',
+  facelessResult: null,
+  studioStatus: null,
+  studioModels: [],
+  generatorMode: 't2v',
+  generatorModel: 't2v-kling-5-1',
+  generatorPrompt: '',
+  generatorNeg: '',
+  generatorImageUrl: '',
+  generatorClipId: '',
+  generatorRunning: false,
+  generatorResult: null,
+  generations: [],
+  transcriptVideoId: null,
+  platformTab: 'tiktok',
+  hookTab: 'curiosity',
+  thumbTab: 0
+};
+
+/* ── Nav ─────────────────────────────────────────────────────────── */
+const NAV = [
+  { id:'home', icon:'⌂', label:'Dashboard' },
+  { id:'create', icon:'✦', label:'Create' },
+  { id:'clips', icon:'▶', label:'Clips' },
+  { id:'studio', icon:'⚡', label:'AI Studio' },
+  { id:'scheduler', icon:'◷', label:'Schedule' },
+  { id:'billing', icon:'◇', label:'Credits' },
+  { id:'settings', icon:'⚙', label:'Settings' }
+];
+
+function renderNav() {
+  const user = state.session?.user;
+  const isAdmin = user?.role === 'admin';
+  const items = isAdmin ? [...NAV, { id:'admin', icon:'◈', label:'Admin' }] : NAV;
+  const navHtml = items.map(n => `<a class="nav-item ${state.view===n.id?'active':''}" data-view="${n.id}"><span class="nav-icon">${n.icon}</span><span class="nav-label">${n.label}</span></a>`).join('');
+  const bottomHtml = items.map(n => `<a class="bottom-item ${state.view===n.id?'active':''}" data-view="${n.id}"><span>${n.icon}</span><small>${n.label}</small></a>`).join('');
+  $('#sideNav').innerHTML = navHtml;
+  $('#bottomNav').innerHTML = bottomHtml;
+  if (user) {
+    const av = (user.name||user.email||'U')[0].toUpperCase();
+    $('#userAvatar').textContent = av;
+    $('#userName').textContent = user.name || user.email;
+    $('#userPlan').textContent = `${user.credits ?? 0} credits`;
+  }
+}
+
+function setView(id) {
+  state.view = id;
+  $$('.view').forEach(el => el.classList.remove('active'));
+  const el = $(`#${id}`);
+  if (el) el.classList.add('active');
+  const eyebrows = { home:'Dashboard', create:'New Project', clips:'Clips Library', studio:'AI Studio', scheduler:'Schedule', billing:'Credits & Plans', settings:'Settings', admin:'Admin', clipDetail:'Clip Detail', transcript:'Transcript', faceless:'Faceless Mode' };
+  const titles = { home:'Welcome back', create:'Create clips', clips:'Your clips', studio:'AI Studio', scheduler:'Post schedule', billing:'Credits & billing', settings:'Settings', admin:'Admin panel', clipDetail:'Clip detail', transcript:'Transcript', faceless:'Faceless content' };
+  $('#pageEyebrow').textContent = eyebrows[id] || id;
+  $('#pageTitle').textContent = titles[id] || id;
+  renderNav();
+  if (id === 'home') renderHome();
+  if (id === 'create') renderCreate();
+  if (id === 'clips') renderClips();
+  if (id === 'studio') renderStudio();
+  if (id === 'clipDetail' && state.clip) renderClipDetail();
+  if (id === 'transcript') renderTranscript();
+  if (id === 'billing') renderBilling();
+  if (id === 'settings') renderSettings();
+  if (id === 'admin') renderAdmin();
+  if (id === 'scheduler') renderScheduler();
+}
+
+/* ── Data loading ─────────────────────────────────────────────────── */
+async function loadAll() {
+  try {
+    const [lib, sess] = await Promise.all([
+      api('/api/library'),
+      api('/api/session')
+    ]);
+    state.library = lib;
+    state.session = sess;
+    // also refresh generations in background
+    api('/api/ai/generations').then(r => { state.generations = r.generations || []; }).catch(() => {});
+  } catch (e) {
+    console.warn('loadAll error', e.message);
+  }
+}
+
+/* ── Home ─────────────────────────────────────────────────────────── */
 function renderHome() {
-  const clips = state.library.clips || [];
-  const jobs = state.library.jobs || [];
-  const tools = state.session?.tools || {};
-  const ready = clips.filter(c => !c.postedAt).length;
-  const activeJobs = jobs.filter(j => !['complete', 'completed', 'failed'].includes(j.status));
-  const systemOk = tools.ffmpeg && (tools.ytDlp || true);
-  const systemBanner = !tools.ffmpeg ? `<div class="system-banner warn"><b>FFmpeg not found.</b> Video rendering is unavailable. Deploy with Docker or install FFmpeg to generate clips. <a class="text-btn" data-view-jump="settings">See setup</a></div>` : !tools.ytDlp ? `<div class="system-banner warn"><b>yt-dlp not found.</b> YouTube download will fail. File upload still works. <a class="text-btn" data-view-jump="settings">See setup</a></div>` : '';
+  const { clips, jobs, videos } = state.library;
+  const user = state.session?.user || {};
+  const activeJobs = (jobs||[]).filter(j => ['queued','running'].includes(j.status));
+  const doneClips = (clips||[]).filter(c => c.outputPath && !c.demoMode);
+  const totalScore = doneClips.length ? Math.round(doneClips.reduce((s,c) => s+(c.score||0),0)/doneClips.length) : 0;
+
   $('#home').innerHTML = `
-    ${systemBanner}
-    <section class="hero-panel clean-hero">
-      <div>
-        <span class="eyebrow">AI Clipping SaaS v2</span>
-        <h2>Upload a video. Get viral clips in minutes.</h2>
-        <p>AI finds the best moments, renders 9:16 clips with captions and hook text, and gives you a virality score, hashtags, and platform instructions for every clip.</p>
+    <div class="home-wrap">
+      <div class="stats-row">
+        <div class="stat-card">
+          <div class="stat-num">${doneClips.length}</div>
+          <div class="stat-label">Clips Generated</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-num">${(videos||[]).length}</div>
+          <div class="stat-label">Videos Imported</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-num">${totalScore || '—'}</div>
+          <div class="stat-label">Avg Viral Score</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-num">${user.credits ?? 0}</div>
+          <div class="stat-label">Credits Left</div>
+        </div>
       </div>
-      <button data-view-jump="create">Create clips</button>
-    </section>
-    <div class="metric-grid">
-      <article class="metric-card"><span>Credits left</span><b>${state.user.credits}</b></article>
-      <article class="metric-card"><span>Clips ready</span><b>${ready}</b></article>
-      <article class="metric-card"><span>Total clips</span><b>${clips.length}</b></article>
-      <article class="metric-card"><span>Jobs run</span><b>${(state.session?.stats?.jobs) || 0}</b></article>
-    </div>
-    ${clips.length === 0 && activeJobs.length === 0 ? `<section class="panel flow-panel">
-      <h2>How it works</h2>
-      <div class="flow-steps">
-        <article><b>1</b><span>Upload a video or paste a YouTube link</span></article>
-        <article><b>2</b><span>AI detects the best viral moments</span></article>
-        <article><b>3</b><span>Clips are rendered as 9:16 vertical with captions</span></article>
-        <article><b>4</b><span>Download, copy caption and hashtags, post</span></article>
+
+      ${activeJobs.length ? `
+        <section class="panel" style="margin-bottom:16px">
+          <h2 style="margin-bottom:12px">Processing now</h2>
+          ${activeJobs.map(j => `
+            <div class="job-row active">
+              <div class="job-info">
+                <b>${esc((videos||[]).find(v=>v.id===j.videoId)?.title||'Video')}</b>
+                <span class="pill warn">${esc(j.stage||j.status)}</span>
+              </div>
+              <div class="progress"><span style="width:${j.progress||0}%"></span></div>
+            </div>
+          `).join('')}
+        </section>
+      ` : ''}
+
+      <div class="quick-actions">
+        <button class="qcard" data-view="create">
+          <div class="qcard-icon">✦</div>
+          <b>Create new clips</b>
+          <small>Upload video or paste YouTube link</small>
+        </button>
+        <button class="qcard" data-view="studio">
+          <div class="qcard-icon">⚡</div>
+          <b>AI Studio</b>
+          <small>B-roll suggestions, faceless content, thumbnails</small>
+        </button>
+        <button class="qcard" data-view="clips">
+          <div class="qcard-icon">▶</div>
+          <b>View clips</b>
+          <small>${doneClips.length} clips ready to post</small>
+        </button>
+        <button class="qcard" data-view="scheduler">
+          <div class="qcard-icon">◷</div>
+          <b>Schedule posts</b>
+          <small>Plan your content calendar</small>
+        </button>
       </div>
-    </section>` : ''}
-    <div class="grid-two">
-      <section class="panel"><div class="panel-head"><h2>Processing</h2><button class="ghost" data-view-jump="create">New job</button></div>${activeJobs.length ? activeJobs.map(jobCard).join('') : jobs.filter(j => j.status === 'failed').slice(0, 2).map(jobCard).join('') || empty('No active jobs. Start one from Create.')}</section>
-      <section class="panel"><div class="panel-head"><h2>Recent clips</h2><button class="ghost" data-view-jump="clips">View all</button></div>${clips.slice(0, 3).map(clipCard).join('') || empty('Finished clips appear here with a download button and posting guide.')}</section>
+
+      ${doneClips.length ? `
+        <section style="margin-top:24px">
+          <div class="panel-head" style="margin-bottom:12px">
+            <h2>Recent clips</h2>
+            <button class="ghost" data-view="clips">View all</button>
+          </div>
+          <div class="card-grid">${doneClips.slice(0,4).map(clipCard).join('')}</div>
+        </section>
+      ` : `
+        <section class="panel empty-state" style="margin-top:24px">
+          <div class="empty-icon">✦</div>
+          <h2>Start your first project</h2>
+          <p>Upload a video or paste a YouTube URL to generate viral short-form clips with AI.</p>
+          <button data-view="create" style="margin-top:16px">Create first clip</button>
+        </section>
+      `}
     </div>`;
 }
 
-function renderCreate() {
-  $('#create').innerHTML = `
-    <div class="create-grid">
-      <section class="panel">
-        <span class="eyebrow">Step 1</span>
-        <h2>Upload video from phone/file</h2>
-        <p>This is the main workflow. Upload your mp4, mov, webm, or m4v file, then the app renders vertical 9:16 clips with captions and hook text.</p>
-        <div id="importMessage" class="message ${state.importStatus?.type === 'error' ? 'error' : ''}">${state.importStatus?.text || ''}</div>
-        <div class="upload-box primary-upload">
-          <form id="uploadForm" class="stack"><input id="uploadVideo" type="file" accept="video/mp4,video/quicktime,video/webm,.m4v"><button ${state.importing ? 'disabled' : ''}>${state.importing ? 'Uploading...' : 'Upload video'}</button></form>
-          ${state.importing && state.uploadProgress ? `<div class="progress"><span style="width:${state.uploadProgress}%"></span></div><p class="muted">${state.uploadProgress}% uploaded</p>` : ''}
-        </div>
-        <div class="source-preview">${sourcePreview()}</div>
-        <div class="youtube-option">
-          <span class="eyebrow">Optional</span>
-          <h3>Import YouTube metadata</h3>
-          <p>YouTube can block server downloads on Render. If that happens, upload the file above and keep creating clips.</p>
-          <form id="importForm" class="source-form"><input id="sourceUrl" type="text" inputmode="url" value="${esc(state.importUrl)}" placeholder="Paste YouTube video, Shorts, channel, or playlist link" ${state.importing ? 'disabled' : ''}><button ${state.importing ? 'disabled' : ''}>Fetch</button></form>
-        </div>
-      </section>
-      <section class="panel">
-        <div class="panel-head"><div><span class="eyebrow">Step 2</span><h2>Select and generate</h2></div><span class="pill">${state.selected.size} selected</span></div>
-        <div class="stack">${videoCards()}</div>
-        <label class="permission"><input id="rightsBulk" type="checkbox"> I own these videos or have permission to reuse them.</label>
-        <div class="stack">
-          <select id="clipCount"><option value="3">3 clips per video</option><option value="5">5 clips per video</option><option value="10">10 clips per video</option></select>
-          <select id="clipLength"><option value="15">15 seconds</option><option value="30">30 seconds</option><option value="60">60 seconds</option></select>
-          <div class="platform-pills">${platforms.map(p => `<label><input type="checkbox" value="${p}" ${p === 'TikTok' ? 'checked' : ''}>${p}</label>`).join('')}</div>
-          <button id="processSelected" ${state.selected.size ? '' : 'disabled'}>Generate transformed clips</button>
-        </div>
-      </section>
-    </div>`;
-  $('#importForm').addEventListener('submit', importSource);
-  $('#uploadForm').addEventListener('submit', uploadSource);
-  $$('#create [data-select]').forEach(b => b.addEventListener('click', () => { state.selected.has(b.dataset.select) ? state.selected.delete(b.dataset.select) : state.selected.add(b.dataset.select); renderCreate(); }));
-  $('#processSelected').addEventListener('click', processSelected);
-}
-function sourcePreview() {
-  if (state.importing) return `<div class="import-loading"><div class="spinner"></div><b>Working on your video</b><p>${state.uploadProgress ? 'Uploading the file and preparing a thumbnail preview.' : 'Reading YouTube metadata if a link was submitted.'}</p><div class="progress"><span style="width:${state.uploadProgress || 62}%"></span></div></div>`;
-  const visible = activeVideos();
-  const v = visible[0];
-  if (v) return `<article class="project-card import-success"><img class="project-thumb" src="${v.thumbnailUrl || ''}"><span class="pill ok">Ready</span><h3>${v.title || v.channelTitle || 'Uploaded source'}</h3><p>${visible.length} video${visible.length === 1 ? '' : 's'} ready. Select one below, choose clip length, then generate.</p></article>`;
-  return empty(state.importStatus?.type === 'error' ? 'Nothing ready yet. Upload the video file from your phone, or try another YouTube link.' : 'Upload a video file to generate a thumbnail preview and start clipping.');
-}
+/* ── Create ─────────────────────────────────────────────────────────── */
 function activeVideos() {
   const videos = state.library.videos || [];
   if (!state.activeVideoIds?.length) return videos;
   const active = videos.filter(v => state.activeVideoIds.includes(v.id));
   return active.length ? active : videos;
 }
-function videoCards() {
+
+function renderCreate() {
+  const allVideos = state.library?.videos || [];
   const videos = activeVideos();
-  return videos.length ? videos.map(v => `<article class="video-card ${state.selected.has(v.id) ? 'selected' : ''}"><img src="${v.thumbnailUrl || ''}"><div><div class="meta"><span>${dur(v.durationSeconds)}</span><span>${v.sourceKind === 'upload' ? 'Uploaded file' : `${fmt(v.viewCount)} views`}</span><span>${v.isShort ? 'Shorts/direct' : 'Long-form'}</span><span>${when(v.publishedAt)}</span></div><h3>${v.title}</h3><p>${v.channelTitle || 'YouTube'} ${v.importWarning ? `• ${v.importWarning}` : ''}</p><button class="ghost" data-select="${v.id}">${state.selected.has(v.id) ? 'Selected' : 'Select'}</button></div></article>`).join('') : empty('No videos imported yet.');
+  const hasAny = allVideos.length > 0;
+
+  $('#create').innerHTML = `
+    <div class="create-grid">
+      <section class="panel">
+        <span class="eyebrow">Step 1</span>
+        <h2>Import your video</h2>
+        <p>Upload an mp4, mov, webm, or m4v file. Your Mac processes everything locally.</p>
+
+        <div class="upload-box">
+          <form id="uploadForm" class="stack">
+            <input id="uploadVideo" type="file" accept="video/mp4,video/quicktime,video/webm,.m4v">
+            <button ${state.importing?'disabled':''}>${state.importing?'Uploading…':'Upload video file'}</button>
+          </form>
+          ${state.importing&&state.uploadProgress?`<div class="progress"><span style="width:${state.uploadProgress}%"></span></div><p class="muted">${state.uploadProgress}% uploaded</p>`:''}
+        </div>
+
+        <div class="divider-label">or</div>
+
+        <form id="importForm" class="source-form">
+          <input id="sourceUrl" type="text" value="${esc(state.importUrl)}" placeholder="Paste YouTube URL" ${state.importing?'disabled':''}>
+          <button ${state.importing?'disabled':''}>Import</button>
+        </form>
+
+        <div id="importMessage" class="message ${state.importStatus?.type==='error'?'error':state.importStatus?.type==='success'?'success':''}">${state.importStatus?.text||''}</div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div><span class="eyebrow">Step 2</span><h2>Select &amp; generate</h2></div>
+          ${state.selected.size?`<span class="pill ok">${state.selected.size} selected</span>`:''}
+        </div>
+
+        ${videos.length ? `
+          <div class="stack">${videoCards(videos)}</div>
+          ${hasAny?`<button class="ghost danger-btn" id="clearAllVideos" style="margin-top:8px">Clear all videos &amp; clips</button>`:''}
+        ` : empty('No videos yet. Upload a file or paste a YouTube URL.')}
+
+        <label class="permission" style="margin-top:16px"><input id="rightsBulk" type="checkbox"> I own these videos or have permission to reuse them.</label>
+
+        <div class="gen-options">
+          <div class="option-row">
+            <label>Clips to generate</label>
+            <select id="clipCount">
+              <option value="3">3 clips</option>
+              <option value="5">5 clips</option>
+              <option value="10">10 clips</option>
+            </select>
+          </div>
+          <div class="option-row">
+            <label>Target length</label>
+            <select id="clipLength">
+              <option value="15">15 seconds</option>
+              <option value="30">30 seconds</option>
+              <option value="45">45 seconds</option>
+              <option value="60">60 seconds</option>
+            </select>
+          </div>
+          <div class="option-row">
+            <label>Caption style</label>
+            <select id="captionStyle">
+              ${CAPTION_STYLES.map(s=>`<option value="${s}">${s.charAt(0).toUpperCase()+s.slice(1)}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+
+        <button id="processSelected" ${state.selected.size?'':'disabled'}>Generate clips with AI →</button>
+      </section>
+    </div>`;
+
+  $('#importForm').addEventListener('submit', importSource);
+  $('#uploadForm').addEventListener('submit', uploadSource);
+  $$('#create [data-select-video]').forEach(b => b.addEventListener('click', () => {
+    const id = b.dataset.selectVideo;
+    state.selected.has(id) ? state.selected.delete(id) : state.selected.add(id);
+    renderCreate();
+  }));
+  $('#processSelected').addEventListener('click', processSelected);
 }
+
+function videoCards(videos) {
+  return videos.map(v => `<article class="video-card ${state.selected.has(v.id)?'selected':''}">
+    <img src="${esc(v.thumbnailUrl||'')}" loading="lazy">
+    <div>
+      <h3>${esc(v.title)}</h3>
+      <div class="meta">
+        <span>${dur(v.durationSeconds)}</span>
+        <span>${v.sourceKind==='upload'?'Uploaded':fmt(v.viewCount)+' views'}</span>
+        <span>${when(v.publishedAt)}</span>
+      </div>
+      <div class="action-row" style="margin-top:10px">
+        <button class="ghost" data-select-video="${v.id}">${state.selected.has(v.id)?'✓ Selected':'Select'}</button>
+        <button class="ghost danger-btn" data-delete-video="${v.id}">Delete</button>
+      </div>
+    </div>
+  </article>`).join('');
+}
+
 async function importSource(e) {
   e.preventDefault();
-  const sourceUrl = $('#sourceUrl').value.trim();
-  if (!sourceUrl) {
-    state.importStatus = { type: 'error', text: 'Paste a YouTube link first, or upload a video file above.' };
-    renderCreate();
-    return;
-  }
-  state.importUrl = sourceUrl;
-  state.importing = true;
-  state.uploadProgress = 0;
-  state.activeVideoIds = null;
-  state.selected.clear();
-  state.importStatus = { type: 'loading', text: 'Fetching YouTube metadata...' };
+  const url = $('#sourceUrl').value.trim();
+  if (!url) { state.importStatus={type:'error',text:'Paste a YouTube URL first.'}; renderCreate(); return; }
+  state.importUrl=url; state.importing=true; state.importStatus={type:'loading',text:'Fetching metadata…'};
   renderCreate();
   try {
-    const res = await api('/api/import', { method: 'POST', body: JSON.stringify({ sourceUrl }) });
-    state.activeVideoIds = (res.videos || []).map(v => v.id);
-    state.importStatus = { type: 'success', text: `Imported ${res.videos.length} video${res.videos.length === 1 ? '' : 's'} using ${res.source || 'metadata'}.` };
-    if (res.warnings?.length) state.importStatus.text += ` ${res.warnings[0]}`;
-    await loadAll();
-    state.importing = false;
-    setView('create');
-  } catch (err) {
-    state.importing = false;
-    state.importStatus = { type: 'error', text: err.message || 'Import failed. Try another YouTube link.' };
-    renderCreate();
+    const res = await api('/api/import', { method:'POST', body:JSON.stringify({ sourceUrl:url }) });
+    state.activeVideoIds=(res.videos||[]).map(v=>v.id);
+    state.importStatus={type:'success',text:`Imported ${res.videos.length} video${res.videos.length===1?'':'s'}.`};
+    await loadAll(); state.importing=false; setView('create');
+  } catch(err) {
+    state.importing=false; state.importStatus={type:'error',text:err.message||'Import failed.'}; renderCreate();
   }
 }
+
 async function uploadSource(e) {
   e.preventDefault();
-  const file = $('#uploadVideo').files?.[0];
-  if (!file) {
-    state.importStatus = { type: 'error', text: 'Choose a video file first.' };
-    renderCreate();
-    return;
-  }
-  const allowed = ['mp4', 'mov', 'webm', 'm4v'];
-  const ext = file.name.split('.').pop().toLowerCase();
-  if (!allowed.includes(ext)) {
-    state.importStatus = { type: 'error', text: 'Unsupported format. Upload mp4, mov, webm, or m4v.' };
-    renderCreate();
-    return;
-  }
-  state.importing = true;
-  state.uploadProgress = 1;
-  state.importUrl = '';
-  state.activeVideoIds = [];
-  state.selected.clear();
-  state.importStatus = { type: 'loading', text: `Uploading ${file.name}...` };
+  const file=$('#uploadVideo').files?.[0];
+  if (!file) { state.importStatus={type:'error',text:'Choose a video file first.'}; renderCreate(); return; }
+  const ext=file.name.split('.').pop().toLowerCase();
+  if (!['mp4','mov','webm','m4v'].includes(ext)) { state.importStatus={type:'error',text:'Unsupported format. Use mp4, mov, webm, or m4v.'}; renderCreate(); return; }
+  state.importing=true; state.uploadProgress=1; state.importStatus={type:'loading',text:`Uploading ${file.name}…`};
   renderCreate();
   try {
-    const form = new FormData();
-    form.append('video', file);
-    form.append('title', file.name.replace(/\.[^.]+$/, ''));
-    const data = await uploadWithProgress(form);
-    state.activeVideoIds = (data.videos || []).map(v => v.id);
-    state.selected = new Set(state.activeVideoIds);
-    state.uploadProgress = 100;
-    const removed = data.cleanup?.removedVideos ? ` Removed ${data.cleanup.removedVideos} old source video${data.cleanup.removedVideos === 1 ? '' : 's'}.` : '';
-    state.importStatus = { type: 'success', text: `Uploaded ${data.videos.length} video file. Thumbnail ready. Select clip length and generate clips.${removed}` };
-    await loadAll();
-    state.importing = false;
-    state.uploadProgress = 0;
-    setView('create');
-  } catch (err) {
-    state.importing = false;
-    state.uploadProgress = 0;
-    state.importStatus = { type: 'error', text: err.message || 'Upload failed.' };
-    renderCreate();
+    const form=new FormData(); form.append('video',file); form.append('title',file.name.replace(/\.[^.]+$/,''));
+    const data=await uploadWithProgress(form);
+    state.activeVideoIds=(data.videos||[]).map(v=>v.id);
+    state.selected=new Set(state.activeVideoIds);
+    state.importStatus={type:'success',text:'Uploaded. Select options and generate clips.'};
+    await loadAll(); state.importing=false; state.uploadProgress=0; setView('create');
+  } catch(err) {
+    state.importing=false; state.importStatus={type:'error',text:err.message||'Upload failed.'}; renderCreate();
   }
 }
+
 function uploadWithProgress(form) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/upload');
-    xhr.setRequestHeader('x-user-id', uid());
-    xhr.upload.onprogress = event => {
-      if (!event.lengthComputable) return;
-      state.uploadProgress = Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100)));
-      state.importStatus = { type: 'loading', text: `Uploading video... ${state.uploadProgress}%` };
+  return new Promise((resolve,reject) => {
+    const xhr=new XMLHttpRequest();
+    xhr.open('POST','/api/upload'); xhr.setRequestHeader('x-user-id',uid());
+    xhr.upload.onprogress=ev => {
+      if (!ev.lengthComputable) return;
+      state.uploadProgress=Math.max(1,Math.min(99,Math.round((ev.loaded/ev.total)*100)));
+      state.importStatus={type:'loading',text:`Uploading… ${state.uploadProgress}%`};
       renderCreate();
     };
-    xhr.onerror = () => reject(new Error('Upload failed. Check your connection and try again.'));
-    xhr.onload = () => {
-      let data = {};
-      try { data = JSON.parse(xhr.responseText || '{}'); } catch { return reject(new Error('Upload failed. Server returned an invalid response.')); }
-      if (xhr.status >= 400 || data.error) reject(new Error(data.error || 'Upload failed.'));
-      else resolve(data);
+    xhr.onerror=()=>reject(new Error('Upload failed.'));
+    xhr.onload=()=>{
+      let d={};
+      try { d=JSON.parse(xhr.responseText||'{}'); } catch { return reject(new Error('Invalid response.')); }
+      if (xhr.status>=400||d.error) reject(new Error(d.error||'Upload failed.'));
+      else resolve(d);
     };
     xhr.send(form);
   });
 }
+
 async function processSelected() {
   if (!$('#rightsBulk').checked) return alert('Confirm permission first.');
-  const selected = [...state.selected];
+  const selected=[...state.selected];
   if (!selected.length) return alert('Select at least one video first.');
-  const button = $('#processSelected');
-  button.disabled = true;
-  button.textContent = 'Starting job...';
-  const clipCount = Number($('#clipCount')?.value || 3);
-  const clipLength = Number($('#clipLength')?.value || 15);
-  state.importStatus = { type: 'loading', text: 'Starting clip generation. You will see progress on the Clips page.' };
+  const btn=$('#processSelected'); btn.disabled=true; btn.textContent='Starting…';
+  const clipCount=Number($('#clipCount')?.value||3);
+  const clipLength=Number($('#clipLength')?.value||15);
+  const captionStyle=$('#captionStyle')?.value||'bold';
+  state.importStatus={type:'loading',text:'Starting AI analysis. Check Clips page for progress.'};
   renderCreate();
   try {
-    await Promise.all(selected.map(videoId => api('/api/process', { method: 'POST', body: JSON.stringify({ videoId, rightsConfirmed: true, clipCount, clipLength }) })));
-    state.selected.clear();
-    await loadAll();
-    setView('clips');
-  } catch (err) {
-    state.importStatus = { type: 'error', text: err.message || 'Could not start clip generation.' };
-    await loadAll();
-    setView('create');
+    await Promise.all(selected.map(videoId=>api('/api/process',{method:'POST',body:JSON.stringify({videoId,rightsConfirmed:true,clipCount,clipLength,captionStyle})})));
+    state.selected.clear(); await loadAll(); setView('clips');
+  } catch(err) {
+    state.importStatus={type:'error',text:err.message||'Could not start generation.'};
+    await loadAll(); renderCreate();
   }
 }
-function jobCard(j) {
-  const v = state.library.videos?.find(x => x.id === j.videoId);
-  const blocked = /Upload the video file instead/i.test(j.error || '');
-  const stale = !['failed', 'complete', 'completed'].includes(j.status) && Date.now() - new Date(j.updatedAt || j.createdAt).getTime() > 3 * 60 * 1000;
-  const statusText = stale ? `${j.status} · no recent update` : j.status;
-  const actions = j.status === 'failed'
-    ? `<button data-retry-job="${j.id}">Retry</button><button class="ghost" data-delete-job="${j.id}">Delete</button>${blocked ? '<button data-view-jump="create">Upload file instead</button>' : ''}`
-    : `<button class="ghost" data-cancel-job="${j.id}">Cancel job</button>`;
-  return `<article class="admin-card"><div class="panel-head"><div><b>${v?.title || 'Video'}</b><p>${j.stage}${j.error ? ` • ${esc(j.error)}` : ''}</p></div><span class="pill ${j.status === 'complete' ? 'ok' : j.status === 'failed' ? 'bad' : stale ? 'bad' : 'warn'}">${statusText}</span></div><div class="progress"><span style="width:${j.progress || 0}%"></span></div><div class="actions">${actions}</div></article>`;
-}
 
+/* ── Clips ─────────────────────────────────────────────────────────── */
 function renderClips() {
-  const clips = (state.library.clips || []).filter(c => c.outputPath && !c.demoMode);
-  const seen = new Set();
-  const jobs = (state.library.jobs || []).filter(j => !['complete', 'completed'].includes(j.status)).filter(j => {
-    const key = j.status === 'failed' ? `${j.videoId}:${j.status}:${j.error}` : j.id;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-  const tools = state.session?.tools || {};
-  const readyNote = !tools.ffmpeg
-    ? `<div class="system-banner warn"><b>FFmpeg is not available.</b> Clip rendering will fail until FFmpeg is installed on the server. <a class="text-btn" data-view-jump="settings">See setup</a></div>`
-    : '';
-  $('#clips').innerHTML = `${readyNote}${jobs.length ? `<section class="panel"><h2>Processing</h2>${jobs.map(jobCard).join('')}</section>` : ''}${clips.length ? `<div class="panel-head"><div><span class="eyebrow">Library</span><h2>Ready clips (${clips.length})</h2></div><button data-view-jump="create">Create more</button></div><div class="card-grid">${clips.map(clipCard).join('')}</div>` : `<section class="panel empty-state"><h2>No clips yet</h2><p>Upload a video file or paste a YouTube link to get started. Rendered 9:16 clips appear here with download buttons, captions, and virality scores.</p><button data-view-jump="create">Create your first clip</button></section>`}`;
+  const clips=(state.library.clips||[]).filter(c=>c.outputPath&&!c.demoMode);
+  const jobs=(state.library.jobs||[]).filter(j=>!['complete','completed'].includes(j.status));
+
+  $('#clips').innerHTML = `
+    ${jobs.length?`<section class="panel" style="margin-bottom:16px">
+      <h2 style="margin-bottom:12px">Processing</h2>
+      ${jobs.map(jobCard).join('')}
+    </section>`:''}
+    ${clips.length
+      ? `<div class="panel-head" style="margin-bottom:12px">
+           <div><span class="eyebrow">Library</span><h2>Clips ready to post (${clips.length})</h2></div>
+           <div style="display:flex;gap:8px">
+             <button data-view-jump="create">+ New</button>
+             <button class="ghost danger-btn" id="clearAllClips">Clear all</button>
+           </div>
+         </div>
+         <div class="card-grid">${clips.map(clipCard).join('')}</div>`
+      : `<section class="panel empty-state">
+           <div class="empty-icon">▶</div>
+           <h2>No clips yet</h2>
+           <p>Upload a video and generate clips to see them here.</p>
+           <button data-view-jump="create" style="margin-top:16px">Create first clip</button>
+         </section>`}`;
 }
+
+function jobCard(j) {
+  const videos=state.library.videos||[];
+  const vid=videos.find(v=>v.id===j.videoId);
+  const steps=j.steps||[];
+  const isFailed=j.status==='failed';
+  const isActive=['queued','running'].includes(j.status);
+  const actions=isFailed
+    ? `<button data-retry-job="${j.id}">Retry</button><button class="ghost" data-delete-job="${j.id}">Delete</button>`
+    : isActive?`<button class="ghost" data-cancel-job="${j.id}">Cancel</button>`:'';
+  return `<div class="job-card ${isFailed?'failed':isActive?'active':''}">
+    <div class="job-head">
+      <div>
+        <b>${esc(vid?.title||'Video')}</b>
+        ${pill(j.stage||j.status, isFailed?'error':isActive?'warn':'ok')}
+      </div>
+      <div class="action-row">${actions}</div>
+    </div>
+    ${steps.length?`<div class="steps-row">${steps.map(s=>`<div class="step ${s.status}"><span></span><small>${esc(s.label)}</small></div>`).join('')}</div>`:''}
+    ${isActive?`<div class="progress" style="margin-top:8px"><span style="width:${j.progress||0}%"></span></div>`:''}
+    ${j.error?`<p class="error-text">${esc(j.error)}</p>`:''}
+  </div>`;
+}
+
 function clipCard(c) {
-  const assistant = c.postingAssistant || {};
-  const intel = c.intelligence || {};
-  const durationSec = Math.round((c.endSeconds || 0) - (c.startSeconds || 0));
-  const scoreColor = c.score >= 85 ? 'ok' : c.score >= 70 ? 'warn' : '';
-  const preview = c.thumbnailPath
-    ? `<img src="${c.thumbnailPath}" alt="Clip thumbnail" loading="lazy">`
-    : `<video src="${c.outputPath}" muted playsinline preload="none"></video>`;
-  return `<article class="clip-card"><div class="clip-preview">${preview}<span class="pill ${scoreColor}">${c.score}/100</span><span class="clip-dur">${durationSec}s</span></div><div class="clip-body"><h3>${esc(assistant.suggestedTitle || c.hook)}</h3><div class="meta"><span>${when(c.createdAt)}</span><span>${esc(assistant.bestPlatform || 'TikTok')}</span><span>${esc(intel.smartEditPlan?.mode || 'Smart cut')}</span></div><p class="clip-rationale">${esc(c.rationale)}</p><div class="actions"><button data-open-clip="${c.id}">View details</button><a class="button ghost" href="${c.outputPath}" download="clip-${c.id}.mp4">Download</a><button class="ghost" data-copy="${encodeURIComponent(assistant.caption || c.postCaption || '')}">Copy caption</button></div></div></article>`;
+  const dur2=Math.round((c.endSeconds||0)-(c.startSeconds||0));
+  const preview=c.thumbnailPath
+    ?`<img src="${c.thumbnailPath}" alt="Clip thumbnail" loading="lazy">`
+    :`<video src="${c.outputPath}" muted playsinline preload="none"></video>`;
+  return `<article class="clip-card" data-open-clip="${c.id}">
+    <div class="clip-preview">${preview}<span class="pill ${scoreColor(c.score)}">${c.score}/100</span><span class="clip-dur">${dur2}s</span></div>
+    <div class="clip-body">
+      <h3>${esc(c.hook||c.title)}</h3>
+      <div class="meta"><span>${when(c.createdAt)}</span><span>${esc(c.bestPlatform||'TikTok')}</span><span>${esc(c.captionStyle||'bold')}</span></div>
+      <div class="score-bars">
+        ${c.hookStrength?`<div class="score-bar"><small>Hook</small><div class="bar"><span style="width:${c.hookStrength*10}%"></span></div></div>`:''}
+        ${c.shareability?`<div class="score-bar"><small>Share</small><div class="bar"><span style="width:${c.shareability*10}%"></span></div></div>`:''}
+      </div>
+      <div class="actions">
+        <button data-open-clip="${c.id}">View</button>
+        <a class="button ghost" href="${c.outputPath}" download="clip-${c.id}.mp4">Download</a>
+        <button class="ghost danger-btn" data-delete-clip="${c.id}">Delete</button>
+      </div>
+    </div>
+  </article>`;
 }
 
+/* ── Clip Detail ─────────────────────────────────────────────────────── */
 function renderClipDetail() {
-  const c = state.clip;
-  if (!c) { $('#clipDetail').innerHTML = empty('Choose a clip first.'); return; }
-  const a = c.postingAssistant || {};
-  const intel = c.intelligence || {};
-  $('#clipDetail').innerHTML = `<div class="grid-two">
-    <section class="panel stack"><div class="phone">${c.outputPath ? `<video src="${c.outputPath}" controls poster="${c.thumbnailPath || ''}"></video>` : `<div class="demo">${esc(c.hook)}</div>`}</div>${downloadButton(c)}${viralRecipePanel(intel)}${smartEditPanel(intel)}</section>
-    <section class="panel stack">
-      <h2>${a.suggestedTitle || c.title}</h2>
-      ${hookBattlePanel(intel)}
-      ${transformationPanel(c)}
-      <div class="copy-box"><b>Caption</b><p>${a.caption || c.postCaption}</p><button class="ghost" data-copy="${encodeURIComponent(a.caption || c.postCaption || '')}">Copy caption</button></div>
-      <div class="copy-box"><b>Hashtags</b><p>${(a.hashtags || c.hashtags || []).join(' ')}</p><button class="ghost" data-copy="${encodeURIComponent((a.hashtags || c.hashtags || []).join(' '))}">Copy hashtags</button></div>
-      <p><b>Best platform:</b> ${a.bestPlatform || 'TikTok'}<br><b>Best time:</b> ${a.bestTime || '6-9 PM'}<br><b>First comment:</b> ${a.firstComment || ''}</p>
-      <h2>Originality checklist</h2><div class="stack">${originalityChecklist(c)}</div>
-      <button id="markPosted">${c.postedAt ? 'Posted' : 'Mark as posted'}</button>
-      <button id="saveTransform" class="ghost">Save transformation settings</button>
-    </section>
-  </div>
-  ${viralLabPanel(intel)}
-  <section class="panel"><h2>Platform upload instructions</h2><div class="card-grid">${Object.entries(a.instructions || {}).map(([platform, steps]) => `<article class="project-card"><h3>${platform}</h3><ol>${steps.map(s => `<li>${s}</li>`).join('')}</ol></article>`).join('')}</div></section>`;
-  $('#markPosted')?.addEventListener('click', markPosted);
-  $('#saveTransform')?.addEventListener('click', saveTransformation);
-  $$('#clipDetail [data-originality]').forEach(input => input.addEventListener('change', updateDownloadState));
-  updateDownloadState();
+  const c=state.clip;
+  if (!c) { $('#clipDetail').innerHTML=empty('Choose a clip first.'); return; }
+  const pa=c.postingAssistant||{};
+  const pc=c.platformContent||pa.platformContent||{};
+  const hooks=c.hooks||{};
+  const thumbOptions=c.thumbnailOptions||[];
+  const intel=c.intelligence||{};
+  const dur2=Math.round((c.endSeconds||0)-(c.startSeconds||0));
+
+  $('#clipDetail').innerHTML = `
+    <div class="detail-grid">
+      <!-- Left: video + scores -->
+      <section class="panel stack">
+        <div class="phone-frame">
+          ${c.outputPath?`<video src="${c.outputPath}" controls poster="${c.thumbnailPath||''}" playsinline></video>`:`<div class="demo-frame">${esc(c.hook)}</div>`}
+        </div>
+        <div class="score-panel">
+          <div class="big-score ${scoreColor(c.score)}">${c.score}<small>/100</small></div>
+          <div class="score-grid">
+            ${[['Hook','hookStrength'],['Emotion','emotionalPunch'],['Controversy','controversy'],['Usefulness','usefulness'],['Story','storytelling'],['Shareability','shareability']].map(([l,k])=>c[k]?`<div class="score-item"><small>${l}</small><b>${c[k]}/10</b></div>`:'').join('')}
+          </div>
+        </div>
+        <div class="meta" style="margin-top:8px">
+          <span>${dur2}s clip</span>
+          <span>${esc(c.reason||'educational')}</span>
+          <span>Style: ${esc(c.captionStyle||'bold')}</span>
+        </div>
+        <a class="button" href="${c.outputPath}" download="clip-${c.id}.mp4" style="text-align:center">⬇ Download clip</a>
+        ${thumbOptions.length?`
+          <div>
+            <h4 style="margin-bottom:8px">Thumbnail options</h4>
+            <div class="thumb-options">
+              ${thumbOptions.map((t,i)=>`<div class="thumb-opt ${state.thumbTab===i?'active':''}" data-thumb-idx="${i}">
+                <img src="${t.path}" alt="${esc(t.label)}">
+                <small>${esc(t.label)}</small>
+                <a href="${t.path}" download="thumb-${c.id}-${t.name}.jpg" class="dl-thumb">⬇</a>
+              </div>`).join('')}
+            </div>
+          </div>
+        `:`<button class="ghost" id="genThumbs">Generate thumbnails</button>`}
+      </section>
+
+      <!-- Right: tabs -->
+      <div class="detail-right">
+        <!-- Hooks -->
+        <section class="panel">
+          <div class="panel-head">
+            <h3>AI Hooks <span class="eyebrow" style="margin-left:8px">6 styles</span></h3>
+            <button class="ghost" id="regenHooks">Regenerate</button>
+          </div>
+          <div class="tab-row">
+            ${Object.keys(HOOK_LABELS).map(k=>`<button class="tab ${state.hookTab===k?'active':''}" data-hook-tab="${k}">${HOOK_LABELS[k]}</button>`).join('')}
+          </div>
+          ${Object.entries(HOOK_LABELS).map(([k,l])=>`
+            <div class="tab-panel ${state.hookTab===k?'active':''}" data-hook-panel="${k}">
+              <div class="hook-text">"${esc(hooks[k]||c.hook||'')}"</div>
+              <button class="ghost" data-copy="${encodeURIComponent(hooks[k]||c.hook||'')}">Copy</button>
+            </div>
+          `).join('')}
+        </section>
+
+        <!-- Platform content -->
+        <section class="panel" style="margin-top:16px">
+          <div class="panel-head">
+            <h3>Platform content</h3>
+            <button class="ghost" id="regenPlatform">Regenerate</button>
+          </div>
+          <div class="tab-row">
+            ${['tiktok','youtube','instagram','x','linkedin','facebook'].map(p=>`<button class="tab ${state.platformTab===p?'active':''}" data-platform-tab="${p}">${p==='tiktok'?'TikTok':p==='youtube'?'YouTube':p==='instagram'?'Instagram':p==='x'?'X / Twitter':p==='linkedin'?'LinkedIn':'Facebook'}</button>`).join('')}
+          </div>
+          ${renderPlatformContent(pc)}
+        </section>
+
+        <!-- B-roll suggestions -->
+        ${c.brollKeywords?.length?`
+          <section class="panel" style="margin-top:16px">
+            <h3>B-Roll keywords</h3>
+            <p class="muted" style="margin-bottom:10px">Search these on Pexels, Shutterstock, or Pixabay</p>
+            <div class="keyword-chips">
+              ${c.brollKeywords.map(k=>`<div class="kw-chip" data-copy="${encodeURIComponent(k)}">${esc(k)} ⎘</div>`).join('')}
+            </div>
+          </section>
+        `:''}
+
+        <!-- Rationale -->
+        <section class="panel" style="margin-top:16px">
+          <h3>Why this clip works</h3>
+          <p>${esc(c.rationale)}</p>
+          ${c.transcriptExcerpt?`<details style="margin-top:12px"><summary class="muted">Transcript excerpt</summary><p style="margin-top:8px;font-size:13px;line-height:1.6">${esc(c.transcriptExcerpt)}</p></details>`:''}
+        </section>
+      </div>
+    </div>`;
+
+  // Hook tabs
+  $$('[data-hook-tab]').forEach(btn => btn.addEventListener('click', () => {
+    state.hookTab=btn.dataset.hookTab;
+    $$('.tab[data-hook-tab]').forEach(b=>b.classList.toggle('active',b===btn));
+    $$('[data-hook-panel]').forEach(p=>p.classList.toggle('active',p.dataset.hookPanel===btn.dataset.hookTab));
+  }));
+
+  // Platform tabs
+  $$('[data-platform-tab]').forEach(btn => btn.addEventListener('click', () => {
+    state.platformTab=btn.dataset.platformTab;
+    $$('.tab[data-platform-tab]').forEach(b=>b.classList.toggle('active',b===btn));
+    $$('[data-platform-panel]').forEach(p=>p.classList.toggle('active',p.dataset.platformPanel===btn.dataset.platformTab));
+    renderPlatformPanels(pc);
+  }));
+
+  // Thumbnail tabs
+  $$('[data-thumb-idx]').forEach(btn => btn.addEventListener('click', () => {
+    state.thumbTab=Number(btn.dataset.thumbIdx);
+    $$('[data-thumb-idx]').forEach(b=>b.classList.toggle('active',b===btn));
+  }));
+
+  $('#regenHooks')?.addEventListener('click', async () => {
+    $('#regenHooks').textContent='Regenerating…'; $('#regenHooks').disabled=true;
+    try {
+      const res=await api('/api/hooks/generate',{method:'POST',body:JSON.stringify({clipId:c.id})});
+      state.clip.hooks=res.hooks;
+      renderClipDetail();
+    } catch(e) { alert(e.message); }
+  });
+
+  $('#regenPlatform')?.addEventListener('click', async () => {
+    $('#regenPlatform').textContent='Generating…'; $('#regenPlatform').disabled=true;
+    try {
+      const res=await api('/api/social/generate',{method:'POST',body:JSON.stringify({clipId:c.id})});
+      state.clip.platformContent=res;
+      renderClipDetail();
+    } catch(e) { alert(e.message); }
+  });
+
+  $('#genThumbs')?.addEventListener('click', async () => {
+    $('#genThumbs').textContent='Generating…'; $('#genThumbs').disabled=true;
+    try {
+      const res=await api('/api/thumbnail/generate',{method:'POST',body:JSON.stringify({clipId:c.id})});
+      state.clip.thumbnailOptions=res.options;
+      renderClipDetail();
+    } catch(e) { alert(e.message); $('#genThumbs').textContent='Generate thumbnails'; $('#genThumbs').disabled=false; }
+  });
 }
 
-function viralRecipePanel(intel) {
-  const recipe = intel.viralRecipe || {};
-  const rows = [
-    ['Hook', recipe.hookStrength],
-    ['Emotion', recipe.emotionalPunch],
-    ['Share', recipe.shareability],
-    ['Clarity', recipe.clarity]
-  ];
-  return `<div class="viral-panel"><h2>Viral recipe</h2>${rows.map(([label, value]) => `<div class="score-row"><span>${label}</span><b>${value || 0}/10</b><i style="width:${(value || 0) * 10}%"></i></div>`).join('')}<p>${esc(recipe.retentionRisk || 'Retention analysis will appear here.')}</p></div>`;
-}
-function smartEditPanel(intel) {
-  const plan = intel.smartEditPlan || {};
-  return `<div class="viral-panel"><h2>${esc(plan.mode || 'Smart edit')}</h2><p>Removed dead air estimate: <b>${plan.removedDeadAirSeconds || 0}s</b></p><div class="mini-list">${(plan.segments || []).map(s => `<span>${esc(s.label || 'segment')}: ${dur(s.start)}-${dur(s.end)}</span>`).join('')}</div><p>Zoom cuts: ${(plan.zoomCuts || []).map(z => `${z.amount} at ${z.at}s`).join(', ') || 'None'}</p></div>`;
-}
-function hookBattlePanel(intel) {
-  const hooks = (intel.hookBattle || []).slice(0, 5);
-  return `<div class="viral-panel"><h2>Hook battle</h2>${hooks.length ? hooks.map(h => `<button class="ghost wide" data-copy="${encodeURIComponent(h.text)}">#${h.rank} ${esc(h.text)} · ${h.score}</button>`).join('') : empty('Hook variants will appear after clip generation.')}</div>`;
-}
-function viralLabPanel(intel) {
-  return `<section class="panel stack"><div class="panel-head"><div><span class="eyebrow">Viral lab</span><h2>Make this clip stronger</h2></div></div><div class="card-grid">
-    <article class="project-card"><h3>Retention timeline</h3>${(intel.retentionTimeline || []).map(i => `<p><b>${esc(i.range)} ${esc(i.label)}:</b> ${esc(i.note)}</p>`).join('') || '<p>No retention notes yet.</p>'}</article>
-    <article class="project-card"><h3>Platform variants</h3>${(intel.platformVariants || []).map(v => `<p><b>${esc(v.platform)}:</b> ${esc(v.edit)} <span class="pill ok">${esc(v.scoreBoost)}</span></p>`).join('')}</article>
-    <article class="project-card"><h3>Originality booster</h3><p>Current score: <b>${intel.originalityBooster?.score || 0}%</b></p>${(intel.originalityBooster?.upgrades || []).map(u => `<p>+${u.boost}% ${esc(u.label)}</p>`).join('')}</article>
-    <article class="project-card"><h3>B-roll prompts</h3>${(intel.brollPrompts || []).map(p => `<p>${esc(p)}</p>`).join('')}</article>
-    <article class="project-card"><h3>Clip series</h3>${(intel.clipSeries || []).map(p => `<p><b>Part ${p.part}: ${esc(p.title)}</b><br>${esc(p.angle)}</p>`).join('')}</article>
-    <article class="project-card"><h3>Creator memory</h3><p>${esc(intel.creatorVoiceMemory?.tone || 'No voice saved yet.')}</p><p>${esc(intel.learningTracker?.note || '')}</p></article>
-  </div></section>`;
-}
-function transformationPanel(c) {
-  const t = c.transformation || {};
-  return `<div class="transform-box">
-    <h2>Transformation tools</h2>
-    <label>Custom intro hook text<input id="introHookText" value="${t.introHookText || ''}"></label>
-    <label>AI summary overlay<textarea id="summaryOverlay" rows="3">${t.summaryOverlay || ''}</textarea></label>
-    <label>Caption style<select id="captionStyle"><option ${t.captionStyle === 'Bold captions' ? 'selected' : ''}>Bold captions</option><option ${t.captionStyle === 'Clean subtitles' ? 'selected' : ''}>Clean subtitles</option><option ${t.captionStyle === 'Podcast style' ? 'selected' : ''}>Podcast style</option></select></label>
-    <label>Source credit text<input id="sourceCredit" value="${t.sourceCredit || ''}" placeholder="Source: Channel / Video"></label>
-    <label>Watermark / brand text<input id="watermarkText" value="${t.watermarkText || ''}"></label>
-    <label>Voiceover/commentary file<input id="voiceoverFilename" type="file" accept="audio/*,video/*"></label>
-    <label>Vertical background frame<select id="verticalFrame"><option ${t.verticalFrame === 'Blurred background' ? 'selected' : ''}>Blurred background</option><option ${t.verticalFrame === 'Solid brand frame' ? 'selected' : ''}>Solid brand frame</option><option ${t.verticalFrame === 'Soft gradient frame' ? 'selected' : ''}>Soft gradient frame</option></select></label>
-    <label class="permission"><input id="splitScreenCommentary" type="checkbox" ${t.splitScreenCommentary ? 'checked' : ''}> Split-screen commentary layout</label>
-    <label class="permission"><input id="zoomCuts" type="checkbox" ${(t.effects || []).includes('Zoom cuts') ? 'checked' : ''}> Add zoom cuts</label>
-    <label class="permission"><input id="highlightEffects" type="checkbox" ${(t.effects || []).includes('Highlight keywords') ? 'checked' : ''}> Highlight effects</label>
-    <label>B-roll placeholders<textarea id="brollPlaceholders" rows="2">${(t.brollPlaceholders || []).join('\\n')}</textarea></label>
+function renderPlatformContent(pc) {
+  return `<div id="platformPanels">
+    ${['tiktok','youtube','instagram','x','linkedin','facebook'].map(p => `
+      <div class="tab-panel ${state.platformTab===p?'active':''}" data-platform-panel="${p}">
+        ${renderPlatformPanel(p, pc[p]||{})}
+      </div>
+    `).join('')}
   </div>`;
 }
-function originalityChecklist(c) {
-  const checklist = c.transformation?.originalityChecklist || [];
-  return checklist.map(item => `<label class="permission"><input data-originality="${item.id}" type="checkbox" ${item.done ? 'checked' : ''}>${item.label}</label>`).join('');
-}
-function downloadButton(c) {
-  if (!c.outputPath) return '<button class="wide" disabled>Download unavailable until rendering completes</button>';
-  return `<a id="downloadClip" class="button wide" href="${c.outputPath}" download="clip-${c.id}.mp4">Download clip</a>`;
-}
-function updateDownloadState() {}
-async function saveTransformation() {
-  const effects = [];
-  if ($('#zoomCuts')?.checked) effects.push('Zoom cuts');
-  if ($('#highlightEffects')?.checked) effects.push('Highlight keywords');
-  const checklist = $$('[data-originality]').map(input => ({ id: input.dataset.originality, label: input.parentElement.textContent.trim(), done: input.checked }));
-  const file = $('#voiceoverFilename')?.files?.[0];
-  const transformation = {
-    introHookText: $('#introHookText').value,
-    summaryOverlay: $('#summaryOverlay').value,
-    captionStyle: $('#captionStyle').value,
-    sourceCredit: $('#sourceCredit').value,
-    watermarkText: $('#watermarkText').value,
-    splitScreenCommentary: $('#splitScreenCommentary').checked,
-    voiceoverFilename: file?.name || state.clip.transformation?.voiceoverFilename || '',
-    verticalFrame: $('#verticalFrame').value,
-    effects,
-    brollPlaceholders: $('#brollPlaceholders').value.split('\\n').map(v => v.trim()).filter(Boolean),
-    originalityChecklist: checklist
-  };
-  await api('/api/clip', { method: 'PATCH', body: JSON.stringify({ id: state.clip.id, transformation }) });
-  await loadAll();
-  state.clip = state.library.clips.find(c => c.id === state.clip.id);
-  renderClipDetail();
-}
-async function markPosted() {
-  await api('/api/clip', { method: 'PATCH', body: JSON.stringify({ id: state.clip.id, posted: true }) });
-  await loadAll();
-  state.clip = state.library.clips.find(c => c.id === state.clip.id);
-  renderClipDetail();
+
+function renderPlatformPanels(pc) {
+  const el=$('#platformPanels');
+  if (!el) return;
+  el.innerHTML = ['tiktok','youtube','instagram','x','linkedin','facebook'].map(p=>`
+    <div class="tab-panel ${state.platformTab===p?'active':''}" data-platform-panel="${p}">
+      ${renderPlatformPanel(p, pc[p]||{})}
+    </div>
+  `).join('');
+  $$('[data-platform-panel] [data-copy]').forEach(btn=>{
+    btn.addEventListener('click', ()=>navigator.clipboard?.writeText(decodeURIComponent(btn.dataset.copy)));
+  });
 }
 
-async function renderSettings() {
-  const setup = (state.session.setup || []).filter(item => ['youtube', 'llm', 'postgres', 'ytdlp', 'ffmpeg', 'platforms'].includes(item.id));
-  const tools = state.session?.tools || {};
-  let healthHtml = '';
-  try {
-    const health = await api('/api/health');
-    const rows = [
-      { label: 'FFmpeg (video rendering)', ok: health.tools?.ffmpeg?.ok, detail: health.tools?.ffmpeg?.version || health.tools?.ffmpeg?.error || '' },
-      { label: 'yt-dlp (YouTube download)', ok: health.tools?.ytdlp?.ok, detail: health.tools?.ytdlp?.version || health.tools?.ytdlp?.error || '' },
-      { label: 'AI provider (viral detection)', ok: health.tools?.llm?.ok, detail: health.tools?.llm?.ok ? 'Key configured' : 'Set LLM_API_KEY in Admin' },
-      { label: 'YouTube API (metadata)', ok: health.tools?.youtube_api?.ok, detail: health.tools?.youtube_api?.ok ? 'Key configured' : 'Optional: set YOUTUBE_API_KEY' },
-      { label: 'File upload', ok: true, detail: 'Always available — primary workflow' }
-    ];
-    healthHtml = `<section class="panel"><h2>System health</h2><p>Live status of tools that power clip generation.</p><div class="stack">${rows.map(r => `<div class="setup-item ${r.ok ? 'ready' : ''}"><span class="pill ${r.ok ? 'ok' : 'warn'}">${r.ok ? 'Ready' : 'Missing'}</span> <b>${r.label}</b><p class="muted">${esc(r.detail)}</p></div>`).join('')}</div><p class="muted" style="margin-top:8px">Queue: ${health.queue?.depth || 0} waiting, ${health.queue?.active || 0} active. Memory: ${health.memory?.rssMb || 0} MB RSS.</p></section>`;
-  } catch {
-    healthHtml = `<section class="panel"><h2>System health</h2><p class="muted">Could not load health status.</p></section>`;
-  }
-  $('#settings').innerHTML = `<div class="settings-grid"><section class="panel"><h2>Profile</h2><form id="profileForm" class="stack"><label>Name<input id="profileName" value="${esc(state.user.name)}"></label><label>Email<input value="${esc(state.user.email)}" disabled></label><button>Save profile</button></form></section>${healthHtml}</div>`;
-  $('#profileForm').addEventListener('submit', async e => { e.preventDefault(); await api('/api/profile', { method: 'PATCH', body: JSON.stringify({ name: $('#profileName').value }) }); await loadAll(); });
+function renderPlatformPanel(platform, data) {
+  if (!data || !Object.keys(data).length) return `<div class="empty-state" style="padding:20px"><p>Click "Regenerate" to generate ${platform} content.</p></div>`;
+  const lines = [];
+  if (data.title) lines.push(`<div class="content-field"><label>Title</label><div class="content-val">${esc(data.title)}</div><button class="ghost" data-copy="${encodeURIComponent(data.title)}">Copy</button></div>`);
+  if (data.caption) lines.push(`<div class="content-field"><label>Caption</label><div class="content-val">${esc(data.caption)}</div><button class="ghost" data-copy="${encodeURIComponent(data.caption)}">Copy</button></div>`);
+  if (data.post) lines.push(`<div class="content-field"><label>Post</label><div class="content-val">${esc(data.post)}</div><button class="ghost" data-copy="${encodeURIComponent(data.post)}">Copy</button></div>`);
+  if (data.tweet) lines.push(`<div class="content-field"><label>Tweet</label><div class="content-val">${esc(data.tweet)}</div><button class="ghost" data-copy="${encodeURIComponent(data.tweet)}">Copy</button></div>`);
+  if (data.description) lines.push(`<div class="content-field"><label>Description</label><div class="content-val">${esc(data.description)}</div><button class="ghost" data-copy="${encodeURIComponent(data.description)}">Copy</button></div>`);
+  const tags=[...(data.hashtags||[]),(data.tags||[])].flat().filter(Boolean);
+  if (tags.length) lines.push(`<div class="content-field"><label>Hashtags</label><div class="keyword-chips">${tags.map(t=>`<span class="kw-chip">${esc(t)}</span>`).join('')}</div><button class="ghost" data-copy="${encodeURIComponent(tags.join(' '))}">Copy all</button></div>`);
+  if (data.bestTime) lines.push(`<p class="muted" style="margin-top:8px">Best time to post: <b>${esc(data.bestTime)}</b></p>`);
+  if (data.tip) lines.push(`<p class="muted"><b>Tip:</b> ${esc(data.tip)}</p>`);
+  if (data.insight) lines.push(`<p class="muted"><b>Key insight:</b> ${esc(data.insight)}</p>`);
+  return lines.join('') || `<div class="empty-state" style="padding:16px"><p>Content for ${platform} not yet generated.</p></div>`;
 }
-async function renderBilling() {
-  state.bank = await api('/api/billing/bank');
-  const tx = state.library.creditTransactions || [];
-  const mine = (state.library.paymentRequests || []).filter(p => p.userId === state.user.id);
-  $('#billing').innerHTML = `<div class="grid-two">
-    <section class="panel stack">
-      <span class="eyebrow">Local payment</span>
-      <h2>Buy credits by bank transfer</h2>
-      <p>Credits are intentionally lightweight. One video processing job uses 5 credits, so small packs can still create multiple clips.</p>
-      <div class="copy-box"><b>${state.bank.bankAccount.bankName}</b><p>Account name: ${state.bank.bankAccount.accountName}<br>Account number: ${state.bank.bankAccount.accountNumber}</p><p>${state.bank.bankAccount.instructions}</p></div>
-      <form id="bankTransferForm" class="stack">
-        <select id="creditPackage">${state.bank.creditPackages.map(p => `<option value="${p.credits}" data-amount="${p.amount}" data-currency="${p.currency}">${p.credits} credits - ${p.currency} ${p.amount.toLocaleString()}</option>`).join('')}</select>
-        <input id="transferAmount" type="number" placeholder="Amount transferred" required>
-        <input id="depositorName" placeholder="Depositor/account name" required>
-        <input id="transferReference" placeholder="Transfer reference/session ID" required>
-        <textarea id="transferNote" rows="3" placeholder="Optional note"></textarea>
-        <button>Submit for verification</button>
+
+/* ── AI Studio ─────────────────────────────────────────────────────── */
+async function renderStudio() {
+  if (!state.studioStatus) {
+    try { state.studioStatus=await api('/api/studio/status'); } catch {}
+  }
+  if (!state.studioModels.length) {
+    try { const m=await api('/api/ai/models'); state.studioModels=m.models||[]; } catch {}
+  }
+  const features=state.studioStatus?.features||{};
+  const videos=state.library.videos||[];
+
+  $('#studio').innerHTML = `
+    <div class="studio-wrap">
+      <div class="studio-sidebar">
+        ${Object.entries(features).map(([key,f])=>`
+          <div class="feature-item ${state.studioTab===key?'active':''}" data-studio-tab="${key}">
+            <div class="feature-dot ${f.available?'on':'off'}"></div>
+            <div>
+              <b>${esc(f.label)}</b>
+              ${!f.available&&f.setupKey?`<small class="muted">Needs setup</small>`:''}
+            </div>
+          </div>
+        `).join('')}
+      </div>
+      <div class="studio-main">
+        ${renderStudioPanel(features, videos)}
+      </div>
+    </div>`;
+
+  $$('[data-studio-tab]').forEach(btn=>btn.addEventListener('click',()=>{
+    state.studioTab=btn.dataset.studioTab;
+    renderStudio();
+  }));
+  $('#facelessForm')?.addEventListener('submit', runFaceless);
+  $('#brollForm')?.addEventListener('submit', runBroll);
+  $('#aiGeneratorForm')?.addEventListener('submit', runAiGenerator);
+}
+
+function renderStudioPanel(features, videos) {
+  const f=features[state.studioTab];
+  if (!f) return empty('Select a feature from the left.');
+
+  if (state.studioTab==='facelessContent') return renderFacelessPanel(f);
+  if (state.studioTab==='brollSuggestions') return renderBrollPanel(f, [], videos);
+  if (state.studioTab==='aiVideoGen' || state.studioTab==='aiImageGen' || state.studioTab==='lipSync') {
+    return renderAiGeneratorPanel(f, state.studioTab);
+  }
+
+  const available=f.available;
+  return `<div class="studio-panel">
+    <div class="feature-header">
+      <div class="feature-badge ${available?'on':'off'}">${available?'Available':'Needs Setup'}</div>
+      <h2>${esc(f.label)}</h2>
+      <p>${esc(f.description)}</p>
+    </div>
+    ${available
+      ? `<div class="feature-ready">
+           <div class="ready-icon">✓</div>
+           <p>This feature is active. It runs automatically when you generate clips.</p>
+           ${state.studioTab==='hookGeneration'?`<p class="muted">Open any clip → Hooks tab to see all 6 hook styles.</p>`:''}
+           ${state.studioTab==='platformContent'?`<p class="muted">Open any clip → Platform Content tab to see posts for all 6 platforms.</p>`:''}
+           ${state.studioTab==='thumbnails'?`<p class="muted">Open any clip → click "Generate thumbnails" for 3 styles.</p>`:''}
+           ${state.studioTab==='captions'?`<p class="muted">Select caption style when creating clips. Options: ${CAPTION_STYLES.join(', ')}.</p>`:''}
+           ${state.studioTab==='viralDetection'?`<p class="muted">AI scores every clip across 6 dimensions: hook strength, emotional punch, controversy, usefulness, storytelling, shareability.</p>`:''}
+           ${state.studioTab==='transcription'?`<p class="muted">Transcription runs automatically on upload. View full transcripts in the Transcript viewer.</p><button class="ghost" data-view-jump="transcript">View transcript</button>`:''}
+           ${state.studioTab==='translation'?`<p class="muted">Caption translation is available when generating clips. Select target language in settings.</p>`:''}
+         </div>`
+      : `<div class="setup-required">
+           <h3>Setup required</h3>
+           <p>Configure <code>${f.setupKey||'API key'}</code> in Admin → API Configuration to enable this feature.</p>
+           <button data-view-jump="admin">Go to Admin →</button>
+         </div>`}
+  </div>`;
+}
+
+function renderAiGeneratorPanel(f, tabKey) {
+  const categoryMap = { aiVideoGen: 't2v', aiImageGen: 't2i', lipSync: 'lipsync' };
+  const cat = categoryMap[tabKey] || 't2v';
+  const models = state.studioModels.filter(m => m.category === cat || (cat==='t2v' && m.category==='i2v'));
+  const gens = (state.generations || []).filter(g => {
+    const m = state.studioModels.find(mm=>mm.id===g.model);
+    return m && (m.category===cat || (cat==='t2v' && m.category==='i2v'));
+  });
+  const needsImage = state.generatorModel && state.studioModels.find(m=>m.id===state.generatorModel)?.category==='i2v';
+  const needsLipsync = cat==='lipsync';
+
+  return `<div class="studio-panel">
+    <div class="feature-header">
+      <div class="feature-badge ${f.available?'on':'off'}">${f.available?'Available':'Needs Setup'}</div>
+      <h2>${esc(f.label)}</h2>
+      <p>${esc(f.description)}</p>
+    </div>
+    ${f.available?`
+      <form id="aiGeneratorForm" class="stack" style="max-width:580px" data-cat="${cat}">
+        <div class="option-row">
+          <label>Model</label>
+          <select id="genModel">
+            ${models.map(m=>`<option value="${m.id}" ${state.generatorModel===m.id?'selected':''}>${esc(m.label)} ${m.seconds?`(${m.seconds}s)`:''}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label>${cat==='lipsync'?'Video URL (talking head)':'Prompt — describe the scene'}</label>
+          <textarea id="genPrompt" rows="3" placeholder="${cat==='t2i'?'A cinematic shot of...':cat==='lipsync'?'https://... (video URL)':'A dynamic video of...'}">${esc(state.generatorPrompt)}</textarea>
+        </div>
+        ${needsImage||needsLipsync?`
+          <div>
+            <label>${needsLipsync?'Audio URL (voice-over)':'Starting image URL (optional)'}</label>
+            <input id="genImageUrl" type="text" placeholder="https://..." value="${esc(state.generatorImageUrl)}">
+          </div>
+        `:''}
+        ${cat!=='lipsync'?`
+          <div>
+            <label>Negative prompt (optional)</label>
+            <input id="genNeg" type="text" placeholder="blurry, low quality, text..." value="${esc(state.generatorNeg)}">
+          </div>
+        `:''}
+        <button type="submit" ${state.generatorRunning?'disabled':''}>
+          ${state.generatorRunning?'Generating… (check back in ~30s)':'Generate →'}
+        </button>
+        ${state.generatorResult?.error?`<div class="message error">${esc(state.generatorResult.error)}</div>`:''}
+        ${state.generatorResult?.id&&!state.generatorResult.error?`<div class="message success">Queued! Refresh to see result below.</div>`:''}
       </form>
-      <div id="billingMessage" class="message"></div>
-    </section>
-    <section class="panel"><h2>Requests</h2>${mine.length ? mine.map(p => `<article class="project-card"><span class="pill ${p.status === 'approved' ? 'ok' : p.status === 'rejected' ? 'bad' : 'warn'}">${p.status}</span><h3>${p.credits} credits</h3><p>${p.currency} ${p.amount} • ${p.reference}</p></article>`).join('') : empty('No payment requests yet. Submit your transfer reference after paying.')}<h2>Credit history</h2>${tx.length ? tx.map(t => `<p>${t.amount > 0 ? '+' : ''}${t.amount} credits • ${t.reason}</p>`).join('') : empty('No credit history yet.')}</section>
+
+      ${gens.length?`
+        <div style="margin-top:24px">
+          <div class="panel-head" style="margin-bottom:12px">
+            <h3>Generated ${cat==='t2i'?'images':'videos'}</h3>
+            <button class="ghost" onclick="loadGenerations()">Refresh</button>
+          </div>
+          <div class="gen-gallery">${gens.map(genCard).join('')}</div>
+        </div>
+      `:''}
+    `:setupRequired(f)}
   </div>`;
-  $('#bankTransferForm').addEventListener('submit', submitBankTransfer);
-  $('#creditPackage').addEventListener('change', e => { $('#transferAmount').value = e.target.selectedOptions[0].dataset.amount; });
-  $('#transferAmount').value = $('#creditPackage').selectedOptions[0].dataset.amount;
 }
-async function submitBankTransfer(e) {
-  e.preventDefault();
-  const opt = $('#creditPackage').selectedOptions[0];
+
+function genCard(g) {
+  const isVideo = !state.studioModels.find(m=>m.id===g.model&&m.category==='t2i');
+  const isReady = g.status==='completed' && g.outputPath;
+  const isPending = ['queued','generating'].includes(g.status);
+  return `<div class="gen-card ${isPending?'pending':''}">
+    ${isReady
+      ? (isVideo
+          ? `<video src="${g.outputPath}" controls muted playsinline loop></video>`
+          : `<img src="${g.outputPath}" alt="Generated image">`)
+      : `<div class="gen-placeholder">${isPending?`<div class="gen-spinner">⟳</div><small>${esc(g.status)}</small>`:`<div class="error-text">${esc(g.error||'Failed')}</div>`}</div>`
+    }
+    <div class="gen-card-info">
+      <p class="gen-prompt">${esc((g.prompt||'').slice(0,80))}</p>
+      <div class="action-row">
+        ${isReady?`<a class="button ghost" href="${g.outputPath}" download>Download</a>`:''}
+        <button class="ghost danger-btn" data-delete-gen="${g.id}">Delete</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+async function loadGenerations() {
   try {
-    await api('/api/billing/transfer', { method: 'POST', body: JSON.stringify({
-      credits: Number($('#creditPackage').value),
-      amount: Number($('#transferAmount').value),
-      currency: opt.dataset.currency,
-      depositorName: $('#depositorName').value,
-      reference: $('#transferReference').value,
-      note: $('#transferNote').value
-    }) });
-    $('#billingMessage').textContent = 'Submitted. Admin will verify funds and add credits.';
-    await loadAll();
-    await renderBilling();
-  } catch (err) {
-    $('#billingMessage').className = 'message error';
-    $('#billingMessage').textContent = err.message;
+    const res = await api('/api/ai/generations');
+    state.generations = res.generations || [];
+    renderStudio();
+  } catch(e) { console.warn('loadGenerations', e.message); }
+}
+
+async function runAiGenerator(e) {
+  e.preventDefault();
+  const model = $('#genModel')?.value;
+  const prompt = $('#genPrompt')?.value?.trim();
+  const imageUrl = $('#genImageUrl')?.value?.trim() || '';
+  const negativePrompt = $('#genNeg')?.value?.trim() || '';
+  if (!model || !prompt) return;
+  state.generatorModel=model; state.generatorPrompt=prompt; state.generatorImageUrl=imageUrl; state.generatorNeg=negativePrompt;
+  state.generatorRunning=true; state.generatorResult=null;
+  renderStudio();
+  try {
+    const res = await api('/api/ai/generate', { method:'POST', body: JSON.stringify({ model, prompt, negativePrompt, imageUrl }) });
+    state.generatorResult = res;
+    state.generatorRunning = false;
+    setTimeout(async () => { await loadGenerations(); }, 4000);
+    renderStudio();
+  } catch(err) {
+    state.generatorResult = { error: err.message };
+    state.generatorRunning = false;
+    renderStudio();
   }
 }
 
-function setView(view) {
-  $$('.view').forEach(v => v.classList.toggle('active', v.id === view));
-  $$('[data-view]').forEach(a => a.classList.toggle('active', a.dataset.view === view));
-  const titles = { home: ['Home', 'AI clipping tool'], create: ['Create', 'Transform YouTube clips'], clips: ['Clips', 'Transformed clips'], clipDetail: ['Transform + Post', 'Originality workspace'], billing: ['Billing', 'Bank transfer credits'], settings: ['Settings', 'Profile and setup'], admin: ['Admin', 'Bank payments and setup'] };
-  $('#pageEyebrow').textContent = titles[view]?.[0] || 'ClipForge';
-  $('#pageTitle').textContent = titles[view]?.[1] || 'App';
-  if (view === 'clipDetail') renderClipDetail();
-  if (view === 'billing') renderBilling();
-  if (view === 'admin') renderAdmin();
-  if (view === 'settings') renderSettings();
-}
-
-setInterval(async () => {
-  if (!uid() || !state.library?.jobs?.some(job => !['complete', 'completed', 'failed'].includes(job.status))) return;
-  const activeView = $('.view.active')?.id || 'home';
-  try {
-    await loadAll();
-    setView(activeView);
-  } catch {}
-}, 5000);
-
-function renderNav() {
-  const items = [...nav, ...(state.user?.role === 'admin' ? [['admin', '◆', 'Admin']] : [])];
-  $('#sideNav').innerHTML = items.map(([id, icon, label]) => `<a href="#${id}" data-view="${id}">${icon} ${label}</a>`).join('');
-  $('#bottomNav').innerHTML = nav.map(([id, icon, label]) => `<a href="#${id}" data-view="${id}">${icon}<span>${label}</span></a>`).join('');
-}
-async function loadAll() {
-  state.session = await api('/api/session');
-  state.user = state.session.user;
-  state.library = await api('/api/library');
-  $('#userName').textContent = state.user.name;
-  $('#userPlan').textContent = `${state.user.credits} credits`;
-  renderNav();
-  renderHome(); renderCreate(); renderClips();
-  if ($('#settings')?.classList.contains('active')) renderSettings();
-}
-async function renderAdmin() {
-  if (state.user.role !== 'admin') return setView('home');
-  const bank = await api('/api/admin/bank');
-  const ai = await api('/api/admin/ai-settings');
-  const payments = bank.paymentRequests || [];
-  const s = ai.settings || {};
-  const logs = ai.logs || [];
-  $('#admin').innerHTML = `<div class="grid-two">
-    <section class="panel stack">
-      <h2>AI settings</h2>
-      <p>Server-side provider config for transcript analysis, viral scoring, hooks, captions, hashtags, and posting guides.</p>
-      <form id="adminAiForm" class="stack">
-        <label>Provider<select id="aiProvider"><option value="emergent" ${s.provider === 'emergent' ? 'selected' : ''}>Emergent Universal Key</option><option value="openai" ${s.provider === 'openai' ? 'selected' : ''}>OpenAI-compatible</option></select></label>
-        <label>Model<input id="aiModel" value="${esc(s.model || 'gpt-4o-mini')}" placeholder="gpt-4o-mini"></label>
-        <label>Optional base URL<input id="aiBaseUrl" value="${esc(s.baseUrl || '')}" placeholder="Default for Emergent: https://api.emergent.sh/v1"></label>
-        <label>API key<input id="aiApiKey" type="password" placeholder="${s.apiKeyConfigured ? 'Key saved. Leave blank to keep it.' : 'Paste API key'}"></label>
-        <div class="actions"><button>Save AI settings</button><button type="button" class="ghost" id="testAi">Test AI</button></div>
+function renderFacelessPanel(f) {
+  const res=state.facelessResult;
+  return `<div class="studio-panel">
+    <div class="feature-header">
+      <div class="feature-badge ${f.available?'on':'off'}">${f.available?'Available':'Needs Setup'}</div>
+      <h2>Faceless Content Mode</h2>
+      <p>Type a topic. AI writes a complete script with scene directions, B-roll queries, and caption lines.</p>
+    </div>
+    ${f.available?`
+      <form id="facelessForm" class="stack" style="max-width:520px">
+        <input id="facelessTopic" type="text" placeholder="e.g. Why Bitcoin will hit $1M" value="${esc(state.facelessTopic)}" required>
+        <div class="option-row">
+          <label>Style</label>
+          <select id="facelessStyle">
+            ${FACELESS_STYLES.map(s=>`<option value="${s}" ${state.facelessStyle===s?'selected':''}>${s.charAt(0).toUpperCase()+s.slice(1)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="option-row">
+          <label>Duration</label>
+          <select id="facelessDur">
+            <option value="30">30 seconds</option>
+            <option value="45" selected>45 seconds</option>
+            <option value="60">60 seconds</option>
+          </select>
+        </div>
+        <button type="submit">Generate script</button>
       </form>
-      <div class="copy-box"><b>Effective route</b><p>${esc(s.effectiveBaseUrl || 'Not configured')}</p></div>
-      <div id="aiMessage" class="message"></div>
-    </section>
-    <section class="panel">
-      <h2>AI logs</h2>
-      ${logs.length ? logs.map(l => `<article class="project-card"><span class="pill ${l.ok ? 'ok' : 'bad'}">${l.ok ? 'ok' : 'failed'}</span><h3>${esc(l.purpose || 'AI request')}</h3><p>${esc(l.provider)} • ${esc(l.model)}<br>Tokens: ${l.totalTokens || 0} ${l.error ? `<br>${esc(l.error)}` : ''}</p></article>`).join('') : empty('No AI requests logged yet. Use Test AI to confirm the provider.')}
-    </section>
-    <section class="panel stack"><h2>Bank account shown to users</h2><form id="adminBankForm" class="stack"><input id="adminBankName" value="${esc(bank.bankAccount.bankName || '')}" placeholder="Bank name"><input id="adminAccountName" value="${esc(bank.bankAccount.accountName || '')}" placeholder="Account name"><input id="adminAccountNumber" value="${esc(bank.bankAccount.accountNumber || '')}" placeholder="Account number"><textarea id="adminInstructions" rows="3">${esc(bank.bankAccount.instructions || '')}</textarea><button>Save bank account</button></form><div id="adminMessage" class="message"></div></section>
-    <section class="panel"><h2>Pending payment verification</h2>${payments.length ? payments.map(p => `<article class="project-card"><span class="pill ${p.status === 'approved' ? 'ok' : p.status === 'rejected' ? 'bad' : 'warn'}">${p.status}</span><h3>${p.credits} credits</h3><p>${p.currency} ${p.amount} • ${p.depositorName}<br>Ref: ${p.reference}</p><div class="actions"><button data-approve-payment="${p.id}">Approve</button><button class="ghost" data-reject-payment="${p.id}">Reject</button></div></article>`).join('') : empty('No payment requests yet.')}</section>
+      ${res?renderFacelessResult(res):''}
+    `:setupRequired(f)}
   </div>`;
-  $('#adminBankForm').addEventListener('submit', saveAdminBank);
-  $('#adminAiForm').addEventListener('submit', saveAiSettings);
-  $('#testAi').addEventListener('click', testAiConnection);
 }
-async function saveAdminBank(e) {
+
+function renderFacelessResult(res) {
+  if (!res.ok) return `<div class="message error">${esc(res.error||'Generation failed.')}</div>`;
+  return `<div class="faceless-result">
+    <div class="panel-head"><h3>${esc(res.title||'Generated Script')}</h3><button class="ghost" data-copy="${encodeURIComponent(res.script||'')}">Copy script</button></div>
+    <div class="hook-text">"${esc(res.hook||'')}"</div>
+    <div class="scene-list">
+      ${(res.scenes||[]).map(s=>`<div class="scene-card">
+        <div class="scene-time">${esc(s.timestamp)}</div>
+        <div class="scene-narration">${esc(s.narration)}</div>
+        <div class="scene-meta">
+          <small>📹 ${esc(s.visualDirection)}</small>
+          <small>🔍 Search: "${esc(s.brollQuery)}"</small>
+        </div>
+      </div>`).join('')}
+    </div>
+    <div class="content-field"><label>Full script</label><div class="content-val">${esc(res.script||'')}</div></div>
+    <div class="meta">
+      <span>${res.estimatedSeconds||45}s estimated</span>
+      <span>Voice: ${esc(res.voiceStyle||'')}</span>
+      <span>Music: ${esc(res.backgroundMusic||'')}</span>
+    </div>
+  </div>`;
+}
+
+function renderBrollPanel(f, transcriptions, videos) {
+  return `<div class="studio-panel">
+    <div class="feature-header">
+      <div class="feature-badge ${f.available?'on':'off'}">${f.available?'Available':'Needs Setup'}</div>
+      <h2>B-Roll Keyword Extractor</h2>
+      <p>Select a video with a transcript. AI extracts specific B-roll footage keywords for every section.</p>
+    </div>
+    ${f.available?`
+      <form id="brollForm" class="stack" style="max-width:520px">
+        <select id="brollVideoId">
+          <option value="">Select a video…</option>
+          ${videos.map(v=>`<option value="${v.id}">${esc(v.title.slice(0,60))}</option>`).join('')}
+        </select>
+        <button type="submit">Extract B-roll keywords</button>
+      </form>
+      <div id="brollResult"></div>
+    `:setupRequired(f)}
+  </div>`;
+}
+
+function setupRequired(f) {
+  return `<div class="setup-required"><h3>Setup required</h3><p>Configure <code>${f.setupKey||'API key'}</code> in Admin → API Configuration.</p><button data-view-jump="admin">Go to Admin →</button></div>`;
+}
+
+async function runFaceless(e) {
   e.preventDefault();
-  await api('/api/admin/bank', { method: 'PATCH', body: JSON.stringify({ bankName: $('#adminBankName').value, accountName: $('#adminAccountName').value, accountNumber: $('#adminAccountNumber').value, instructions: $('#adminInstructions').value }) });
-  $('#adminMessage').textContent = 'Bank account saved.';
-  await renderAdmin();
-}
-async function saveAiSettings(e) {
-  e.preventDefault();
-  const body = {
-    LLM_PROVIDER: $('#aiProvider').value,
-    LLM_MODEL: $('#aiModel').value,
-    LLM_BASE_URL: $('#aiBaseUrl').value
-  };
-  if ($('#aiApiKey').value.trim()) body.LLM_API_KEY = $('#aiApiKey').value.trim();
-  await api('/api/admin/ai-settings', { method: 'PATCH', body: JSON.stringify(body) });
-  $('#aiMessage').className = 'message';
-  $('#aiMessage').textContent = 'AI settings saved.';
-  await renderAdmin();
-}
-async function testAiConnection() {
-  const msg = $('#aiMessage');
-  msg.className = 'message';
-  msg.textContent = 'Testing AI provider...';
+  const topic=$('#facelessTopic')?.value?.trim();
+  const style=$('#facelessStyle')?.value||'documentary';
+  const duration=Number($('#facelessDur')?.value||45);
+  if (!topic) return;
+  state.facelessTopic=topic; state.facelessStyle=style; state.facelessResult=null;
+  const btn=e.target.querySelector('button[type=submit]'); btn.disabled=true; btn.textContent='Generating…';
   try {
-    const res = await api('/api/admin/ai-test', { method: 'POST', body: JSON.stringify({}) });
-    msg.textContent = `AI connected: ${res.provider} / ${res.model}. Reply: ${res.reply || 'ok'}`;
-    await renderAdmin();
-  } catch (err) {
-    msg.className = 'message error';
-    msg.textContent = err.message;
-    await renderAdmin();
+    const res=await api('/api/faceless/generate',{method:'POST',body:JSON.stringify({topic,style,duration})});
+    state.facelessResult=res;
+    renderStudio();
+  } catch(err) {
+    state.facelessResult={ok:false,error:err.message};
+    renderStudio();
   }
 }
-async function boot() {
-  renderNav();
-  if (!uid()) return;
-  $('#authShell').classList.add('hidden');
-  $('#appShell').classList.remove('hidden');
-  await loadAll();
-  setView('home');
+
+async function runBroll(e) {
+  e.preventDefault();
+  const videoId=$('#brollVideoId')?.value;
+  if (!videoId) return;
+  const btn=e.target.querySelector('button[type=submit]'); btn.disabled=true; btn.textContent='Extracting…';
+  try {
+    const res=await api('/api/broll/suggest',{method:'POST',body:JSON.stringify({videoId})});
+    const el=$('#brollResult');
+    if (!el) return;
+    el.innerHTML=`<div class="broll-results">
+      ${(res.suggestions||[]).map(s=>`<div class="broll-card">
+        <div class="broll-time">${esc(s.timestamp)}</div>
+        <b>${esc(s.topic)}</b>
+        <div class="keyword-chips">${(s.brollKeywords||[]).map(k=>`<span class="kw-chip" data-copy="${encodeURIComponent(k)}">${esc(k)}</span>`).join('')}</div>
+        <small>Search: "${esc(s.stockQuery)}" · Mood: ${esc(s.mood)}</small>
+      </div>`).join('')}
+      ${res.recommendedStyle?`<p class="muted">Recommended style: <b>${esc(res.recommendedStyle)}</b></p>`:''}
+    </div>`;
+    $$('#brollResult .kw-chip[data-copy]').forEach(c=>c.addEventListener('click',()=>navigator.clipboard?.writeText(decodeURIComponent(c.dataset.copy))));
+  } catch(err) {
+    $('#brollResult').innerHTML=`<div class="message error">${esc(err.message)}</div>`;
+  } finally {
+    btn.disabled=false; btn.textContent='Extract B-roll keywords';
+  }
 }
-document.addEventListener('click', e => {
-  const jump = e.target.closest('[data-view], [data-view-jump]');
-  if (jump) { e.preventDefault(); setView(jump.dataset.view || jump.dataset.viewJump); }
-  const open = e.target.closest('[data-open-clip]');
-  if (open) { state.clip = state.library.clips.find(c => c.id === open.dataset.openClip); setView('clipDetail'); }
-  const copy = e.target.closest('[data-copy]');
-  if (copy) navigator.clipboard?.writeText(decodeURIComponent(copy.dataset.copy));
-  const approve = e.target.closest('[data-approve-payment]');
-  if (approve) api('/api/admin/payments', { method: 'PATCH', body: JSON.stringify({ paymentId: approve.dataset.approvePayment, status: 'approved' }) }).then(loadAll).then(renderAdmin);
-  const reject = e.target.closest('[data-reject-payment]');
-  if (reject) api('/api/admin/payments', { method: 'PATCH', body: JSON.stringify({ paymentId: reject.dataset.rejectPayment, status: 'rejected' }) }).then(loadAll).then(renderAdmin);
-  const retryJob = e.target.closest('[data-retry-job]');
-  if (retryJob) api('/api/job', { method: 'PATCH', body: JSON.stringify({ jobId: retryJob.dataset.retryJob, action: 'retry' }) }).then(loadAll).then(() => setView('clips'));
-  const deleteJob = e.target.closest('[data-delete-job]');
-  if (deleteJob) api('/api/job', { method: 'PATCH', body: JSON.stringify({ jobId: deleteJob.dataset.deleteJob, action: 'delete' }) }).then(loadAll).then(() => setView('clips'));
-  const cancelJob = e.target.closest('[data-cancel-job]');
-  if (cancelJob) api('/api/job', { method: 'PATCH', body: JSON.stringify({ jobId: cancelJob.dataset.cancelJob, action: 'cancel' }) }).then(loadAll).then(() => setView('clips'));
-});
+
+/* ── Transcript ─────────────────────────────────────────────────────── */
+async function renderTranscript() {
+  const videos=state.library.videos||[];
+  const transcriptions=state.library.transcriptions||[];
+  const videoId=state.transcriptVideoId||videos[0]?.id||'';
+  let transcript={segments:[],fullText:'',wordCount:0};
+  if (videoId) {
+    try { transcript=await api(`/api/transcript?videoId=${videoId}`); } catch {}
+  }
+
+  $('#transcript').innerHTML = `
+    <div class="panel" style="max-width:800px">
+      <div class="panel-head">
+        <h2>Transcript viewer</h2>
+        <select id="transcriptSelect">
+          <option value="">Select a video…</option>
+          ${videos.map(v=>`<option value="${v.id}" ${v.id===videoId?'selected':''}>${esc(v.title.slice(0,50))}</option>`).join('')}
+        </select>
+      </div>
+      ${transcript.segments.length
+        ? `<div class="meta" style="margin-bottom:12px"><span>${transcript.wordCount||0} words</span><span>${transcript.segments.length} segments</span></div>
+           <div class="transcript-body">
+             ${transcript.segments.map(s=>`<span class="seg" title="${s.start.toFixed(1)}s–${s.end.toFixed(1)}s">${esc(s.text)} </span>`).join('')}
+           </div>
+           <div style="margin-top:16px"><button class="ghost" data-copy="${encodeURIComponent(transcript.fullText||'')}">Copy full transcript</button></div>`
+        : empty(videoId?'No transcript yet. Generate clips to trigger transcription.':'Select a video to view its transcript.')}
+    </div>`;
+
+  $('#transcriptSelect')?.addEventListener('change', e => {
+    state.transcriptVideoId=e.target.value;
+    renderTranscript();
+  });
+}
+
+/* ── Scheduler ─────────────────────────────────────────────────────── */
+function renderScheduler() {
+  const scheduled=(state.library.scheduledPosts||[]);
+  const clips=state.library.clips||[];
+  $('#scheduler').innerHTML = `
+    <div class="panel">
+      <h2>Post schedule</h2>
+      ${scheduled.length
+        ? `<div class="schedule-list">
+             ${scheduled.map(p=>{
+               const clip=clips.find(c=>c.id===p.clipId);
+               return `<div class="schedule-item">
+                 <div><b>${esc(clip?.hook||'Clip')}</b> <span class="pill">${esc(p.platform)}</span></div>
+                 <div class="meta"><span>${new Date(p.scheduledFor).toLocaleString()}</span><span>${pill(p.status, p.status==='scheduled'?'warn':p.status==='posted'?'ok':'')}</span></div>
+               </div>`;
+             }).join('')}
+           </div>`
+        : `<div class="empty-state" style="padding:32px">
+             <div class="empty-icon">◷</div>
+             <p>No scheduled posts yet. Generate clips and schedule them from the clip detail page.</p>
+             <button data-view-jump="create">Create clips →</button>
+           </div>`}
+    </div>`;
+}
+
+/* ── Billing ─────────────────────────────────────────────────────── */
+function renderBilling() {
+  const user=state.session?.user||{};
+  const plans=state.library.billingPlans||[];
+  const txns=(state.library.creditTransactions||[]).filter(t=>t.userId===user.id).slice(0,10);
+  $('#billing').innerHTML = `
+    <div class="billing-wrap">
+      <div class="credit-hero">
+        <div class="big-score">${user.credits??0}<small>credits</small></div>
+        <p class="muted">Credits are used for AI processing. Clip generation costs 5 credits.</p>
+      </div>
+      <div class="plans-grid">
+        ${plans.map(p=>`<div class="plan-card">
+          <h3>${esc(p.name)}</h3>
+          <div class="plan-price">$${p.monthlyPrice}<small>/mo</small></div>
+          <ul>${(p.features||[`${p.creditsIncluded} credits/month`,`Up to ${p.maxVideoLength}min videos`,`${p.maxClipsPerVideo} clips per video`]).map(f=>`<li>${esc(f)}</li>`).join('')}</ul>
+          <button class="ghost">Choose plan</button>
+        </div>`).join('')}
+      </div>
+      ${txns.length?`
+        <h3 style="margin:24px 0 12px">Transaction history</h3>
+        <div class="txn-list">
+          ${txns.map(t=>`<div class="txn-row">
+            <span>${esc(t.reason||'Credit')}</span>
+            <span class="${t.amount>0?'credit-pos':'credit-neg'}">${t.amount>0?'+':''}${t.amount}</span>
+            <small class="muted">${when(t.createdAt)}</small>
+          </div>`).join('')}
+        </div>
+      `:''}
+    </div>`;
+}
+
+/* ── Settings ─────────────────────────────────────────────────────── */
+function renderSettings() {
+  const user=state.session?.user||{};
+  const tools=state.session?.tools||{};
+  const setup=state.session?.setup||[];
+  $('#settings').innerHTML = `
+    <div class="settings-wrap">
+      <section class="panel">
+        <h2>System status</h2>
+        <div class="status-list">
+          ${setup.map(s=>`<div class="status-row">
+            <span class="status-dot ${s.ready?'on':'off'}"></span>
+            <b>${esc(s.label)}</b>
+            <small class="muted">${esc(s.action)}</small>
+          </div>`).join('')}
+        </div>
+      </section>
+      <section class="panel" style="margin-top:16px">
+        <h2>Profile</h2>
+        <form id="profileForm" class="stack" style="max-width:420px">
+          <input id="profileName" type="text" value="${esc(user.name||'')}" placeholder="Display name">
+          <button type="submit">Save profile</button>
+        </form>
+      </section>
+      <section class="panel" style="margin-top:16px">
+        <h2>Caption style default</h2>
+        <div class="style-swatches">
+          ${CAPTION_STYLES.map(s=>`<div class="swatch ${s}" data-style="${s}"><small>${s}</small></div>`).join('')}
+        </div>
+      </section>
+    </div>`;
+
+  $('#profileForm').addEventListener('submit', async e => {
+    e.preventDefault();
+    try {
+      await api('/api/profile',{method:'PATCH',body:JSON.stringify({name:$('#profileName').value.trim()})});
+      await loadAll(); renderSettings();
+    } catch(e2) { alert(e2.message); }
+  });
+}
+
+/* ── Admin ─────────────────────────────────────────────────────────── */
+function renderAdmin() {
+  const db=state.library;
+  const users=db.users||[];
+  const jobs=db.jobs||[];
+  const aiLogs=db.aiLogs||[];
+  const failed=jobs.filter(j=>j.status==='failed');
+  const apiSettings=db.apiSettings||[];
+
+  $('#admin').innerHTML = `
+    <div class="admin-wrap">
+      <div class="admin-stats">
+        <div class="stat-card"><div class="stat-num">${users.length}</div><div class="stat-label">Users</div></div>
+        <div class="stat-card"><div class="stat-num">${(db.clips||[]).length}</div><div class="stat-label">Clips</div></div>
+        <div class="stat-card"><div class="stat-num">${jobs.filter(j=>j.status==='complete').length}</div><div class="stat-label">Completed</div></div>
+        <div class="stat-card"><div class="stat-num">${failed.length}</div><div class="stat-label">Failed</div></div>
+      </div>
+
+      <section class="panel" style="margin-top:16px">
+        <h2>Users</h2>
+        <div class="admin-table">
+          ${users.map(u=>`<div class="admin-row">
+            <div><b>${esc(u.name||u.email)}</b> <small class="muted">${esc(u.email)}</small></div>
+            <div class="meta"><span>${pill(u.plan||'Free')}</span><span>${u.credits||0} credits</span><span>${pill(u.role||'user',u.role==='admin'?'ok':'')}</span></div>
+          </div>`).join('')}
+        </div>
+      </section>
+
+      <section class="panel" style="margin-top:16px">
+        <h2>AI Configuration</h2>
+        <form id="adminAiForm" class="stack" style="max-width:520px">
+          ${apiSettings.filter(s=>s.key.startsWith('LLM_')||s.key.includes('API_KEY')||s.key.includes('WHISPER')).slice(0,8).map(s=>`
+            <div class="option-row">
+              <label>${esc(s.label||s.key)}</label>
+              <input type="${s.key.includes('KEY')||s.key.includes('SECRET')?'password':'text'}" name="${esc(s.key)}" value="${esc(s.value||'')}" placeholder="${esc(s.key)}">
+            </div>
+          `).join('')}
+          <button type="submit">Save configuration</button>
+        </form>
+      </section>
+
+      ${failed.length?`
+        <section class="panel" style="margin-top:16px">
+          <h2>Failed jobs</h2>
+          ${failed.map(j=>`<div class="job-card failed">
+            <div class="job-head">
+              <b>${esc((db.videos||[]).find(v=>v.id===j.videoId)?.title||'Video')}</b>
+              <button data-retry-job="${j.id}">Retry</button>
+            </div>
+            <p class="error-text">${esc(j.error||'Unknown error')}</p>
+          </div>`).join('')}
+        </section>
+      `:''}
+
+      <section class="panel" style="margin-top:16px">
+        <h2>AI request log</h2>
+        <div class="log-list">
+          ${aiLogs.slice(0,20).map(l=>`<div class="log-row">
+            <span class="status-dot ${l.ok?'on':'off'}"></span>
+            <span>${esc(l.purpose)}</span>
+            <small class="muted">${esc(l.model)} · ${l.totalTokens||0} tokens · ${when(l.createdAt)}</small>
+            ${l.error?`<small class="error-text">${esc(l.error)}</small>`:''}
+          </div>`).join('')}
+        </div>
+      </section>
+    </div>`;
+
+  $('#adminAiForm')?.addEventListener('submit', async e => {
+    e.preventDefault();
+    const entries=[...new FormData(e.target).entries()];
+    try {
+      await Promise.all(entries.map(([key,value])=>api('/api/admin/settings',{method:'POST',body:JSON.stringify({key,value:String(value)})})));
+      await loadAll(); renderAdmin();
+    } catch(err) { alert(err.message); }
+  });
+}
+
+/* ── Auth ─────────────────────────────────────────────────────────── */
 $('#authForm').addEventListener('submit', async e => {
   e.preventDefault();
+  const btn=$('#authSubmit'); btn.disabled=true; btn.textContent='Please wait…';
   try {
-    const path = state.authMode === 'signup' ? '/api/signup' : '/api/login';
-    const res = await api(path, { method: 'POST', body: JSON.stringify({ email: $('#authEmail').value, password: $('#authPassword').value }) });
-    localStorage.setItem('clipforge:userId', res.user.id);
+    const isSignup=state.authMode==='signup';
+    const endpoint=isSignup?'/api/signup':'/api/login';
+    const body={email:$('#authEmail').value,password:$('#authPassword').value};
+    if (isSignup) {
+      const name=$('#authName')?.value?.trim();
+      if (name) body.name=name;
+    }
+    const data=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
+    if (data.error) throw new Error(data.error);
+    localStorage.setItem('clipforge:userId',data.user.id);
+    await boot();
+  } catch(e2) {
+    $('#authMessage').textContent=e2.message;
+    btn.disabled=false; btn.textContent=state.authMode==='signup'?'Create account':'Sign in';
+  }
+});
+
+$('#toggleAuth').addEventListener('click', () => {
+  state.authMode=state.authMode==='login'?'signup':'login';
+  $('#authTitle').textContent=state.authMode==='signup'?'Create account':'Welcome back';
+  $('#authSub').textContent=state.authMode==='signup'?'Start creating viral clips today':'Sign in to your account';
+  $('#authSubmit').textContent=state.authMode==='signup'?'Create account':'Sign in';
+  $('#toggleAuth').textContent=state.authMode==='signup'?'Already have an account?':'Create account';
+  $('#authNameRow').classList.toggle('hidden',state.authMode!=='signup');
+  $('#authMessage').textContent='';
+});
+
+$('#forgotPassword')?.addEventListener('click', () => {
+  $('#authMessage').textContent='Contact your admin to reset your password.';
+});
+
+document.getElementById('logoutBtn')?.addEventListener('click', () => {
+  localStorage.removeItem('clipforge:userId');
+  location.reload();
+});
+
+/* ── Event delegation ─────────────────────────────────────────────── */
+document.addEventListener('click', e => {
+  const jump=e.target.closest('[data-view],[data-view-jump]');
+  if (jump) { e.preventDefault(); setView(jump.dataset.view||jump.dataset.viewJump); }
+
+  const openClip=e.target.closest('[data-open-clip]');
+  if (openClip) {
+    const clip=state.library.clips.find(c=>c.id===openClip.dataset.openClip);
+    if (clip) { state.clip=clip; state.hookTab='curiosity'; state.platformTab='tiktok'; setView('clipDetail'); }
+  }
+
+  const copy=e.target.closest('[data-copy]');
+  if (copy) navigator.clipboard?.writeText(decodeURIComponent(copy.dataset.copy));
+
+  const retryJob=e.target.closest('[data-retry-job]');
+  if (retryJob) api('/api/job',{method:'PATCH',body:JSON.stringify({jobId:retryJob.dataset.retryJob,action:'retry'})}).then(loadAll).then(()=>setView('clips'));
+
+  const deleteJob=e.target.closest('[data-delete-job]');
+  if (deleteJob) api('/api/job',{method:'PATCH',body:JSON.stringify({jobId:deleteJob.dataset.deleteJob,action:'delete'})}).then(loadAll).then(()=>setView('clips'));
+
+  const cancelJob=e.target.closest('[data-cancel-job]');
+  if (cancelJob) api('/api/job',{method:'PATCH',body:JSON.stringify({jobId:cancelJob.dataset.cancelJob,action:'cancel'})}).then(loadAll).then(()=>setView('clips'));
+
+  const deleteVideo=e.target.closest('[data-delete-video]');
+  if (deleteVideo&&confirm('Delete this video and all its clips?')) {
+    api('/api/video',{method:'DELETE',body:JSON.stringify({videoId:deleteVideo.dataset.deleteVideo})}).then(loadAll).then(renderCreate);
+  }
+
+  const deleteClip=e.target.closest('[data-delete-clip]');
+  if (deleteClip&&confirm('Delete this clip?')) {
+    api('/api/clip',{method:'DELETE',body:JSON.stringify({clipId:deleteClip.dataset.deleteClip})}).then(loadAll).then(renderClips);
+  }
+
+  if (e.target.id==='clearAllVideos'&&confirm('Delete ALL videos and clips? This cannot be undone.')) {
+    const vids=state.library?.videos||[];
+    Promise.all(vids.map(v=>api('/api/video',{method:'DELETE',body:JSON.stringify({videoId:v.id})}))).then(loadAll).then(renderCreate);
+  }
+
+  if (e.target.id==='clearAllClips'&&confirm('Delete all clips? This cannot be undone.')) {
+    api('/api/clip',{method:'DELETE',body:JSON.stringify({all:true})}).then(loadAll).then(renderClips);
+  }
+
+  const deleteGen=e.target.closest('[data-delete-gen]');
+  if (deleteGen&&confirm('Delete this generation?')) {
+    api(`/api/ai/generation/${deleteGen.dataset.deleteGen}`,{method:'DELETE'}).then(loadGenerations);
+  }
+});
+
+/* ── Auto-refresh active jobs ─────────────────────────────────────── */
+function scheduleRefresh() {
+  const activeJobs=(state.library.jobs||[]).filter(j=>['queued','running'].includes(j.status));
+  if (activeJobs.length) {
+    setTimeout(async()=>{
+      await loadAll();
+      if (['clips','home'].includes(state.view)) setView(state.view);
+      scheduleRefresh();
+    }, 3000);
+  } else {
+    setTimeout(scheduleRefresh, 8000);
+  }
+}
+
+/* ── Boot ─────────────────────────────────────────────────────────── */
+async function boot() {
+  if (!uid()) {
+    $('#authShell').classList.remove('hidden');
+    $('#appShell').classList.add('hidden');
+    return;
+  }
+  try {
+    await loadAll();
+    if (!state.session?.user) throw new Error('Session expired.');
     $('#authShell').classList.add('hidden');
     $('#appShell').classList.remove('hidden');
-    await loadAll();
+    renderNav();
     setView('home');
-  } catch (err) { $('#authMessage').className = 'message error'; $('#authMessage').textContent = err.message; }
-});
-$('#toggleAuth').addEventListener('click', () => {
-  state.authMode = state.authMode === 'login' ? 'signup' : 'login';
-  $('#authSubmit').textContent = state.authMode === 'login' ? 'Login' : 'Create account';
-  $('#toggleAuth').textContent = state.authMode === 'login' ? 'Create account' : 'I already have an account';
-});
-$('#forgotPassword').addEventListener('click', () => { $('#authMessage').textContent = 'Password reset placeholder for MVP.'; });
+    scheduleRefresh();
+  } catch {
+    localStorage.removeItem('clipforge:userId');
+    $('#authShell').classList.remove('hidden');
+    $('#appShell').classList.add('hidden');
+  }
+}
+
 boot();

@@ -3,45 +3,72 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#101828">
-    <title>ClipForge AI</title>
-    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#080812">
+    <title>ClipForge AI — Viral clips, no effort</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
     <section id="authShell" class="auth-shell">
+      <div class="auth-glow"></div>
       <form id="authForm" class="auth-card">
-        <div class="brand"><span>CF</span><b>ClipForge AI</b></div>
-        <h1>Ready-to-post shorts, no account linking.</h1>
-        <p>Generate original, transformed, ready-to-post clips. Pay for credits by local bank transfer and post manually.</p>
-        <input id="authEmail" type="email" placeholder="Email" required>
-        <input id="authPassword" type="password" placeholder="Password" required>
-        <button id="authSubmit" type="submit">Login</button>
-        <div class="auth-links"><button type="button" class="text-btn" id="toggleAuth">Create account</button><button type="button" class="text-btn" id="forgotPassword">Forgot password?</button></div>
+        <div class="brand">
+          <div class="brand-icon">⚡</div>
+          <b>ClipForge AI</b>
+        </div>
+        <h1 id="authTitle">Welcome back</h1>
+        <p id="authSub">Sign in to your account to continue</p>
+        <div id="authNameRow" class="hidden">
+          <input id="authName" type="text" placeholder="Your name" autocomplete="name">
+        </div>
+        <input id="authEmail" type="email" placeholder="Email address" autocomplete="email" required>
+        <input id="authPassword" type="password" placeholder="Password" autocomplete="current-password" required>
+        <button id="authSubmit" type="submit">Sign in</button>
+        <div class="auth-links">
+          <button type="button" class="text-btn" id="toggleAuth">Create account</button>
+          <button type="button" class="text-btn" id="forgotPassword">Forgot password?</button>
+        </div>
         <div id="authMessage" class="message"></div>
       </form>
     </section>
 
     <div id="appShell" class="app-shell hidden">
       <aside class="side-nav">
-        <div class="brand"><span>CF</span><b>ClipForge</b></div>
+        <div class="brand">
+          <div class="brand-icon">⚡</div>
+          <b>ClipForge AI</b>
+        </div>
         <nav id="sideNav"></nav>
-        <div class="user-box"><b id="userName">User</b><small id="userPlan">Credits</small></div>
+        <div class="user-box">
+          <div class="user-avatar" id="userAvatar">U</div>
+          <div class="user-info">
+            <b id="userName">User</b>
+            <small id="userPlan">— credits</small>
+          </div>
+          <button class="icon-btn logout-btn" id="logoutBtn" title="Sign out">↩</button>
+        </div>
       </aside>
 
       <main class="main">
         <header class="app-top">
-          <div><span id="pageEyebrow" class="eyebrow">Home</span><h1 id="pageTitle">Manual Posting Assistant</h1></div>
-          <button class="icon-btn" data-view-jump="settings" title="Settings">⚙</button>
+          <div>
+            <span id="pageEyebrow" class="eyebrow">Home</span>
+            <h1 id="pageTitle">Dashboard</h1>
+          </div>
+          <div class="top-actions">
+            <button class="icon-btn" data-view-jump="settings" title="Settings">⚙</button>
+          </div>
         </header>
 
-        <section id="home" class="view active"></section>
-        <section id="create" class="view"></section>
-        <section id="clips" class="view"></section>
+        <section id="home"       class="view active"></section>
+        <section id="create"     class="view"></section>
+        <section id="clips"      class="view"></section>
         <section id="clipDetail" class="view"></section>
-        <section id="billing" class="view"></section>
-        <section id="settings" class="view"></section>
-        <section id="admin" class="view"></section>
+        <section id="studio"     class="view"></section>
+        <section id="transcript" class="view"></section>
+        <section id="scheduler"  class="view"></section>
+        <section id="billing"    class="view"></section>
+        <section id="settings"   class="view"></section>
+        <section id="admin"      class="view"></section>
       </main>
 
       <nav id="bottomNav" class="bottom-nav"></nav>
