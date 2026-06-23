@@ -1390,7 +1390,8 @@ function buildCaptionText(text) {
 function ffmpegText(value = '') {
   return String(value)
     .replace(/\\/g, '\\\\')
-    .replace(/[,;]/g, ' ')
+    .replace(/[,;]/g,  ' ')   // commas/semicolons break filter chains
+    .replace(/[\[\]]/g, ' ')  // brackets are pad-label markers in filter_complex
     .replace(/:/g, '\\:')
     .replace(/'/g, "\\'");
 }
@@ -1454,16 +1455,47 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     'setsar=1',
     ...captionStyleFilters(hook, title, captionStyle, canDrawText)
   ].join(',');
+  const singleSegmentRender = () => run(FFMPEG, [
+    '-y', '-ss', String(moment.start), '-to', String(moment.end), '-i', mediaPath,
+    '-vf', visualFilters,
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26',
+    '-maxrate', '1600k', '-bufsize', '3200k',
+    '-c:a', 'aac', '-movflags', '+faststart', output
+  ], { jobId, label: 'ffmpeg render', timeoutMs: PROCESS_TIMEOUT_MS });
+
   if (renderSegments.length > 1) {
-    const trims = renderSegments.map((segment, i) => [
-      `[0:v]trim=start=${segment.start}:end=${segment.end},setpts=PTS-STARTPTS[v${i}]`,
-      `[0:a]atrim=start=${segment.start}:end=${segment.end},asetpts=PTS-STARTPTS[a${i}]`
-    ].join(';')).join(';');
-    const concatInputs = renderSegments.map((_, i) => `[v${i}][a${i}]`).join('');
-    const filterComplex = `${trims};${concatInputs}concat=n=${renderSegments.length}:v=1:a=1[cv][ca];[cv]${visualFilters}[outv]`;
-    await run(FFMPEG, ['-y', '-i', mediaPath, '-filter_complex', filterComplex, '-map', '[outv]', '-map', '[ca]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-maxrate', '1600k', '-bufsize', '3200k', '-c:a', 'aac', '-movflags', '+faststart', output], { jobId, label: 'ffmpeg render', timeoutMs: PROCESS_TIMEOUT_MS });
+    // Validate segments are within video bounds and have positive duration
+    const validSegments = renderSegments.filter(s => {
+      const dur = Number(s.end) - Number(s.start);
+      return dur > 1 && Number(s.start) >= 0 && Number(s.end) > Number(s.start);
+    });
+    if (validSegments.length > 1) {
+      try {
+        const trims = validSegments.map((segment, i) => [
+          `[0:v]trim=start=${Number(segment.start).toFixed(3)}:end=${Number(segment.end).toFixed(3)},setpts=PTS-STARTPTS[v${i}]`,
+          `[0:a]atrim=start=${Number(segment.start).toFixed(3)}:end=${Number(segment.end).toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`
+        ].join(';')).join(';');
+        const concatInputs = validSegments.map((_, i) => `[v${i}][a${i}]`).join('');
+        const filterComplex = `${trims};${concatInputs}concat=n=${validSegments.length}:v=1:a=1[cv][ca];[cv]${visualFilters}[outv]`;
+        await run(FFMPEG, [
+          '-y', '-i', mediaPath,
+          '-filter_complex', filterComplex,
+          '-map', '[outv]', '-map', '[ca]',
+          '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26',
+          '-maxrate', '1600k', '-bufsize', '3200k',
+          '-c:a', 'aac', '-movflags', '+faststart', output
+        ], { jobId, label: 'ffmpeg render', timeoutMs: PROCESS_TIMEOUT_MS });
+      } catch (filterErr) {
+        console.warn('[ffmpeg:filter-complex-fallback]', { clipId, error: String(filterErr.message||filterErr).slice(0,200) });
+        // Clean up failed output before retry
+        try { if (existsSync(output)) unlinkSync(output); } catch {}
+        await singleSegmentRender();
+      }
+    } else {
+      await singleSegmentRender();
+    }
   } else {
-    await run(FFMPEG, ['-y', '-ss', String(moment.start), '-to', String(moment.end), '-i', mediaPath, '-vf', visualFilters, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-maxrate', '1600k', '-bufsize', '3200k', '-c:a', 'aac', '-movflags', '+faststart', output], { jobId, label: 'ffmpeg render', timeoutMs: PROCESS_TIMEOUT_MS });
+    await singleSegmentRender();
   }
   if (!existsSync(output) || statSync(output).size < 1024) {
     throw new Error('FFmpeg finished but no valid clip output was created.');
