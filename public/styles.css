@@ -570,6 +570,10 @@ label {
 details { background: var(--panel-bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
 summary { cursor: pointer; font-size: .85rem; font-weight: 600; }
 
+/* ── LLM Verify ────────────────────────────────────────────────── */
+.verify-ok   { margin-top:10px; padding:12px 14px; background:rgba(52,211,153,.1); border:1px solid rgba(52,211,153,.3); border-radius:var(--radius2); font-size:.88rem; color:var(--ok); }
+.verify-fail { margin-top:10px; padding:12px 14px; background:rgba(248,113,113,.1); border:1px solid rgba(248,113,113,.3); border-radius:var(--radius2); font-size:.88rem; color:var(--danger); }
+
 /* ── AI Generator Gallery ───────────────────────────────────────── */
 .gen-gallery { display: grid; grid-template-columns: repeat(auto-fill,minmax(220px,1fr)); gap: 12px; }
 .gen-card { background: var(--panel-bg); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; transition: border-color .15s; }

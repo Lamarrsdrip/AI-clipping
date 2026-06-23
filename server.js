@@ -1835,15 +1835,24 @@ function normalizeOpenAiBaseUrl(baseUrl) {
 
 function aiConfig(db, fallback = false) {
   const prefix = fallback ? 'LLM_FALLBACK_' : 'LLM_';
-  const provider = settingValue(db, `${prefix}PROVIDER`) || (fallback ? '' : 'openai');
+  const provider = settingValue(db, `${prefix}PROVIDER`) || (fallback ? '' : 'xai');
   const apiKey = settingValue(db, `${prefix}API_KEY`);
   const customBaseUrl = settingValue(db, `${prefix}BASE_URL`);
   const providerDefaults = {
-    emergent: 'https://api.emergent.sh/v1',
-    openai: 'https://api.openai.com/v1'
+    xai:      'https://api.x.ai/v1',
+    grok:     'https://api.x.ai/v1',
+    openai:   'https://api.openai.com/v1',
+    groq:     'https://api.groq.com/openai/v1',
+    together: 'https://api.together.xyz/v1',
+    emergent: 'https://api.emergent.sh/v1'
+  };
+  const providerModels = {
+    xai: 'grok-3-mini', grok: 'grok-3-mini',
+    openai: 'gpt-4o-mini', groq: 'llama-3.3-70b-versatile',
+    together: 'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo'
   };
   const baseUrl = customBaseUrl ? normalizeOpenAiBaseUrl(customBaseUrl) : (providerDefaults[provider] || '');
-  const model = settingValue(db, `${prefix}MODEL`) || 'gpt-4o-mini';
+  const model = settingValue(db, `${prefix}MODEL`) || providerModels[provider] || 'grok-3-mini';
   return { provider, apiKey, baseUrl, model, customBaseUrl: Boolean(customBaseUrl) };
 }
 
@@ -3046,6 +3055,42 @@ async function handleApi(req, res, pathname) {
         saveDb(db);
       }
       return json(res, 200, { paymentRequests: db.paymentRequests, users: db.users.map(publicUser) });
+    }
+    if (pathname === '/api/admin/llm/verify' && req.method === 'POST') {
+      const db = loadDb();
+      requireAdmin(req, db);
+      const body = await readJson(req);
+      // Allow testing a candidate key before saving
+      const provider = body.provider || settingValue(db, 'LLM_PROVIDER') || 'xai';
+      const apiKey   = body.apiKey   || settingValue(db, 'LLM_API_KEY');
+      const model    = body.model    || settingValue(db, 'LLM_MODEL') || 'grok-3-mini';
+      const customBase = body.baseUrl || settingValue(db, 'LLM_BASE_URL');
+      const providerBases = {
+        xai: 'https://api.x.ai/v1', grok: 'https://api.x.ai/v1',
+        openai: 'https://api.openai.com/v1', groq: 'https://api.groq.com/openai/v1',
+        together: 'https://api.together.xyz/v1'
+      };
+      const base = (customBase || providerBases[provider] || '').replace(/\/+$/, '');
+      if (!apiKey) return json(res, 400, { ok: false, error: 'No API key provided.' });
+      if (!base)   return json(res, 400, { ok: false, error: `Unknown provider "${provider}". Set a custom base URL.` });
+      const endpoint = `${base}/chat/completions`;
+      const t0 = Date.now();
+      try {
+        const testRes = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'authorization': `Bearer ${apiKey}` },
+          body: JSON.stringify({ model, messages: [{ role: 'user', content: 'Reply with the single word: working' }], max_tokens: 10, temperature: 0 }),
+          signal: AbortSignal.timeout(20000)
+        });
+        const data = await testRes.json().catch(() => ({}));
+        const ms = Date.now() - t0;
+        if (!testRes.ok) return json(res, 200, { ok: false, error: data.error?.message || data.error || `HTTP ${testRes.status}`, status: testRes.status, ms });
+        const reply = data.choices?.[0]?.message?.content?.trim() || '';
+        const usedModel = data.model || model;
+        return json(res, 200, { ok: true, reply, model: usedModel, ms, provider, endpoint });
+      } catch (err) {
+        return json(res, 200, { ok: false, error: String(err.message || err), ms: Date.now() - t0 });
+      }
     }
     if (pathname === '/api/admin/settings') {
       const db = loadDb();

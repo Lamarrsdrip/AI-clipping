@@ -1095,43 +1095,89 @@ function renderAdmin() {
   const jobs=db.jobs||[];
   const aiLogs=db.aiLogs||[];
   const failed=jobs.filter(j=>j.status==='failed');
-  const apiSettings=db.apiSettings||[];
 
   $('#admin').innerHTML = `
     <div class="admin-wrap">
       <div class="admin-stats">
         <div class="stat-card"><div class="stat-num">${users.length}</div><div class="stat-label">Users</div></div>
         <div class="stat-card"><div class="stat-num">${(db.clips||[]).length}</div><div class="stat-label">Clips</div></div>
-        <div class="stat-card"><div class="stat-num">${jobs.filter(j=>j.status==='complete').length}</div><div class="stat-label">Completed</div></div>
+        <div class="stat-card"><div class="stat-num">${jobs.filter(j=>j.status==='complete'||j.status==='completed').length}</div><div class="stat-label">Completed</div></div>
         <div class="stat-card"><div class="stat-num">${failed.length}</div><div class="stat-label">Failed</div></div>
       </div>
 
+      <!-- ── LLM / Grok config ── -->
       <section class="panel" style="margin-top:16px">
-        <h2>Users</h2>
+        <div class="panel-head" style="margin-bottom:16px">
+          <div>
+            <span class="eyebrow">AI Brain</span>
+            <h2>Grok / LLM Configuration</h2>
+          </div>
+          <div id="llmVerifyBadge"></div>
+        </div>
+        <form id="llmConfigForm" class="stack" style="max-width:540px">
+          <div class="option-row">
+            <label>Provider</label>
+            <select id="llmProvider" name="LLM_PROVIDER">
+              <option value="xai">xAI — Grok (recommended)</option>
+              <option value="openai">OpenAI — GPT-4o-mini</option>
+              <option value="groq">Groq — Llama 3.3 70B (free tier)</option>
+              <option value="together">Together AI — Llama 3.1 70B</option>
+            </select>
+          </div>
+          <div>
+            <label>API Key</label>
+            <div style="display:flex;gap:8px">
+              <input id="llmApiKey" name="LLM_API_KEY" type="password" placeholder="Paste your API key here" autocomplete="off" style="flex:1">
+              <button type="button" id="llmReveal" class="ghost" style="flex-shrink:0;padding:10px 14px">👁</button>
+            </div>
+            <p class="muted" id="llmKeyHint" style="margin-top:6px;font-size:.78rem">xAI Grok: get key at <b>console.x.ai</b> → free tier available</p>
+          </div>
+          <div>
+            <label>Model <span class="muted">(auto-filled per provider)</span></label>
+            <input id="llmModel" name="LLM_MODEL" type="text" placeholder="grok-3-mini">
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button type="button" id="llmVerifyBtn" class="ghost">Test connection</button>
+            <button type="submit">Save &amp; apply</button>
+          </div>
+          <div id="llmVerifyResult"></div>
+        </form>
+      </section>
+
+      <!-- ── Other API keys ── -->
+      <section class="panel" style="margin-top:16px">
+        <span class="eyebrow">Media Generation</span>
+        <h2 style="margin-bottom:14px">API Keys</h2>
+        <form id="mediaKeyForm" class="stack" style="max-width:540px">
+          ${[['MUAPI_API_KEY','Muapi.ai key (Kling, Seedance, FLUX, Wav2Lip)','console.muapi.ai'],
+             ['HIGGSFIELD_API_KEY','Higgsfield AI key (cinematic video)','cloud.higgsfield.ai'],
+             ['ELEVENLABS_API_KEY','ElevenLabs key (AI voiceover)','elevenlabs.io'],
+             ['YOUTUBE_API_KEY','YouTube Data API key (channel imports)','console.developers.google.com']
+            ].map(([key,label,url])=>`
+            <div>
+              <label>${esc(label)} <span class="muted">— ${esc(url)}</span></label>
+              <input type="password" name="${key}" placeholder="${key}" autocomplete="off">
+            </div>
+          `).join('')}
+          <button type="submit">Save keys</button>
+          <div id="mediaKeyResult"></div>
+        </form>
+      </section>
+
+      <!-- ── Users ── -->
+      <section class="panel" style="margin-top:16px">
+        <h2 style="margin-bottom:12px">Users</h2>
         <div class="admin-table">
           ${users.map(u=>`<div class="admin-row">
             <div><b>${esc(u.name||u.email)}</b> <small class="muted">${esc(u.email)}</small></div>
-            <div class="meta"><span>${pill(u.plan||'Free')}</span><span>${u.credits||0} credits</span><span>${pill(u.role||'user',u.role==='admin'?'ok':'')}</span></div>
+            <div class="meta">${pill(u.plan||'Free')}<span>${u.credits||0} credits</span>${pill(u.role||'user',u.role==='admin'?'ok':'')}</div>
           </div>`).join('')}
         </div>
       </section>
 
-      <section class="panel" style="margin-top:16px">
-        <h2>AI Configuration</h2>
-        <form id="adminAiForm" class="stack" style="max-width:520px">
-          ${apiSettings.filter(s=>s.key.startsWith('LLM_')||s.key.includes('API_KEY')||s.key.includes('WHISPER')).slice(0,8).map(s=>`
-            <div class="option-row">
-              <label>${esc(s.label||s.key)}</label>
-              <input type="${s.key.includes('KEY')||s.key.includes('SECRET')?'password':'text'}" name="${esc(s.key)}" value="${esc(s.value||'')}" placeholder="${esc(s.key)}">
-            </div>
-          `).join('')}
-          <button type="submit">Save configuration</button>
-        </form>
-      </section>
-
       ${failed.length?`
         <section class="panel" style="margin-top:16px">
-          <h2>Failed jobs</h2>
+          <h2 style="margin-bottom:12px">Failed jobs</h2>
           ${failed.map(j=>`<div class="job-card failed">
             <div class="job-head">
               <b>${esc((db.videos||[]).find(v=>v.id===j.videoId)?.title||'Video')}</b>
@@ -1142,25 +1188,97 @@ function renderAdmin() {
         </section>
       `:''}
 
+      <!-- ── AI request log ── -->
       <section class="panel" style="margin-top:16px">
-        <h2>AI request log</h2>
+        <div class="panel-head" style="margin-bottom:12px">
+          <h2>AI request log</h2>
+          <span class="muted">${aiLogs.length} entries</span>
+        </div>
         <div class="log-list">
-          ${aiLogs.slice(0,20).map(l=>`<div class="log-row">
+          ${aiLogs.slice(0,30).map(l=>`<div class="log-row">
             <span class="status-dot ${l.ok?'on':'off'}"></span>
             <span>${esc(l.purpose)}</span>
-            <small class="muted">${esc(l.model)} · ${l.totalTokens||0} tokens · ${when(l.createdAt)}</small>
-            ${l.error?`<small class="error-text">${esc(l.error)}</small>`:''}
+            <small class="muted">${esc(l.model||'—')} · ${l.totalTokens||0} tok · ${when(l.createdAt)}</small>
+            ${l.error?`<div style="width:100%"><small class="error-text">${esc(String(l.error).slice(0,120))}</small></div>`:''}
           </div>`).join('')}
         </div>
       </section>
     </div>`;
 
-  $('#adminAiForm')?.addEventListener('submit', async e => {
-    e.preventDefault();
-    const entries=[...new FormData(e.target).entries()];
+  // Provider → hint + model auto-fill
+  const PROVIDER_HINTS = {
+    xai:      { hint:'Get key at <b>console.x.ai</b> — free tier available', model:'grok-3-mini' },
+    openai:   { hint:'Get key at <b>platform.openai.com</b>', model:'gpt-4o-mini' },
+    groq:     { hint:'Get key at <b>console.groq.com</b> — generous free tier', model:'llama-3.3-70b-versatile' },
+    together: { hint:'Get key at <b>api.together.xyz</b> — free credits on signup', model:'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo' }
+  };
+  function applyProviderHint() {
+    const p=$('#llmProvider')?.value||'xai';
+    const h=PROVIDER_HINTS[p]||PROVIDER_HINTS.xai;
+    if ($('#llmKeyHint')) $('#llmKeyHint').innerHTML=h.hint;
+    if ($('#llmModel')&&!$('#llmModel').value) $('#llmModel').value=h.model;
+  }
+  $('#llmProvider')?.addEventListener('change', applyProviderHint);
+  applyProviderHint();
+
+  // Reveal toggle
+  $('#llmReveal')?.addEventListener('click', () => {
+    const inp=$('#llmApiKey');
+    inp.type=inp.type==='password'?'text':'password';
+  });
+
+  // Verify button
+  $('#llmVerifyBtn')?.addEventListener('click', async () => {
+    const btn=$('#llmVerifyBtn');
+    const resultEl=$('#llmVerifyResult');
+    const badgeEl=$('#llmVerifyBadge');
+    btn.disabled=true; btn.textContent='Testing…';
+    resultEl.innerHTML='';
     try {
-      await Promise.all(entries.map(([key,value])=>api('/api/admin/settings',{method:'POST',body:JSON.stringify({key,value:String(value)})})));
-      await loadAll(); renderAdmin();
+      const res=await api('/api/admin/llm/verify',{method:'POST',body:JSON.stringify({
+        provider:$('#llmProvider')?.value,
+        apiKey:$('#llmApiKey')?.value,
+        model:$('#llmModel')?.value
+      })});
+      if (res.ok) {
+        resultEl.innerHTML=`<div class="verify-ok">✓ Connected — model <b>${esc(res.model)}</b> replied in ${res.ms}ms: "<i>${esc(res.reply)}</i>"</div>`;
+        badgeEl.innerHTML=`<span class="pill ok">✓ Verified</span>`;
+      } else {
+        resultEl.innerHTML=`<div class="verify-fail">✗ Failed — ${esc(res.error)}</div>`;
+        badgeEl.innerHTML=`<span class="pill error">✗ Failed</span>`;
+      }
+    } catch(e) {
+      resultEl.innerHTML=`<div class="verify-fail">✗ ${esc(e.message)}</div>`;
+      badgeEl.innerHTML=`<span class="pill error">✗ Error</span>`;
+    }
+    btn.disabled=false; btn.textContent='Test connection';
+  });
+
+  // Save LLM config
+  $('#llmConfigForm')?.addEventListener('submit', async e => {
+    e.preventDefault();
+    const settings={
+      LLM_PROVIDER:$('#llmProvider')?.value||'xai',
+      LLM_API_KEY:$('#llmApiKey')?.value||'',
+      LLM_MODEL:$('#llmModel')?.value||'grok-3-mini'
+    };
+    try {
+      await api('/api/admin/settings',{method:'PATCH',body:JSON.stringify({settings})});
+      state.studioStatus=null; // force re-fetch
+      const btn=e.target.querySelector('button[type=submit]');
+      btn.textContent='Saved ✓'; setTimeout(()=>{ btn.textContent='Save & apply'; },2000);
+    } catch(err) { alert(err.message); }
+  });
+
+  // Save media keys
+  $('#mediaKeyForm')?.addEventListener('submit', async e => {
+    e.preventDefault();
+    const settings=Object.fromEntries([...new FormData(e.target).entries()].filter(([,v])=>v));
+    try {
+      await api('/api/admin/settings',{method:'PATCH',body:JSON.stringify({settings})});
+      state.studioStatus=null;
+      $('#mediaKeyResult').innerHTML='<div class="verify-ok">Saved ✓</div>';
+      setTimeout(()=>{ $('#mediaKeyResult').innerHTML=''; },3000);
     } catch(err) { alert(err.message); }
   });
 }
