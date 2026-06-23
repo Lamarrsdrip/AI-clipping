@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9
 """
 Face tracking script for ClipForge AI rendering pipeline.
-Uses OpenCV Haar cascade (included with OpenCV) for face detection.
-Falls back to DNN-based detection if model files are available.
+Uses MediaPipe BlazeFace (neural face detector) for accurate face positions.
+Falls back to OpenCV Haar cascade if MediaPipe is unavailable.
 
-Usage: python3 face_track.py <video_path> <start_sec> <end_sec> [sample_fps]
+Usage: python3.9 face_track.py <video_path> <start_sec> <end_sec> [sample_fps]
 Output: JSON with speaker side and aggregate face position
 """
 import sys
@@ -27,16 +27,11 @@ def main():
         print(json.dumps({"error": "opencv not available", "speakerSide": "center"}))
         sys.exit(0)
 
-    # Use built-in Haar cascade (ships with every OpenCV install)
-    cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml'
-    if not os.path.exists(cascade_path):
-        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-
-    if not os.path.exists(cascade_path):
-        print(json.dumps({"error": "No cascade file found", "speakerSide": "center"}))
-        sys.exit(0)
-
-    face_cascade = cv2.CascadeClassifier(cascade_path)
+    try:
+        import mediapipe as mp
+        USE_MEDIAPIPE = True
+    except ImportError:
+        USE_MEDIAPIPE = False
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -52,50 +47,83 @@ def main():
 
     all_cx = []
     all_cy = []
+    all_sizes = []
     frames_sampled = 0
-    MAX_FRAMES = 20  # cap to keep it fast
+    MAX_FRAMES = 25
 
-    while frames_sampled < MAX_FRAMES:
-        pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-        if pos_ms / 1000 > end + 0.1:
-            break
+    if USE_MEDIAPIPE:
+        # BlazeFace: neural face detector, accurate & fast
+        mp_face = mp.solutions.face_detection
+        detector = mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.55)
 
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frames_sampled += 1
-
-        # Downscale for speed
-        small = cv2.resize(frame, (640, int(640 * src_height / src_width)))
-        gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        gray  = cv2.equalizeHist(gray)
-
-        faces = face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.15,
-            minNeighbors=4,
-            minSize=(30, 30),
-            flags=cv2.CASCADE_SCALE_IMAGE
-        )
-
-        if len(faces) > 0:
-            for (x, y, w, h) in faces:
-                # Convert back to original frame coordinates (relative 0..1)
-                scale_x = src_width / 640
-                scale_y = src_height / (640 * src_height / src_width)
-                cx = ((x + w / 2) * scale_x) / src_width
-                cy = ((y + h / 2) * scale_y) / src_height
-                # Only count high-confidence large faces (filter noise)
-                if w * scale_x > src_width * 0.05:
-                    all_cx.append(cx)
-                    all_cy.append(cy)
-
-        # Skip frames
-        for _ in range(interval - 1):
-            ret2, _ = cap.read()
-            if not ret2:
+        while frames_sampled < MAX_FRAMES:
+            pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            if pos_ms / 1000 > end + 0.1:
                 break
+
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frames_sampled += 1
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            result = detector.process(rgb)
+
+            if result.detections:
+                for det in result.detections:
+                    bb = det.location_data.relative_bounding_box
+                    cx = bb.xmin + bb.width / 2
+                    cy = bb.ymin + bb.height / 2
+                    area = bb.width * bb.height
+                    # Filter out tiny spurious detections
+                    if bb.width > 0.04 and det.score[0] > 0.55:
+                        all_cx.append(max(0, min(1, cx)))
+                        all_cy.append(max(0, min(1, cy)))
+                        all_sizes.append(area)
+
+            for _ in range(interval - 1):
+                ret2, _ = cap.read()
+                if not ret2:
+                    break
+
+        detector.close()
+
+    else:
+        # Fallback: OpenCV Haar cascade
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml'
+        if not os.path.exists(cascade_path):
+            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        face_cascade = cv2.CascadeClassifier(cascade_path)
+
+        while frames_sampled < MAX_FRAMES:
+            pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            if pos_ms / 1000 > end + 0.1:
+                break
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames_sampled += 1
+
+            small = cv2.resize(frame, (640, int(640 * src_height / max(1, src_width))))
+            gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            gray  = cv2.equalizeHist(gray)
+            faces = face_cascade.detectMultiScale(gray, 1.15, 4, minSize=(30, 30))
+
+            if len(faces) > 0:
+                scale_x = src_width / 640
+                scale_y = src_height / (640 * src_height / max(1, src_width))
+                for (x, y, w, h) in faces:
+                    cx = ((x + w / 2) * scale_x) / src_width
+                    cy = ((y + h / 2) * scale_y) / src_height
+                    if w * scale_x > src_width * 0.04:
+                        all_cx.append(cx)
+                        all_cy.append(cy)
+                        all_sizes.append((w / 640) * (h / 480))
+
+            for _ in range(interval - 1):
+                ret2, _ = cap.read()
+                if not ret2:
+                    break
 
     cap.release()
 
@@ -103,18 +131,20 @@ def main():
         print(json.dumps({
             "speakerSide": "center",
             "meanFaceX": 0.5,
-            "meanFaceY": 0.4,
+            "meanFaceY": 0.38,
             "srcWidth": src_width,
             "srcHeight": src_height,
             "totalFaceDetections": 0,
-            "framesSampled": frames_sampled
+            "framesSampled": frames_sampled,
+            "detector": "mediapipe" if USE_MEDIAPIPE else "haar"
         }))
         return
 
-    mean_cx = sum(all_cx) / len(all_cx)
-    mean_cy = sum(all_cy) / len(all_cy)
+    # Weight by face size — larger (closer) face = dominant speaker
+    total_w = sum(all_sizes) or 1
+    mean_cx = sum(cx * sz for cx, sz in zip(all_cx, all_sizes)) / total_w
+    mean_cy = sum(cy * sz for cy, sz in zip(all_cy, all_sizes)) / total_w
 
-    # Classify speaker side
     if mean_cx < 0.38:
         speaker_side = "left"
     elif mean_cx > 0.62:
@@ -124,12 +154,13 @@ def main():
 
     print(json.dumps({
         "speakerSide": speaker_side,
-        "meanFaceX": round(mean_cx, 3),
-        "meanFaceY": round(mean_cy, 3),
+        "meanFaceX": round(mean_cx, 4),
+        "meanFaceY": round(mean_cy, 4),
         "srcWidth": src_width,
         "srcHeight": src_height,
         "totalFaceDetections": len(all_cx),
-        "framesSampled": frames_sampled
+        "framesSampled": frames_sampled,
+        "detector": "mediapipe" if USE_MEDIAPIPE else "haar"
     }))
 
 if __name__ == "__main__":

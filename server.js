@@ -1704,11 +1704,14 @@ async function probeVideoDims(mediaPath) {
 const FACE_TRACK_SCRIPT = path.join(__dirname, 'face_track.py');
 let _faceTrackAvailable = null;
 
+const PYTHON3 = '/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9';
+
 async function faceTrackAvailable() {
   if (_faceTrackAvailable !== null) return _faceTrackAvailable;
   try {
+    const py = existsSync(PYTHON3) ? PYTHON3 : 'python3';
     const { stdout } = await new Promise((resolve, reject) => {
-      const p = spawn('python3', ['-c', 'import cv2; print("ok")'], { stdio:['pipe','pipe','pipe'] });
+      const p = spawn(py, ['-c', 'import cv2; print("ok")'], { stdio:['pipe','pipe','pipe'] });
       let out='', err='';
       p.stdout.on('data', d => out += d);
       p.stderr.on('data', d => err += d);
@@ -1722,8 +1725,9 @@ async function faceTrackAvailable() {
 async function trackFaces(mediaPath, start, end) {
   try {
     if (!await faceTrackAvailable()) return null;
+    const py = existsSync(PYTHON3) ? PYTHON3 : 'python3';
     const { stdout } = await new Promise((resolve, reject) => {
-      const p = spawn('python3', [FACE_TRACK_SCRIPT, mediaPath, String(start), String(end), '3'], {
+      const p = spawn(py, [FACE_TRACK_SCRIPT, mediaPath, String(start), String(end), '3'], {
         stdio: ['pipe', 'pipe', 'pipe']
       });
       let out = '', err = '';
