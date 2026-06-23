@@ -518,6 +518,7 @@ async function commandVersion(command) {
 
 // Cache result — probe runs once per process lifetime
 let _drawtextOk = null;
+let _toolsCache = null; // cached once per process startup
 async function drawtextSupported() {
   if (_drawtextOk !== null) return _drawtextOk;
   try {
@@ -948,9 +949,10 @@ async function fetchSourceVideos(sourceUrl) {
 function addImportedVideos(db, sourceUrl, sourceType, videos, defaults = {}) {
   const importId = randomUUID();
   const projectId = randomUUID();
+  const ownerId = defaults.userId || 'user_demo';
   db.imports.unshift({
     id: importId,
-    userId: 'user_demo',
+    userId: ownerId,
     projectId,
     sourceUrl,
     sourceType,
@@ -959,7 +961,7 @@ function addImportedVideos(db, sourceUrl, sourceType, videos, defaults = {}) {
   });
   db.projects.unshift({
     id: projectId,
-    userId: defaults.userId || 'user_demo',
+    userId: ownerId,
     importId,
     name: sourceType === 'channel' ? 'YouTube channel clips' : 'YouTube video clips',
     sourceUrl,
@@ -970,10 +972,11 @@ function addImportedVideos(db, sourceUrl, sourceType, videos, defaults = {}) {
   });
   const added = [];
   for (const video of videos) {
-    const existing = db.videos.find(item => item.youtubeId === video.youtubeId);
+    const existing = db.videos.find(item => item.youtubeId === video.youtubeId && item.userId === ownerId);
     if (existing) continue;
     const row = {
       id: randomUUID(),
+      userId: ownerId,
       importId,
       ...video,
       selected: false,
@@ -983,18 +986,16 @@ function addImportedVideos(db, sourceUrl, sourceType, videos, defaults = {}) {
       watchedChannelId: defaults.watchedChannelId || null,
       projectId
     };
-    db.videos.unshift({
-      ...row
-    });
+    db.videos.unshift(row);
     added.push(row);
   }
   return { importId, videos: added };
 }
 
-async function importSource(sourceUrl) {
+async function importSource(sourceUrl, userId) {
   const { parsed, videos, source, warnings } = await fetchSourceVideos(sourceUrl);
   const db = loadDb();
-  const result = addImportedVideos(db, parsed.canonical, parsed.type, videos);
+  const result = addImportedVideos(db, parsed.canonical, parsed.type, videos, { userId });
   saveDb(db);
   return { ...result, source: source || 'youtube-api', warnings: warnings || [], canonicalUrl: parsed.canonical };
 }
@@ -1134,8 +1135,9 @@ async function importUploadedVideo(req) {
     status: 'imported'
   }, { source: 'upload' }).video;
   const db = loadDb();
+  const uploaderUser = currentUser(req, db);
   const cleanup = cleanupOldSourcesForNewUpload(db);
-  const result = addImportedVideos(db, 'upload', 'upload', [video]);
+  const result = addImportedVideos(db, 'upload', 'upload', [video], { userId: uploaderUser?.id });
   saveDb(db);
   return { ...result, source: 'upload', warnings: [], canonicalUrl: 'upload', cleanup };
 }
@@ -2979,12 +2981,17 @@ async function handleApi(req, res, pathname) {
   try {
     if (pathname === '/api/session') {
       const db = loadDb();
-      const user = requireUser(req, db);
+      const user = currentUser(req, db); // intentionally not requireUser — returns null instead of throwing
       if (!user) return json(res, 200, { user: null });
       const { subscription, plan } = subscriptionFor(db, user.id);
-      const ytdlpCommand = await workingYtDlpCommand();
-      const ytdlpStatus = ytdlpCommand ? await commandVersion(ytdlpCommand) : { ok: false, version: '', error: `Tried: ${ytdlpCandidates().join(', ')}` };
-      const ffmpegStatus = await commandVersion(FFMPEG);
+      // Cache tool checks for the lifetime of this process (spawning subprocesses on every refresh is expensive)
+      if (!_toolsCache) {
+        const ytdlpCommand = await workingYtDlpCommand();
+        const ytdlpStatus = ytdlpCommand ? await commandVersion(ytdlpCommand) : { ok: false, version: '', error: `Tried: ${ytdlpCandidates().join(', ')}` };
+        const ffmpegStatus = await commandVersion(FFMPEG);
+        _toolsCache = { ytdlpCommand, ytdlpStatus, ffmpegStatus };
+      }
+      const { ytdlpCommand, ytdlpStatus, ffmpegStatus } = _toolsCache;
       const tools = {
         ytDlp: ytdlpStatus.ok,
         ytDlpVersion: ytdlpStatus.version,
@@ -3134,7 +3141,9 @@ async function handleApi(req, res, pathname) {
     }
     if (pathname === '/api/import' && req.method === 'POST') {
       const body = await readJson(req);
-      return json(res, 200, await importSource(body.sourceUrl || ''));
+      const db = loadDb();
+      const user = requireUser(req, db);
+      return json(res, 200, await importSource(body.sourceUrl || '', user.id));
     }
     if (pathname === '/api/upload' && req.method === 'POST') {
       return json(res, 200, await importUploadedVideo(req));

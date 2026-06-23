@@ -205,18 +205,16 @@ function setView(id) {
 
 /* ── Data loading ─────────────────────────────────────────────────── */
 async function loadAll() {
-  try {
-    const [lib, sess] = await Promise.all([
-      api('/api/library'),
-      api('/api/session')
-    ]);
-    state.library = lib;
-    state.session = sess;
-    // also refresh generations in background
-    api('/api/ai/generations').then(r => { state.generations = r.generations || []; }).catch(() => {});
-  } catch (e) {
-    console.warn('loadAll error', e.message);
-  }
+  // Load session and library in parallel; failures are isolated so one can't kill the other
+  const [sessResult, libResult] = await Promise.allSettled([
+    api('/api/session'),
+    api('/api/library'),
+  ]);
+  if (sessResult.status === 'fulfilled') state.session = sessResult.value;
+  else console.warn('Session load failed:', sessResult.reason?.message);
+  if (libResult.status === 'fulfilled') state.library = libResult.value;
+  else console.warn('Library load failed:', libResult.reason?.message);
+  api('/api/ai/generations').then(r => { state.generations = r.generations || []; }).catch(() => {});
 }
 
 /* ── Home ─────────────────────────────────────────────────────────── */
@@ -2004,18 +2002,26 @@ async function boot() {
     $('#appShell').classList.add('hidden');
     return;
   }
+  await loadAll();
+  const user = state.session?.user;
+  if (!user) {
+    // Only clear localStorage if the server explicitly returned {user: null} (invalid/expired userId)
+    // If state.session is still null it means the request failed (network/server error) — don't log out
+    if (state.session !== null) {
+      localStorage.removeItem('clipforge:userId');
+    }
+    $('#authShell').classList.remove('hidden');
+    $('#appShell').classList.add('hidden');
+    return;
+  }
   try {
-    await loadAll();
-    if (!state.session?.user) throw new Error('Session expired.');
     $('#authShell').classList.add('hidden');
     $('#appShell').classList.remove('hidden');
     renderNav();
     setView('home');
     scheduleRefresh();
-  } catch {
-    localStorage.removeItem('clipforge:userId');
-    $('#authShell').classList.remove('hidden');
-    $('#appShell').classList.add('hidden');
+  } catch(e) {
+    console.error('Boot render error:', e);
   }
 }
 
