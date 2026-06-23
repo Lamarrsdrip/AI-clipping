@@ -262,13 +262,30 @@ function renderHome() {
             </div>`).join('')}
         </div>
       ` : `
-        ${/* ── Stats row ── */`
         <div class="stats-row">
-          <div class="stat-card"><div class="stat-num">${doneClips.length}</div><div class="stat-label">Clips ready</div></div>
-          <div class="stat-card"><div class="stat-num">${videos.length}</div><div class="stat-label">Videos</div></div>
-          <div class="stat-card"><div class="stat-num">${doneClips.length?Math.round(doneClips.reduce((s,c)=>s+(c.score||0),0)/doneClips.length):'—'}</div><div class="stat-label">Avg score</div></div>
-          <div class="stat-card"><div class="stat-num">${user.credits??0}</div><div class="stat-label">Credits</div></div>
-        </div>`}
+          <div class="stat-card" style="cursor:pointer" data-view="clips">
+            <div class="stat-num">${doneClips.length}</div>
+            <div class="stat-label">Clips ready</div>
+          </div>
+          <div class="stat-card" style="cursor:pointer" data-view="create">
+            <div class="stat-num">${videos.length}</div>
+            <div class="stat-label">Videos</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-num">${doneClips.length ? Math.round(doneClips.reduce((s,c)=>s+(c.score||0),0)/doneClips.length) : '—'}</div>
+            <div class="stat-label">Avg score</div>
+          </div>
+          <div class="stat-card" style="cursor:pointer" data-view="billing">
+            <div class="stat-num">${(user.credits??0) >= 9999 ? '∞' : (user.credits??0)}</div>
+            <div class="stat-label">Credits left</div>
+          </div>
+        </div>
+
+        ${(user.credits ?? 0) < 10 && (user.credits ?? 0) >= 0 ? `
+          <div class="alert-banner" style="background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.25)">
+            <span>⚠ Low credits — ${user.credits??0} remaining</span>
+            <button class="ghost" data-view="billing">Get more →</button>
+          </div>` : ''}
 
         ${failedJobs.length ? `
           <div class="alert-banner">
@@ -278,20 +295,30 @@ function renderHome() {
 
         <div class="home-actions">
           <button class="primary-action" data-view="create">
-            <span class="pa-icon">✦</span>
-            <div><b>New project</b><small>Upload or import a video</small></div>
+            <div class="pa-icon">✦</div>
+            <div><b>New project</b><small>Upload or import a video to start clipping</small></div>
+          </button>
+          <button class="primary-action" data-view="faceless">
+            <div class="pa-icon">◈</div>
+            <div><b>Faceless content</b><small>AI scripts for faceless video creation</small></div>
           </button>
           <button class="primary-action" data-view="clips">
-            <span class="pa-icon">▶</span>
-            <div><b>View clips</b><small>${doneClips.length} clip${doneClips.length!==1?'s':''} ready</small></div>
+            <div class="pa-icon">▶</div>
+            <div><b>My clips</b><small>${doneClips.length} clip${doneClips.length!==1?'s':''} ready to download</small></div>
+          </button>
+          <button class="primary-action" data-view="billing">
+            <div class="pa-icon">◇</div>
+            <div><b>Credits & billing</b><small>${(user.credits??0) >= 9999 ? 'Unlimited' : (user.credits??0)+' credits remaining'}</small></div>
           </button>
         </div>
 
-        <div class="panel-head" style="margin:24px 0 12px">
-          <h2>Recent clips</h2>
-          <button class="ghost" data-view="clips">View all</button>
-        </div>
-        <div class="card-grid">${doneClips.slice(0,4).map(clipCard).join('')}</div>
+        ${doneClips.length ? `
+          <div class="panel-head" style="margin:28px 0 12px">
+            <h2>Recent clips</h2>
+            <button class="ghost" data-view="clips">View all →</button>
+          </div>
+          <div class="card-grid">${doneClips.slice(0,4).map(clipCard).join('')}</div>
+        ` : ''}
       `}
     </div>`;
 }
@@ -1481,34 +1508,152 @@ function renderScheduler() {
 
 /* ── Billing ─────────────────────────────────────────────────────── */
 function renderBilling() {
-  const user=state.session?.user||{};
-  const plans=state.library.billingPlans||[];
-  const txns=(state.library.creditTransactions||[]).filter(t=>t.userId===user.id).slice(0,10);
+  const user = state.session?.user || {};
+  const plans = state.library.billingPlans || [];
+  const allTxns = state.library.creditTransactions || [];
+  const txns = allTxns.filter(t => t.userId === user.id).slice(0, 12);
+  const credits = user.credits ?? 0;
+  const userPlanId = (user.plan || 'free').toLowerCase();
+  const currentPlan = plans.find(p => p.id === userPlanId) || plans[0] || {};
+  const creditsIncluded = currentPlan.creditsIncluded || 100;
+  const creditsUsed = Math.max(0, creditsIncluded - credits);
+  const usePct = Math.min(100, Math.round((creditsUsed / creditsIncluded) * 100));
+  const barClass = usePct >= 90 ? 'danger' : usePct >= 70 ? 'warn' : '';
+
+  function planCta(p) {
+    const isCurrent = p.id === userPlanId;
+    const isUpgrade = plans.indexOf(p) > plans.indexOf(currentPlan);
+    if (isCurrent) return `<button class="plan-cta current-cta" disabled>Current plan</button>`;
+    if (isUpgrade) return `<button class="plan-cta upgrade-cta" data-upgrade="${esc(p.id)}">Upgrade →</button>`;
+    return `<button class="plan-cta downgrade-cta ghost" data-upgrade="${esc(p.id)}">Switch</button>`;
+  }
+
   $('#billing').innerHTML = `
     <div class="billing-wrap">
-      <div class="credit-hero">
-        <div class="big-score">${user.credits??0}<small>credits</small></div>
-        <p class="muted">Credits are used for AI processing. Clip generation costs 5 credits.</p>
+
+      <!-- Current plan card -->
+      <div class="plan-current-card">
+        <div class="plan-current-left">
+          <div class="plan-current-badge">
+            <span class="plan-current-badge-dot"></span>
+            Active plan
+          </div>
+          <div class="plan-current-name">${esc(currentPlan.name||'Free')}</div>
+          <div class="plan-current-desc">
+            ${currentPlan.monthlyPrice ? `$${currentPlan.monthlyPrice}/month · ` : 'Free · '}
+            ${creditsIncluded >= 99999 ? 'Unlimited credits' : `${creditsIncluded.toLocaleString()} credits / month`}
+          </div>
+          <div class="usage-bar-wrap">
+            <div class="usage-bar-row">
+              <span>${credits.toLocaleString()} credits remaining</span>
+              <span>${creditsIncluded >= 99999 ? '∞' : `${creditsUsed} used`}</span>
+            </div>
+            <div class="usage-bar">
+              <div class="usage-bar-fill ${barClass}" style="width:${creditsIncluded >= 99999 ? 5 : usePct}%"></div>
+            </div>
+          </div>
+        </div>
+        <div class="plan-credit-col">
+          <div class="plan-credit-num">${credits >= 99999 ? '∞' : credits.toLocaleString()}</div>
+          <div class="plan-credit-label">Credits left</div>
+        </div>
+      </div>
+
+      <!-- Credit cost reference -->
+      <div class="billing-info-row">
+        <div class="billing-info-card">
+          <h4>Credit costs</h4>
+          <p style="margin-top:8px;line-height:2">
+            Clip generation — <b>5 credits</b><br>
+            AI transcript analysis — <b>2 credits</b><br>
+            Faceless script generation — <b>3 credits</b><br>
+            Thumbnail AI generation — <b>2 credits</b>
+          </p>
+        </div>
+        <div class="billing-info-card">
+          <h4>Your limits</h4>
+          <p style="margin-top:8px;line-height:2">
+            Max video length — <b>${currentPlan.maxVideoLength >= 999 ? 'Unlimited' : (currentPlan.maxVideoLength||15) + ' min'}</b><br>
+            Clips per video — <b>${currentPlan.maxClipsPerVideo >= 999 ? 'Unlimited' : (currentPlan.maxClipsPerVideo||3)}</b><br>
+            Scheduling — <b>${currentPlan.autoPostAllowed ? 'Included' : 'Not available'}</b><br>
+            API access — <b>${(currentPlan.id === 'studio') ? 'Included' : 'Not available'}</b>
+          </p>
+        </div>
+      </div>
+
+      <!-- Plans comparison -->
+      <div class="billing-section-head">
+        <h2>Plans</h2>
+        <small class="muted">Upgrade or switch at any time</small>
       </div>
       <div class="plans-grid">
-        ${plans.map(p=>`<div class="plan-card">
-          <h3>${esc(p.name)}</h3>
-          <div class="plan-price">$${p.monthlyPrice}<small>/mo</small></div>
-          <ul>${(p.features||[`${p.creditsIncluded} credits/month`,`Up to ${p.maxVideoLength}min videos`,`${p.maxClipsPerVideo} clips per video`]).map(f=>`<li>${esc(f)}</li>`).join('')}</ul>
-          <button class="ghost">Choose plan</button>
-        </div>`).join('')}
+        ${plans.map(p => {
+          const isCurrent = p.id === userPlanId;
+          const feats = p.features || [
+            `${p.creditsIncluded >= 99999 ? 'Unlimited' : p.creditsIncluded.toLocaleString()} credits/month`,
+            `${p.maxVideoLength >= 999 ? 'Unlimited' : p.maxVideoLength+'min'} max video`,
+            `${p.maxClipsPerVideo >= 999 ? 'Unlimited' : p.maxClipsPerVideo} clips/video`,
+          ];
+          return `<div class="plan-card ${p.popular ? 'popular' : ''} ${isCurrent ? 'current-plan' : ''}">
+            ${p.popular ? '<span class="plan-popular-badge">Most popular</span>' : ''}
+            ${isCurrent ? '<span class="plan-current-label">✓ Active</span>' : ''}
+            <h3>${esc(p.name)}</h3>
+            <div class="plan-price">
+              ${p.monthlyPrice ? `$${p.monthlyPrice}` : 'Free'}
+              ${p.monthlyPrice ? '<small>/mo</small>' : ''}
+            </div>
+            <div class="plan-credits-tag">
+              ${p.creditsIncluded >= 99999 ? '∞ Unlimited credits' : p.creditsIncluded.toLocaleString() + ' credits / mo'}
+            </div>
+            <ul>${feats.map(f => `<li>${esc(f)}</li>`).join('')}</ul>
+            ${planCta(p)}
+          </div>`;
+        }).join('')}
       </div>
-      ${txns.length?`
-        <h3 style="margin:24px 0 12px">Transaction history</h3>
-        <div class="txn-list">
-          ${txns.map(t=>`<div class="txn-row">
-            <span>${esc(t.reason||'Credit')}</span>
-            <span class="${t.amount>0?'credit-pos':'credit-neg'}">${t.amount>0?'+':''}${t.amount}</span>
-            <small class="muted">${when(t.createdAt)}</small>
-          </div>`).join('')}
-        </div>
-      `:''}
+
+      <!-- Transaction history -->
+      <div class="billing-section-head" style="margin-top:4px">
+        <h2>Credit history</h2>
+      </div>
+      <div class="txn-panel">
+        ${txns.length ? `
+          <div class="txn-list">
+            ${txns.map(t => {
+              const isIn = t.amount > 0;
+              return `<div class="txn-row">
+                <div class="txn-icon ${isIn ? 'credit-in' : 'credit-out'}">${isIn ? '＋' : '−'}</div>
+                <div class="txn-info">
+                  <b>${esc(t.reason || (isIn ? 'Credits added' : 'Credits used'))}</b>
+                  <small>${when(t.createdAt)}</small>
+                </div>
+                <div class="txn-amount ${isIn ? 'credit-pos' : 'credit-neg'}">
+                  ${isIn ? '+' : ''}${t.amount}
+                </div>
+              </div>`;
+            }).join('')}
+          </div>
+        ` : '<div class="txn-empty">No credit transactions yet. Generate your first clip to see usage here.</div>'}
+      </div>
+
     </div>`;
+
+  /* upgrade button handler */
+  $('#billing').querySelectorAll('[data-upgrade]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const planId = btn.dataset.upgrade;
+      const plan = plans.find(p => p.id === planId);
+      if (!plan) return;
+      if (plan.monthlyPrice > 0) {
+        alert(`To upgrade to ${plan.name} ($${plan.monthlyPrice}/mo), connect your payment method.\n\nStripe billing coming soon — contact support to upgrade manually.`);
+        return;
+      }
+      try {
+        btn.disabled = true; btn.textContent = 'Switching…';
+        await api('/api/billing/switch', { method: 'POST', body: JSON.stringify({ planId }) });
+        await loadAll(); renderBilling();
+      } catch(e2) { alert(e2.message); btn.disabled = false; }
+    });
+  });
 }
 
 /* ── Settings ─────────────────────────────────────────────────────── */

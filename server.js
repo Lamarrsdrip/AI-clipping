@@ -33,7 +33,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const STORAGE_DIR = path.join(__dirname, 'storage');
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
-const CREDITS_ENABLED = process.env.CREDITS_ENABLED === 'true';
+const CREDITS_ENABLED = process.env.CREDITS_ENABLED !== 'false';
 const CLIP_JOB_CREDIT_COST = Number(process.env.CLIP_JOB_CREDIT_COST || 5);
 const MIN_CLIP_SOURCE_SECONDS = Number(process.env.MIN_CLIP_SOURCE_SECONDS || 15);
 const IMPORT_RATE_LIMIT_MS = Number(process.env.IMPORT_RATE_LIMIT_MS || 8000);
@@ -2193,19 +2193,22 @@ async function processVideo(payload) {
     throw new Error('Fair-use/remix mode requires a commentary, reaction, education, or transformation note.');
   }
   const db = loadDb();
-  const user = db.users[0];
   const video = db.videos.find(item => item.id === videoId);
   if (!video) throw new Error('Video not found.');
   const existingJob = db.jobs.find(item => item.videoId === videoId && ['queued', 'running'].includes(item.status) && item.id !== payload.jobId);
   if (existingJob) return { jobId: existingJob.id, duplicate: true };
-  if (CREDITS_ENABLED && user.credits < CLIP_JOB_CREDIT_COST) throw new Error(`Not enough credits. Each video job uses ${CLIP_JOB_CREDIT_COST} credits.`);
+  const jobOwner = db.users.find(u => u.id === (video.userId || video.createdBy)) || db.users.find(u => u.role === 'admin');
+  if (!jobOwner) throw new Error('Video owner not found.');
+  if (CREDITS_ENABLED && jobOwner.role !== 'admin' && jobOwner.credits < CLIP_JOB_CREDIT_COST) {
+    throw new Error(`Not enough credits. Clip generation costs ${CLIP_JOB_CREDIT_COST} credits. Go to Credits & Billing to get more.`);
+  }
   video.rightsConfirmed = true;
   video.fairUseMode = Boolean(fairUseMode);
   video.transformationNote = transformationNote || '';
   video.status = 'queued';
-  if (CREDITS_ENABLED) {
-    user.credits -= CLIP_JOB_CREDIT_COST;
-    db.creditTransactions.unshift({ id: randomUUID(), userId: user.id, amount: -CLIP_JOB_CREDIT_COST, reason: `Clip job for ${video.title}`, createdAt: new Date().toISOString() });
+  if (CREDITS_ENABLED && jobOwner.role !== 'admin') {
+    jobOwner.credits -= CLIP_JOB_CREDIT_COST;
+    db.creditTransactions.unshift({ id: randomUUID(), userId: jobOwner.id, amount: -CLIP_JOB_CREDIT_COST, reason: `Clip job — ${video.title || 'video'}`, createdAt: new Date().toISOString() });
   }
   let job = payload.jobId ? db.jobs.find(item => item.id === payload.jobId) : null;
   if (!job) {
@@ -2315,8 +2318,10 @@ function mimeFor(file) {
 }
 
 function currentUser(req, db) {
-  const userId = req.headers['x-user-id'] || new URL(req.url, `http://${req.headers.host}`).searchParams.get('userId');
-  return db.users.find(user => user.id === userId) || db.users[0];
+  const userId = (req.headers['x-user-id'] || '').trim() ||
+    new URL(req.url, `http://${req.headers.host}`).searchParams.get('userId') || '';
+  if (!userId) return null;
+  return db.users.find(user => user.id === userId) || null;
 }
 
 function publicUser(user) {
@@ -2974,7 +2979,8 @@ async function handleApi(req, res, pathname) {
   try {
     if (pathname === '/api/session') {
       const db = loadDb();
-      const user = currentUser(req, db);
+      const user = requireUser(req, db);
+      if (!user) return json(res, 200, { user: null });
       const { subscription, plan } = subscriptionFor(db, user.id);
       const ytdlpCommand = await workingYtDlpCommand();
       const ytdlpStatus = ytdlpCommand ? await commandVersion(ytdlpCommand) : { ok: false, version: '', error: `Tried: ${ytdlpCandidates().join(', ')}` };
@@ -3100,7 +3106,7 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/billing/transfer' && req.method === 'POST') {
       const body = await readJson(req);
       const db = loadDb();
-      const user = currentUser(req, db);
+      const user = requireUser(req, db);
       const credits = Number(body.credits || 0);
       const amount = Number(body.amount || 0);
       const depositorName = String(body.depositorName || '').trim();
@@ -3220,8 +3226,8 @@ async function handleApi(req, res, pathname) {
         scheduledPosts: myScheduledPosts,
         transcriptions: myTranscriptions,
         studioGenerations: myStudioGenerations,
-        // Strip other users' data from sensitive collections
-        users: [db.users.find(u => u.id === user.id)].filter(Boolean),
+        // Admins see all users; regular users only see themselves
+        users: isAdmin ? db.users.map(publicUser) : [publicUser(db.users.find(u => u.id === user.id))].filter(Boolean),
         subscriptions: isAdmin ? db.subscriptions : db.subscriptions.filter(s => s.userId === user.id),
         creditTransactions: isAdmin ? db.creditTransactions : db.creditTransactions.filter(t => t.userId === user.id),
         paymentRequests: isAdmin ? db.paymentRequests : db.paymentRequests.filter(p => p.userId === user.id),
@@ -3283,6 +3289,17 @@ async function handleApi(req, res, pathname) {
       const body = await readJson(req);
       if (!body.topic) throw new Error('Topic is required.');
       const db = loadDb();
+      const user = requireUser(req, db);
+      const FACELESS_COST = 3;
+      if (CREDITS_ENABLED && user.role !== 'admin' && user.credits < FACELESS_COST) {
+        throw new Error(`Not enough credits. Faceless script generation costs ${FACELESS_COST} credits.`);
+      }
+      if (CREDITS_ENABLED && user.role !== 'admin') {
+        const userIdx = db.users.findIndex(u => u.id === user.id);
+        db.users[userIdx].credits -= FACELESS_COST;
+        db.creditTransactions.unshift({ id: randomUUID(), userId: user.id, amount: -FACELESS_COST, reason: `Faceless script — ${body.topic}`, createdAt: new Date().toISOString() });
+        saveDb(db);
+      }
       const result = await generateFacelessScript(db, String(body.topic), {
         style:           String(body.style || 'documentary'),
         targetSeconds:   Number(body.duration || 45),
@@ -3296,7 +3313,7 @@ async function handleApi(req, res, pathname) {
       });
       if (result.ok) {
         if (!Array.isArray(db.studioGenerations)) db.studioGenerations = [];
-        db.studioGenerations.unshift({ id: randomUUID(), type: 'faceless_script', topic: body.topic, style: body.style, result, createdAt: new Date().toISOString() });
+        db.studioGenerations.unshift({ id: randomUUID(), userId: user.id, type: 'faceless_script', topic: body.topic, style: body.style, result, createdAt: new Date().toISOString() });
         db.studioGenerations = db.studioGenerations.slice(0, 50);
         saveDb(db);
       }
@@ -3305,7 +3322,7 @@ async function handleApi(req, res, pathname) {
     // ── AI Media Generation (Higgsfield / Muapi) ─────────────────────
     if (pathname === '/api/ai/models') {
       const db = loadDb();
-      currentUser(req, db);
+      requireUser(req, db);
       const ready = aiMediaReady(db);
       const models = Object.entries(AI_MEDIA_MODELS).map(([id, m]) => ({ id, label: m.label, category: m.category, provider: m.provider, seconds: m.seconds }));
       return json(res, 200, { models, ready });
@@ -3313,7 +3330,7 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/ai/generate' && req.method === 'POST') {
       const body = await readJson(req);
       const db = loadDb();
-      const user = currentUser(req, db);
+      const user = requireUser(req, db);
       if (!body.model || !body.prompt) throw new Error('model and prompt are required');
       if (!AI_MEDIA_MODELS[body.model]) throw new Error(`Unknown model: ${body.model}`);
       const generation = {
@@ -3345,14 +3362,14 @@ async function handleApi(req, res, pathname) {
     }
     if (pathname === '/api/ai/generations') {
       const db = loadDb();
-      const user = currentUser(req, db);
+      const user = requireUser(req, db);
       const gens = (db.studioGenerations || []).filter(g => g.userId === user.id);
       return json(res, 200, { generations: gens });
     }
     if (pathname.startsWith('/api/ai/generation/') && req.method === 'DELETE') {
       const genId = pathname.split('/').pop();
       const db = loadDb();
-      const user = currentUser(req, db);
+      const user = requireUser(req, db);
       const gen = (db.studioGenerations || []).find(g => g.id === genId && g.userId === user.id);
       if (gen?.outputPath) {
         const fp = path.join(STORAGE_DIR, gen.outputPath.replace('/media/', ''));
@@ -3390,7 +3407,7 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/onboarding' && req.method === 'POST') {
       const body = await readJson(req);
       const db = loadDb();
-      const user = currentUser(req, db);
+      const user = requireUser(req, db);
       user.onboardingComplete = Boolean(body.complete);
       user.defaults = {
         captionStyle: body.captionStyle || user.defaults?.captionStyle || 'Bold captions',
@@ -3403,7 +3420,7 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/profile' && req.method === 'PATCH') {
       const body = await readJson(req);
       const db = loadDb();
-      const user = currentUser(req, db);
+      const user = requireUser(req, db);
       user.name = body.name || user.name;
       user.defaults = {
         ...user.defaults,
@@ -3420,7 +3437,7 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/billing/checkout' && req.method === 'POST') {
       const body = await readJson(req);
       const db = loadDb();
-      const user = currentUser(req, db);
+      const user = requireUser(req, db);
       const plan = db.billingPlans.find(item => item.id === body.planId);
       if (!plan) throw new Error('Plan not found.');
       if (!settingReady(db, 'STRIPE_SECRET_KEY')) {
@@ -3431,7 +3448,7 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/credits/purchase' && req.method === 'POST') {
       const body = await readJson(req);
       const db = loadDb();
-      const user = currentUser(req, db);
+      const user = requireUser(req, db);
       const amount = Number(body.amount || 0);
       if (![40, 120, 300].includes(amount)) throw new Error('Choose a valid credit pack.');
       if (!settingReady(db, 'STRIPE_SECRET_KEY')) throw new Error('Stripe checkout is not configured yet.');
@@ -3439,6 +3456,21 @@ async function handleApi(req, res, pathname) {
       db.creditTransactions.unshift({ id: randomUUID(), userId: user.id, amount, reason: 'Credit purchase placeholder', createdAt: new Date().toISOString() });
       saveDb(db);
       return json(res, 200, { credits: user.credits });
+    }
+    if (pathname === '/api/billing/switch' && req.method === 'POST') {
+      const body = await readJson(req);
+      const db = loadDb();
+      const user = requireUser(req, db);
+      const plan = db.billingPlans.find(p => p.id === body.planId);
+      if (!plan) throw new Error('Plan not found.');
+      if (plan.monthlyPrice > 0) throw new Error('Paid plan upgrades require Stripe checkout.');
+      const idx = db.users.findIndex(u => u.id === user.id);
+      if (idx !== -1) {
+        db.users[idx].plan = plan.id;
+        db.users[idx].credits = Math.max(db.users[idx].credits || 0, plan.creditsIncluded);
+      }
+      saveDb(db);
+      return json(res, 200, { plan: plan.id, credits: db.users[idx]?.credits });
     }
     if (pathname === '/api/process' && req.method === 'POST') {
       const body = await readJson(req);
@@ -3570,7 +3602,7 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/social-account' && req.method === 'POST') {
       const body = await readJson(req);
       const db = loadDb();
-      const user = currentUser(req, db);
+      const user = requireUser(req, db);
       const platform = String(body.platform || '').trim();
       const handle = String(body.handle || '').trim();
       if (!PLATFORMS.includes(platform)) throw new Error('Choose a supported platform.');
