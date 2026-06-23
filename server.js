@@ -1708,7 +1708,7 @@ async function faceTrackAvailable() {
   if (_faceTrackAvailable !== null) return _faceTrackAvailable;
   try {
     const { stdout } = await new Promise((resolve, reject) => {
-      const p = spawn('python3', ['-c', 'import mediapipe,cv2; print("ok")'], { stdio:['pipe','pipe','pipe'] });
+      const p = spawn('python3', ['-c', 'import cv2; print("ok")'], { stdio:['pipe','pipe','pipe'] });
       let out='', err='';
       p.stdout.on('data', d => out += d);
       p.stderr.on('data', d => err += d);

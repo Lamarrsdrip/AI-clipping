@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
 Face tracking script for ClipForge AI rendering pipeline.
-Usage: python3 face_track.py <video_path> <start_sec> <end_sec> <sample_fps>
-Output: JSON with face positions per sampled frame
+Uses OpenCV Haar cascade (included with OpenCV) for face detection.
+Falls back to DNN-based detection if model files are available.
+
+Usage: python3 face_track.py <video_path> <start_sec> <end_sec> [sample_fps]
+Output: JSON with speaker side and aggregate face position
 """
 import sys
 import json
+import os
 
 def main():
     if len(sys.argv) < 4:
@@ -15,97 +19,117 @@ def main():
     video_path = sys.argv[1]
     start      = float(sys.argv[2])
     end        = float(sys.argv[3])
-    sample_fps = float(sys.argv[4]) if len(sys.argv) > 4 else 2.0
+    sample_fps = float(sys.argv[4]) if len(sys.argv) > 4 else 3.0
 
     try:
         import cv2
-        has_cv2 = True
     except ImportError:
-        has_cv2 = False
-
-    try:
-        import mediapipe as mp
-        has_mp = True
-    except ImportError:
-        has_mp = False
-
-    if not has_cv2 or not has_mp:
-        print(json.dumps({"error": "mediapipe or opencv not available", "speakerSide": "center", "faces": []}))
+        print(json.dumps({"error": "opencv not available", "speakerSide": "center"}))
         sys.exit(0)
 
-    mp_face = mp.solutions.face_detection
-    frames  = []
+    # Use built-in Haar cascade (ships with every OpenCV install)
+    cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml'
+    if not os.path.exists(cascade_path):
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+
+    if not os.path.exists(cascade_path):
+        print(json.dumps({"error": "No cascade file found", "speakerSide": "center"}))
+        sys.exit(0)
+
+    face_cascade = cv2.CascadeClassifier(cascade_path)
 
     cap = cv2.VideoCapture(video_path)
-    src_fps   = cap.get(cv2.CAP_PROP_FPS) or 30
+    if not cap.isOpened():
+        print(json.dumps({"error": f"Cannot open: {video_path}", "speakerSide": "center"}))
+        sys.exit(0)
+
+    src_fps    = cap.get(cv2.CAP_PROP_FPS) or 30
     src_width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    interval  = max(1, int(src_fps / sample_fps))
+    interval   = max(1, int(src_fps / sample_fps))
 
     cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
 
-    with mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.5) as detector:
-        while True:
-            pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-            if pos_ms / 1000 > end + 0.1:
+    all_cx = []
+    all_cy = []
+    frames_sampled = 0
+    MAX_FRAMES = 20  # cap to keep it fast
+
+    while frames_sampled < MAX_FRAMES:
+        pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+        if pos_ms / 1000 > end + 0.1:
+            break
+
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frames_sampled += 1
+
+        # Downscale for speed
+        small = cv2.resize(frame, (640, int(640 * src_height / src_width)))
+        gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        gray  = cv2.equalizeHist(gray)
+
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.15,
+            minNeighbors=4,
+            minSize=(30, 30),
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
+
+        if len(faces) > 0:
+            for (x, y, w, h) in faces:
+                # Convert back to original frame coordinates (relative 0..1)
+                scale_x = src_width / 640
+                scale_y = src_height / (640 * src_height / src_width)
+                cx = ((x + w / 2) * scale_x) / src_width
+                cy = ((y + h / 2) * scale_y) / src_height
+                # Only count high-confidence large faces (filter noise)
+                if w * scale_x > src_width * 0.05:
+                    all_cx.append(cx)
+                    all_cy.append(cy)
+
+        # Skip frames
+        for _ in range(interval - 1):
+            ret2, _ = cap.read()
+            if not ret2:
                 break
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            current_sec = pos_ms / 1000
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = detector.process(rgb)
-
-            face_data = []
-            if result.detections:
-                for det in result.detections:
-                    bb = det.location_data.relative_bounding_box
-                    cx = (bb.xmin + bb.width / 2)   # 0..1
-                    cy = (bb.ymin + bb.height / 2)   # 0..1
-                    face_data.append({
-                        "cx": round(cx, 3),
-                        "cy": round(cy, 3),
-                        "w":  round(bb.width, 3),
-                        "h":  round(bb.height, 3),
-                        "score": round(det.score[0] if det.score else 0, 3)
-                    })
-
-            frames.append({
-                "t": round(current_sec - start, 3),
-                "faces": face_data
-            })
-
-            # Skip to next sample frame
-            for _ in range(interval - 1):
-                cap.read()
 
     cap.release()
 
-    # Compute aggregate speaker side from face center-x positions
-    all_cx = [f["cx"] for fr in frames for f in fr["faces"]]
-    if all_cx:
-        mean_cx = sum(all_cx) / len(all_cx)
-        if mean_cx < 0.38:
-            speaker_side = "left"
-        elif mean_cx > 0.62:
-            speaker_side = "right"
-        else:
-            speaker_side = "center"
+    if not all_cx:
+        print(json.dumps({
+            "speakerSide": "center",
+            "meanFaceX": 0.5,
+            "meanFaceY": 0.4,
+            "srcWidth": src_width,
+            "srcHeight": src_height,
+            "totalFaceDetections": 0,
+            "framesSampled": frames_sampled
+        }))
+        return
+
+    mean_cx = sum(all_cx) / len(all_cx)
+    mean_cy = sum(all_cy) / len(all_cy)
+
+    # Classify speaker side
+    if mean_cx < 0.38:
+        speaker_side = "left"
+    elif mean_cx > 0.62:
+        speaker_side = "right"
     else:
         speaker_side = "center"
 
-    # Compute dominant face zone (for crop offset)
-    dominant_y = sum(f["cy"] for fr in frames for f in fr["faces"]) / max(1, len(all_cx))
-
     print(json.dumps({
         "speakerSide": speaker_side,
-        "meanFaceX": round(sum(all_cx) / max(1, len(all_cx)), 3) if all_cx else 0.5,
-        "meanFaceY": round(dominant_y, 3),
+        "meanFaceX": round(mean_cx, 3),
+        "meanFaceY": round(mean_cy, 3),
         "srcWidth": src_width,
         "srcHeight": src_height,
         "totalFaceDetections": len(all_cx),
-        "frames": frames[:5]  # send first 5 frames for debugging
+        "framesSampled": frames_sampled
     }))
 
 if __name__ == "__main__":
