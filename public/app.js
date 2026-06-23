@@ -199,7 +199,7 @@ function setView(id) {
   if (id === 'transcript') renderTranscript();
   if (id === 'billing')    renderBilling();
   if (id === 'settings')   renderSettings();
-  if (id === 'admin')      renderAdmin();
+  if (id === 'admin')      { if (state.session?.user?.role === 'admin') renderAdmin(); else setView('home'); }
   if (id === 'scheduler')  renderScheduler();
 }
 
@@ -827,9 +827,11 @@ function renderStudioPanel(features, videos) {
            ${state.studioTab==='translation'?`<p class="muted">Caption translation is available when generating clips. Select target language in settings.</p>`:''}
          </div>`
       : `<div class="setup-required">
-           <h3>Setup required</h3>
-           <p>Configure <code>${f.setupKey||'API key'}</code> in Admin → API Configuration to enable this feature.</p>
-           <button data-view-jump="admin">Go to Admin →</button>
+           <h3>${f.label||'Feature unavailable'}</h3>
+           <p>This feature requires additional setup.</p>
+           ${state.session?.user?.role==='admin'
+             ? `<button data-view-jump="admin">Configure in Admin →</button>`
+             : `<small class="muted">Contact your administrator to enable this feature.</small>`}
          </div>`}
   </div>`;
 }
@@ -1121,7 +1123,7 @@ function renderFaceless() {
 }
 
 function renderFacelessOutput(res) {
-  if (!res.ok) return `<div class="fl-error"><div class="fl-err-icon">⚠</div><p>${esc(res.error || 'Generation failed. Check your API key in Admin settings.')}</p><button data-view="admin" class="ghost" style="margin-top:12px">Open Admin settings</button></div>`;
+  if (!res.ok) return `<div class="fl-error"><div class="fl-err-icon">⚠</div><p>${esc(res.error || 'Generation failed. The AI service may not be configured yet.')}</p><small style="color:var(--muted)">If this persists, contact support.</small></div>`;
 
   const copyBtn = (text, label='Copy') =>
     `<button class="fl-copy-btn ghost" data-copy="${encodeURIComponent(text||'')}">${label}</button>`;
@@ -1337,7 +1339,14 @@ function renderBrollPanel(f, transcriptions, videos) {
 }
 
 function setupRequired(f) {
-  return `<div class="setup-required"><h3>Setup required</h3><p>Configure <code>${f.setupKey||'API key'}</code> in Admin → API Configuration.</p><button data-view-jump="admin">Go to Admin →</button></div>`;
+  const isAdmin = state.session?.user?.role === 'admin';
+  return `<div class="setup-required">
+    <h3>${f.label || 'Feature not available'}</h3>
+    <p>This feature requires additional configuration.</p>
+    ${isAdmin
+      ? `<button data-view-jump="admin">Configure in Admin →</button>`
+      : `<small class="muted">Please contact your account administrator to enable this feature.</small>`}
+  </div>`;
 }
 
 async function runFaceless(e) {
@@ -1545,6 +1554,7 @@ function renderSettings() {
 
 /* ── Admin ─────────────────────────────────────────────────────────── */
 function renderAdmin() {
+  if (state.session?.user?.role !== 'admin') { setView('home'); return; }
   const db=state.library;
   const users=db.users||[];
   const jobs=db.jobs||[];
