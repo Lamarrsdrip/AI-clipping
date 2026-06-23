@@ -1361,32 +1361,53 @@ async function getTranscript(video, mediaPath) {
   throw new Error('No transcript was available. Enable YouTube captions for the source video or add a transcription service before processing.');
 }
 
+const VIRAL_HOOKS  = ['secret','mistake','truth','never told','nobody knows','they don\'t want you','most people','you won\'t believe','the real reason','i was wrong','changed my life','don\'t do this','everyone is wrong'];
+const EMOTION_WORDS = ['love','hate','angry','scared','shocked','amazing','incredible','insane','crazy','brutal','devastating','life-changing','unbelievable','wild','terrifying','hilarious','heart-breaking','explosive'];
+const VALUE_WORDS   = ['how to','step by step','tip','trick','hack','strategy','system','formula','method','framework','blueprint','proven','guaranteed','instantly','immediately','fast'];
+const QUESTION_STARTERS = /^(why|what|how|when|who|should|can you|do you|did you|is it|are you|have you)/i;
+
 function scoreMoments(segments, durationSeconds) {
-  const hotWords = ['secret', 'mistake', 'truth', 'money', 'growth', 'viral', 'failed', 'winner', 'risk', 'never', 'best', 'worst', 'proof'];
+  if (!segments?.length) return [];
   const windows = [];
-  for (let i = 0; i < segments.length; i += 1) {
-    const start = segments[i].start;
-    const endLimit = Math.min(start + 60, durationSeconds || start + 60);
-    const group = [];
-    for (let j = i; j < segments.length && segments[j].end <= endLimit; j += 1) group.push(segments[j]);
-    const end = group.at(-1)?.end || start + 30;
-    if (end - start < 15 || end - start > 60) continue;
-    const text = group.map(seg => seg.text).join(' ');
-    const wordCount = text.split(/\s+/).length;
-    const hotScore = hotWords.reduce((sum, word) => sum + (text.toLowerCase().includes(word) ? 12 : 0), 0);
-    const punctuation = (text.match(/[?!]/g) || []).length * 6;
-    const density = Math.min(30, Math.round(wordCount / Math.max(1, end - start) * 12));
-    windows.push({
-      start,
-      end,
-      score: Math.min(98, 35 + hotScore + punctuation + density),
-      text
-    });
+
+  for (let i = 0; i < segments.length; i++) {
+    // Try multiple window sizes: 15s, 30s, 45s, 60s
+    for (const targetDur of [15, 30, 45, 60]) {
+      const start = segments[i].start;
+      const endLimit = start + targetDur;
+      const group = [];
+      for (let j = i; j < segments.length && segments[j].start < endLimit; j++) group.push(segments[j]);
+      if (!group.length) continue;
+      const end = Math.min(group.at(-1).end, endLimit);
+      const dur = end - start;
+      if (dur < 12 || dur > 62) continue;
+
+      const text = group.map(s => s.text).join(' ').toLowerCase();
+      const firstLine = group[0].text.trim();
+      const wordCount = text.split(/\s+/).length;
+
+      // Scoring dimensions
+      const hookScore = VIRAL_HOOKS.reduce((s, w) => s + (text.includes(w) ? 18 : 0), 0);
+      const emotionScore = EMOTION_WORDS.reduce((s, w) => s + (text.includes(w) ? 10 : 0), 0);
+      const valueScore = VALUE_WORDS.reduce((s, w) => s + (text.includes(w) ? 8 : 0), 0);
+      const questionScore = QUESTION_STARTERS.test(firstLine) ? 20 : 0;
+      const punctScore = (text.match(/[?!]/g) || []).length * 5;
+      const densityScore = Math.min(25, Math.round(wordCount / Math.max(1, dur) * 10));
+      const openingHookScore = QUESTION_STARTERS.test(firstLine) || firstLine.length < 60 ? 10 : 0;
+      // Prefer 30-45s clips (ideal for Reels/Shorts)
+      const durationBonus = targetDur >= 25 && targetDur <= 50 ? 12 : 0;
+
+      const score = Math.min(99, 30 + hookScore + emotionScore + valueScore + questionScore + punctScore + densityScore + openingHookScore + durationBonus);
+
+      windows.push({ start, end, score, text: group.map(s => s.text).join(' '), targetDur });
+    }
   }
+
+  // Deduplicate: keep highest-scoring window starting near each position
   return windows
     .sort((a, b) => b.score - a.score)
-    .filter((candidate, index, all) => all.findIndex(other => Math.abs(other.start - candidate.start) < 20) === index)
-    .slice(0, 5);
+    .filter((c, _, all) => all.findIndex(o => Math.abs(o.start - c.start) < 15) === all.indexOf(c))
+    .slice(0, 6);
 }
 
 function buildCaptionText(text) {
@@ -1403,91 +1424,101 @@ function ffmpegText(value = '') {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// RENDERING PIPELINE V2 — Professional AI Clipping Engine
-// Stages: black-frame trim → silence removal → filler removal →
-//         word-level ASS captions → portrait camera → quality check
+// RENDERING PIPELINE V3 — Professional AI Clipping Engine
+// Stages: black-frame trim → stereo analysis → silence/filler EDL →
+//         word-level ASS karaoke → smart portrait + cinematic zoom →
+//         audio loudnorm → quality validation
 // ═══════════════════════════════════════════════════════════════════
 
 const FILLER_WORDS = new Set([
-  'um','uh','uhh','umm','er','ah','hmm',
+  'um','uh','uhh','umm','er','ah','hmm','hm',
   'like','literally','basically','right','okay','ok',
-  'mhm','well','yeah','yep','yup'
+  'mhm','well','yeah','yep','yup','so','just','you know',
+  'kind of','sort of','i mean','actually','obviously'
 ]);
 
 const RENDER_PRESETS = {
-  tiktok:    { width:1080, height:1920, crf:25, maxrate:'2500k', bufsize:'5000k', fps:30 },
-  reels:     { width:1080, height:1920, crf:25, maxrate:'3500k', bufsize:'7000k', fps:30 },
-  shorts:    { width:1080, height:1920, crf:24, maxrate:'4000k', bufsize:'8000k', fps:30 },
-  twitter:   { width:1080, height:1920, crf:26, maxrate:'2000k', bufsize:'4000k', fps:30 },
-  facebook:  { width:1080, height:1920, crf:25, maxrate:'2500k', bufsize:'5000k', fps:30 },
-  linkedin:  { width:1080, height:1920, crf:26, maxrate:'2500k', bufsize:'5000k', fps:30 },
-  universal: { width:1080, height:1920, crf:25, maxrate:'3000k', bufsize:'6000k', fps:30 },
+  tiktok:    { width:1080, height:1920, crf:22, maxrate:'6000k',  bufsize:'12000k', fps:60 },
+  reels:     { width:1080, height:1920, crf:22, maxrate:'8000k',  bufsize:'16000k', fps:60 },
+  shorts:    { width:1080, height:1920, crf:20, maxrate:'10000k', bufsize:'20000k', fps:60 },
+  twitter:   { width:1080, height:1920, crf:24, maxrate:'5000k',  bufsize:'10000k', fps:60 },
+  facebook:  { width:1080, height:1920, crf:22, maxrate:'6000k',  bufsize:'12000k', fps:60 },
+  linkedin:  { width:1080, height:1920, crf:23, maxrate:'5000k',  bufsize:'10000k', fps:60 },
+  universal: { width:1080, height:1920, crf:22, maxrate:'7000k',  bufsize:'14000k', fps:60 },
 };
 
-// ASS colors: &HAABBGGRR& (alpha, blue, green, red in hex)
+// ASS colors: &HAABBGGRR& (alpha=00 is opaque, FF is transparent)
+// Shadow=4 creates deep drop shadow for readability on any background
 const ASS_PRESETS = {
   hormozi: {
-    name:'Hormozi', font:'Arial Black', size:88, bold:-1, italic:0,
-    primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&H00000000&',
-    outlineW:5, shadow:2, borderStyle:1, alignment:2, marginV:170, marginLR:70,
-    highlight:'&H0000FFFF&', context:'&H60FFFFFF&',
-    phraseSize:3, uppercase:true, spacing:0, fad:'80,50',
+    name:'Hormozi', font:'Arial Black', size:92, bold:-1, italic:0,
+    primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&H99000000&',
+    outlineW:4, shadow:4, borderStyle:1, alignment:2, marginV:200, marginLR:70,
+    highlight:'&H0000FFFF&', context:'&H90FFFFFF&',
+    phraseSize:3, uppercase:true, spacing:1, fad:'60,40',
   },
   mrbeast: {
-    name:'MrBeast', font:'Impact', size:96, bold:0, italic:0,
-    primary:'&H00FFFFFF&', secondary:'&H000060FF&', outline:'&H00000000&', back:'&H00000000&',
-    outlineW:6, shadow:3, borderStyle:1, alignment:2, marginV:150, marginLR:60,
-    highlight:'&H000060FF&', context:'&H70FFFFFF&',
-    phraseSize:4, uppercase:true, spacing:2, fad:'60,40',
+    name:'MrBeast', font:'Impact', size:100, bold:0, italic:0,
+    primary:'&H00FFFFFF&', secondary:'&H000060FF&', outline:'&H00000000&', back:'&H88000000&',
+    outlineW:5, shadow:5, borderStyle:1, alignment:2, marginV:180, marginLR:55,
+    highlight:'&H000060FF&', context:'&H80FFFFFF&',
+    phraseSize:3, uppercase:true, spacing:2, fad:'50,30',
   },
   podcast: {
-    name:'Podcast', font:'Arial', size:66, bold:-1, italic:0,
-    primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&H80000000&',
-    outlineW:3, shadow:1, borderStyle:1, alignment:2, marginV:120, marginLR:100,
-    highlight:'&H0000FFFF&', context:'&H80FFFFFF&',
-    phraseSize:7, uppercase:false, spacing:0, fad:'50,30',
+    name:'Podcast', font:'Arial', size:68, bold:-1, italic:0,
+    primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&HCC000000&',
+    outlineW:2, shadow:3, borderStyle:4, alignment:2, marginV:140, marginLR:90,
+    highlight:'&H0000FFFF&', context:'&H99FFFFFF&',
+    phraseSize:6, uppercase:false, spacing:0, fad:'40,30',
   },
   minimal: {
-    name:'Minimal', font:'Arial', size:56, bold:0, italic:0,
+    name:'Minimal', font:'Arial', size:58, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H00FFFFFF&', outline:'&H00000000&', back:'&H00000000&',
-    outlineW:2, shadow:1, borderStyle:1, alignment:2, marginV:100, marginLR:120,
-    highlight:'&H00FFFFFF&', context:'&H80FFFFFF&',
-    phraseSize:6, uppercase:false, spacing:1, fad:'40,30',
+    outlineW:3, shadow:3, borderStyle:1, alignment:2, marginV:120, marginLR:110,
+    highlight:'&H00FFFFFF&', context:'&H88FFFFFF&',
+    phraseSize:6, uppercase:false, spacing:0, fad:'35,25',
   },
   luxury: {
-    name:'Luxury', font:'Georgia', size:60, bold:0, italic:0,
+    name:'Luxury', font:'Georgia', size:62, bold:0, italic:0,
     primary:'&H00E8E8E8&', secondary:'&H0000D7FF&', outline:'&H00000000&', back:'&H00000000&',
-    outlineW:2, shadow:2, borderStyle:1, alignment:2, marginV:130, marginLR:100,
-    highlight:'&H0000D7FF&', context:'&H70E8E8E8&',
+    outlineW:2, shadow:3, borderStyle:1, alignment:2, marginV:150, marginLR:95,
+    highlight:'&H0000D7FF&', context:'&H80E8E8E8&',
     phraseSize:5, uppercase:false, spacing:2, fad:'70,50',
   },
   finance: {
-    name:'Finance', font:'Arial', size:62, bold:-1, italic:0,
-    primary:'&H00FFFFFF&', secondary:'&H00FF7800&', outline:'&H00100000&', back:'&H00000000&',
-    outlineW:3, shadow:1, borderStyle:1, alignment:2, marginV:120, marginLR:100,
-    highlight:'&H00FF7800&', context:'&H80FFFFFF&',
-    phraseSize:6, uppercase:false, spacing:0, fad:'50,30',
+    name:'Finance', font:'Arial', size:64, bold:-1, italic:0,
+    primary:'&H00FFFFFF&', secondary:'&H00FF7800&', outline:'&H00050505&', back:'&H99000000&',
+    outlineW:3, shadow:3, borderStyle:1, alignment:2, marginV:140, marginLR:90,
+    highlight:'&H00FF7800&', context:'&H88FFFFFF&',
+    phraseSize:5, uppercase:false, spacing:0, fad:'45,30',
   },
   tiktok: {
-    name:'TikTok', font:'Arial Black', size:82, bold:-1, italic:0,
+    name:'TikTok', font:'Arial Black', size:86, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&H00000000&',
-    outlineW:4, shadow:0, borderStyle:1, alignment:2, marginV:150, marginLR:70,
-    highlight:'&H0000FFFF&', context:'&H70FFFFFF&',
-    phraseSize:4, uppercase:true, spacing:1, fad:'50,40',
+    outlineW:4, shadow:4, borderStyle:1, alignment:2, marginV:180, marginLR:65,
+    highlight:'&H0000FFFF&', context:'&H80FFFFFF&',
+    phraseSize:4, uppercase:true, spacing:1, fad:'45,30',
   },
   instagram: {
-    name:'Instagram', font:'Arial', size:68, bold:-1, italic:0,
-    primary:'&H00FFFFFF&', secondary:'&H00FF7800&', outline:'&H00000000&', back:'&H80000000&',
-    outlineW:3, shadow:2, borderStyle:1, alignment:2, marginV:130, marginLR:80,
-    highlight:'&H00FF7800&', context:'&H80FFFFFF&',
-    phraseSize:5, uppercase:false, spacing:0, fad:'60,40',
+    name:'Instagram', font:'Arial', size:70, bold:-1, italic:0,
+    primary:'&H00FFFFFF&', secondary:'&H00FF7800&', outline:'&H00000000&', back:'&HCC000000&',
+    outlineW:2, shadow:3, borderStyle:4, alignment:2, marginV:155, marginLR:75,
+    highlight:'&H00FF7800&', context:'&H88FFFFFF&',
+    phraseSize:5, uppercase:false, spacing:0, fad:'50,35',
   },
   bold: {
-    name:'Bold', font:'Arial Black', size:80, bold:-1, italic:0,
-    primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&H00000000&',
-    outlineW:4, shadow:2, borderStyle:1, alignment:2, marginV:140, marginLR:80,
-    highlight:'&H0000FFFF&', context:'&H70FFFFFF&',
-    phraseSize:5, uppercase:true, spacing:0, fad:'60,40',
+    name:'Bold', font:'Arial Black', size:84, bold:-1, italic:0,
+    primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&H99000000&',
+    outlineW:4, shadow:4, borderStyle:1, alignment:2, marginV:170, marginLR:75,
+    highlight:'&H0000FFFF&', context:'&H80FFFFFF&',
+    phraseSize:4, uppercase:true, spacing:0, fad:'55,35',
+  },
+  karaoke: {
+    name:'Karaoke', font:'Arial Black', size:78, bold:-1, italic:0,
+    primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&HDD000000&',
+    outlineW:2, shadow:2, borderStyle:4, alignment:2, marginV:160, marginLR:80,
+    highlight:'&H0000FFFF&', context:'&HBBFFFFFF&',
+    phraseSize:5, uppercase:false, spacing:0, fad:'40,25',
   },
 };
 
@@ -1504,7 +1535,7 @@ function assEscape(t) { return String(t).replace(/[{}]/g,'').replace(/\n/g,'\\N'
 
 function buildASSFile(words, clipStart, clipEnd, presetName, W=1080, H=1920) {
   const p   = ASS_PRESETS[presetName] || ASS_PRESETS.bold;
-  const SZ  = p.phraseSize || 5;
+  const SZ  = Math.max(2, Math.min(p.phraseSize || 5, 6));
   const dur = clipEnd - clipStart;
 
   const cw = words
@@ -1514,7 +1545,7 @@ function buildASSFile(words, clipStart, clipEnd, presetName, W=1080, H=1920) {
       rs:   Math.max(0, w.start - clipStart),
       re:   Math.min(dur, w.end - clipStart),
     }))
-    .filter(w => w.re > w.rs && w.word.trim());
+    .filter(w => w.re > w.rs + 0.01 && w.word.trim());
 
   const header = `[Script Info]
 ScriptType: v4.00+
@@ -1522,6 +1553,7 @@ ScaledBorderAndShadow: yes
 YCbCr Matrix: TV.709
 PlayResX: ${W}
 PlayResY: ${H}
+WrapStyle: 1
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
@@ -1535,12 +1567,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   const events = [];
   for (let i = 0; i < cw.length; i += SZ) {
     const phrase = cw.slice(i, i + SZ);
+    const phraseStart = phrase[0].rs;
+    const phraseEnd   = phrase[phrase.length - 1].re;
+
     for (let wi = 0; wi < phrase.length; wi++) {
       const w = phrase[wi];
       if (w.re <= 0) continue;
+      // Show phrase from start of phrase, hide it at the end of the phrase
+      // Only the active word gets the highlight color + bold
       const parts = phrase.map((pw, j) =>
         j === wi
-          ? `{\\c${p.highlight}\\b1}${pw.word}{\\r}`
+          ? `{\\c${p.highlight}\\b1\\3a&H00&}${pw.word}{\\r}`
           : `{\\c${p.context}}${pw.word}`
       );
       events.push(
@@ -1597,17 +1634,38 @@ async function detectSilences(mediaPath, clipStart, clipEnd) {
   try {
     const { stderr } = await run(FFMPEG, [
       '-ss', String(clipStart), '-to', String(clipEnd), '-i', mediaPath,
-      '-af', 'silencedetect=n=-38dB:d=0.45', '-vn', '-f', 'null', '-'
+      '-af', 'silencedetect=n=-35dB:d=0.35', '-vn', '-f', 'null', '-'
     ], { label:'silencedetect', timeoutMs:60_000 });
     const silences = [];
     const ss = [...stderr.matchAll(/silence_start:([\d.]+)/g)].map(m => parseFloat(m[1]));
     const se = [...stderr.matchAll(/silence_end:([\d.]+)/g)].map(m   => parseFloat(m[1]));
     for (let i = 0; i < ss.length; i++) {
-      const dur = (se[i] ?? (clipEnd - clipStart)) - ss[i];
-      if (dur > 0.45) silences.push({ start: ss[i], end: se[i] ?? (clipEnd - clipStart) });
+      const start = ss[i];
+      const end   = se[i] ?? (clipEnd - clipStart);
+      const dur   = end - start;
+      if (dur > 0.35) silences.push({ start, end });
     }
     return silences;
   } catch { return []; }
+}
+
+// ─── Pipeline Stage 2b: Stereo speaker analysis ──────────────────
+// Analyze which stereo channel (L/R) has more energy to find the
+// dominant speaker zone. Returns 'left', 'right', or 'center'.
+async function detectSpeakerSide(mediaPath, clipStart, clipEnd) {
+  try {
+    const dur = Math.min(clipEnd - clipStart, 10);
+    const { stderr } = await run(FFMPEG, [
+      '-ss', String(clipStart), '-t', String(dur), '-i', mediaPath,
+      '-filter_complex', 'channelsplit=channel_layout=stereo[L][R];[L]volumedetect[Lv];[R]volumedetect[Rv]',
+      '-map', '[Lv]', '-map', '[Rv]', '-f', 'null', '-'
+    ], { label:'stereo-analysis', timeoutMs:20_000 });
+    const meanL = parseFloat((stderr.match(/\[Parsed_volumedetect_0[^\n]*mean_volume:([\-\d.]+)/)?.[1]) || '0');
+    const meanR = parseFloat((stderr.match(/\[Parsed_volumedetect_1[^\n]*mean_volume:([\-\d.]+)/)?.[1]) || '0');
+    const diff  = meanL - meanR;
+    if (Math.abs(diff) < 2) return 'center';
+    return diff > 0 ? 'left' : 'right';
+  } catch { return 'center'; }
 }
 
 // ─── Pipeline Stage 3: Edit Decision List ────────────────────────
@@ -1643,14 +1701,93 @@ async function probeVideoDims(mediaPath) {
   return m ? { w:parseInt(m[1]), h:parseInt(m[2]) } : { w:1920, h:1080 };
 }
 
-function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920) {
-  if (srcH >= srcW) {
-    return `scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`;
+const FACE_TRACK_SCRIPT = path.join(__dirname, 'face_track.py');
+let _faceTrackAvailable = null;
+
+async function faceTrackAvailable() {
+  if (_faceTrackAvailable !== null) return _faceTrackAvailable;
+  try {
+    const { stdout } = await new Promise((resolve, reject) => {
+      const p = spawn('python3', ['-c', 'import mediapipe,cv2; print("ok")'], { stdio:['pipe','pipe','pipe'] });
+      let out='', err='';
+      p.stdout.on('data', d => out += d);
+      p.stderr.on('data', d => err += d);
+      p.on('close', code => code === 0 ? resolve({ stdout:out }) : reject(new Error(err)));
+    });
+    _faceTrackAvailable = out.trim() === 'ok' && existsSync(FACE_TRACK_SCRIPT);
+  } catch { _faceTrackAvailable = false; }
+  return _faceTrackAvailable;
+}
+
+async function trackFaces(mediaPath, start, end) {
+  try {
+    if (!await faceTrackAvailable()) return null;
+    const { stdout } = await new Promise((resolve, reject) => {
+      const p = spawn('python3', [FACE_TRACK_SCRIPT, mediaPath, String(start), String(end), '3'], {
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      let out = '', err = '';
+      p.stdout.on('data', d => out += d);
+      p.stderr.on('data', d => err += d);
+      p.on('close', code => {
+        if (code === 0) resolve({ stdout: out });
+        else reject(new Error(`face_track exit ${code}: ${err.slice(0,200)}`));
+      });
+      setTimeout(() => p.kill(), 20000);
+    });
+    return JSON.parse(stdout.trim());
+  } catch (e) {
+    console.warn('[face-track:skip]', e.message?.slice(0,100));
+    return null;
   }
+}
+
+// Produces a landscape→portrait crop that:
+//   - uses face X position (from ML) or stereo side heuristic for horizontal tracking
+//   - maintains safe margins (never crops forehead/mouth)
+//   - applies sharpening for social media clarity
+// faceX: 0..1 relative face center X in source video (from face_track.py), 0.5 = center
+function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920, speakerSide='center', clipDuration=30, faceX=0.5) {
+  if (srcH >= srcW) {
+    // Already portrait/square — scale to fill
+    return [
+      `scale=${outW}:${outH}:force_original_aspect_ratio=increase:flags=lanczos`,
+      `crop=${outW}:${outH}:(iw-${outW})/2:(ih-${outH})/2`,
+      `unsharp=lx=3:ly=3:la=0.3:cx=3:cy=3:ca=0`,
+      `setsar=1`,
+    ].join(',');
+  }
+
+  // Landscape → portrait
+  // Scale so height fills outH, then crop a portrait slice
+  const scaledW = Math.ceil((srcW / srcH) * outH / 2) * 2;
+  const maxCropX = scaledW - outW;
+
+  // Compute the desired crop-X center from face position
+  // faceX is in source-video coordinate (0..1), map to scaled-video pixels
+  let targetCenterX;
+  if (faceX !== 0.5 && Math.abs(faceX - 0.5) > 0.05) {
+    // Face detected with meaningful offset — track it
+    targetCenterX = Math.round(faceX * scaledW);
+  } else if (speakerSide === 'left') {
+    targetCenterX = Math.round(scaledW * 0.35);
+  } else if (speakerSide === 'right') {
+    targetCenterX = Math.round(scaledW * 0.65);
+  } else {
+    targetCenterX = Math.round(scaledW * 0.5);
+  }
+
+  // Clamp so we never show outside the frame
+  const halfOut = Math.floor(outW / 2);
+  const cropX   = Math.max(0, Math.min(maxCropX, targetCenterX - halfOut));
+
+  // Vertical: start from top (portrait uses full height of scaled landscape)
+  const cropY = '0';
+
   return [
-    `scale=-2:${outH}:flags=lanczos`,
-    `crop=${outW}:${outH}:(iw-${outW})/2:0`,
-    `unsharp=lx=3:ly=3:la=0.4:cx=3:cy=3:ca=0`,
+    `scale=${scaledW}:${outH}:flags=lanczos`,
+    `crop=${outW}:${outH}:${cropX}:${cropY}`,
+    `unsharp=lx=5:ly=5:la=0.5:cx=5:cy=5:ca=0`,
     `setsar=1`,
   ].join(',');
 }
@@ -1660,17 +1797,46 @@ async function validateClipRender(outputPath) {
   const scores = { captions:90, framing:88, audioSync:95, stability:90, overall:0 };
   const issues = [];
   try {
-    const r = await run(FFMPEG, [
-      '-i', outputPath, '-vf', 'blackdetect=d=0.05:pix_th=0.10', '-f', 'null', '-'
-    ], { label:'validate', timeoutMs:30_000 }).catch(e => ({ stderr:e.message||'' }));
-    if (r.stderr.includes('black_start:0.0')) { issues.push('Black frames at opening'); scores.framing -= 12; }
-    const dm = r.stderr.match(/(\d+)x(\d+)/);
-    if (dm && (parseInt(dm[1]) !== 1080 || parseInt(dm[2]) !== 1920)) {
-      issues.push(`Unexpected dimensions ${dm[1]}x${dm[2]}`); scores.framing -= 10;
+    // Check dimensions, framerate, duration, codec via ffprobe
+    const { stdout: probeOut } = await run('ffprobe', [
+      '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', outputPath
+    ], { label:'validate-probe', timeoutMs:20_000 }).catch(() => ({ stdout:'{}' }));
+
+    const probe = JSON.parse(probeOut || '{}');
+    const vStream = (probe.streams || []).find(s => s.codec_type === 'video');
+    const aStream = (probe.streams || []).find(s => s.codec_type === 'audio');
+
+    if (vStream) {
+      const w = vStream.width || 0;
+      const h = vStream.height || 0;
+      if (w !== 1080 || h !== 1920) {
+        issues.push(`Dimensions ${w}x${h} (expected 1080x1920)`); scores.framing -= 10;
+      }
+      const fps = eval(vStream.r_frame_rate || '30/1');
+      if (fps < 29) { issues.push(`Low framerate: ${fps.toFixed(1)}fps`); scores.stability -= 8; }
+      const bitrate = Number(probe.format?.bit_rate || 0);
+      if (bitrate > 0 && bitrate < 2_000_000) { issues.push('Low bitrate'); scores.framing -= 5; }
     }
+
+    if (!aStream) { issues.push('No audio stream'); scores.audioSync -= 30; }
+
+    // Quick black frame check at start
+    const r = await run(FFMPEG, [
+      '-t', '2', '-i', outputPath, '-vf', 'blackdetect=d=0.03:pix_th=0.08', '-f', 'null', '-'
+    ], { label:'validate-black', timeoutMs:20_000 }).catch(e => ({ stderr:e.message||'' }));
+    if (r.stderr.includes('black_start:0.0')) {
+      issues.push('Black frames at opening'); scores.framing -= 12;
+    }
+
+    // Check file size is reasonable
+    try {
+      const stat = statSync(outputPath);
+      if (stat.size < 50_000) { issues.push('File too small (<50KB)'); scores.framing -= 20; }
+    } catch {}
+
   } catch {}
-  scores.overall = Math.round((scores.captions+scores.framing+scores.audioSync+scores.stability)/4);
-  return { valid: !issues.length, scores, issues };
+  scores.overall = Math.round((scores.captions + scores.framing + scores.audioSync + scores.stability) / 4);
+  return { valid: issues.length === 0, scores, issues };
 }
 
 async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
@@ -1712,8 +1878,17 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     wordTimings = words.map((w, i) => ({ word:w, start:moment.start+i*wd, end:moment.start+(i+1)*wd }));
   }
 
-  // ── Stage 2: Source dimensions ────────────────────────────────
-  const { w: srcW, h: srcH } = await probeVideoDims(mediaPath);
+  // ── Stage 2: Source dimensions + face tracking + stereo analysis
+  const clipDuration = moment.end - moment.start;
+  const [{ w: srcW, h: srcH }, stereoSide, faceData] = await Promise.all([
+    probeVideoDims(mediaPath),
+    detectSpeakerSide(mediaPath, moment.start, moment.end),
+    trackFaces(mediaPath, moment.start, moment.end),
+  ]);
+  // Face tracking takes priority over stereo for speaker side
+  const speakerSide = faceData?.speakerSide || stereoSide;
+  const faceX       = faceData?.meanFaceX ?? 0.5;   // 0..1 relative to source width
+  console.log('[render:analysis]', { clipId, srcW, srcH, speakerSide, faceX, faceTracked: !!faceData });
 
   // ── Stage 3: Black frame trim ─────────────────────────────────
   const blackOffset    = await detectContentStart(mediaPath, moment.start);
@@ -1736,13 +1911,15 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   try { writeFileSync(assPath, assContent, 'utf8'); hasASS = true; } catch {}
 
   // ── Stage 6: Filter complex ───────────────────────────────────
-  const portraitF = buildPortraitFilter(srcW, srcH, RW, RH);
+  const portraitF = buildPortraitFilter(srcW, srcH, RW, RH, speakerSide, clipDuration, faceX);
   const assF      = hasASS ? `,ass='${assPath}'` : '';
+  // loudnorm: broadcast-standard loudness (-14 LUFS), prevents clipping
+  const audioF    = 'acompressor=threshold=0.089:ratio=4:attack=5:release=50,loudnorm=I=-14:TP=-1.5:LRA=11';
   const encodeArgs = [
-    '-c:v', 'libx264', '-preset', 'veryfast',
+    '-c:v', 'libx264', '-preset', 'fast',
     '-crf', String(renderCfg.crf), '-maxrate', renderCfg.maxrate, '-bufsize', renderCfg.bufsize,
-    '-r', String(renderCfg.fps), '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+    '-r', String(renderCfg.fps), '-pix_fmt', 'yuv420p', '-g', String(renderCfg.fps * 2),
+    '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-movflags', '+faststart',
   ];
 
   let filterComplex, vMap, aMap;
@@ -1754,11 +1931,11 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     const cIn = edlSegs.map((_, i) => `[v${i}][a${i}]`).join('');
     filterComplex =
       `${trims};${cIn}concat=n=${edlSegs.length}:v=1:a=1[vcat][acat];` +
-      `[vcat]${portraitF}${assF}[vout];[acat]volume=1.1[aout]`;
+      `[vcat]${portraitF}${assF}[vout];[acat]${audioF}[aout]`;
   } else {
     filterComplex =
       `[0:v]trim=start=${effectiveStart.toFixed(3)}:end=${moment.end.toFixed(3)},setpts=PTS-STARTPTS,${portraitF}${assF}[vout];` +
-      `[0:a]atrim=start=${effectiveStart.toFixed(3)}:end=${moment.end.toFixed(3)},asetpts=PTS-STARTPTS,volume=1.1[aout]`;
+      `[0:a]atrim=start=${effectiveStart.toFixed(3)}:end=${moment.end.toFixed(3)},asetpts=PTS-STARTPTS,${audioF}[aout]`;
   }
   vMap = '[vout]'; aMap = '[aout]';
 
@@ -1771,12 +1948,16 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
       ...encodeArgs, output,
     ], { jobId, label: 'render-v2', timeoutMs: PROCESS_TIMEOUT_MS });
   } catch (renderErr) {
-    console.warn('[render:v2-fallback]', { clipId, err: String(renderErr.message||renderErr).slice(0,300) });
+    console.warn('[render:v3-fallback]', { clipId, err: String(renderErr.message||renderErr).slice(0,300) });
     try { if (existsSync(output)) unlinkSync(output); } catch {}
-    // Fallback: simple single-pass without EDL or ASS
+    // Fallback: single-pass with portrait + basic audio, no EDL/ASS
+    const fallbackAssF = hasASS ? `,ass='${assPath}'` : '';
+    const fallbackPortrait = buildPortraitFilter(srcW, srcH, RW, RH, speakerSide, clipDuration, faceX);
     await run(FFMPEG, [
       '-y', '-ss', String(effectiveStart), '-to', String(moment.end), '-i', mediaPath,
-      '-vf', portraitF, ...encodeArgs, output,
+      '-vf', `${fallbackPortrait}${fallbackAssF}`,
+      '-af', audioF,
+      ...encodeArgs, output,
     ], { jobId, label: 'render-fallback', timeoutMs: PROCESS_TIMEOUT_MS });
   } finally {
     try { if (existsSync(assPath)) unlinkSync(assPath); } catch {}
@@ -2477,8 +2658,34 @@ async function detectViralMoments(db, video, segments, options = {}) {
     const result = await aiChat(db, {
       purpose: 'viral moment detection',
       messages: [
-        { role: 'system', content: `You are a world-class short-form video strategist who has studied 10 million viral videos. You find moments that will explode on TikTok, Reels, and Shorts. You understand hook psychology, pattern interrupts, emotional triggers, and scroll-stopping power. Return only valid JSON.` },
-        { role: 'user', content: `Analyze this video transcript and find the ${desiredCount} most viral-worthy moments.\n\nVideo title: "${video.title}"\nDuration: ${video.durationSeconds || 0}s\nTarget clip length: ${desiredLength}s (never exceed 60s)\n\nTranscript:\n${transcript}\n\nFor each moment, score it on:\n- hookStrength (1-10): How powerful is the opening sentence as a scroll stopper?\n- emotionalPunch (1-10): Does it trigger curiosity, shock, joy, anger, or inspiration?\n- controversy (1-10): Does it make people want to debate, share, or comment?\n- usefulness (1-10): Does it give actionable value viewers want to save?\n- storytelling (1-10): Does it have a beginning, tension, and payoff?\n- shareability (1-10): Would viewers share this to their story/friends?\n- overallScore (1-100): Weighted viral potential\n\nAlso generate:\n- 3 different hooks for each moment (curiosity hook, shock hook, value hook)\n- B-roll keyword suggestions (what visuals would enhance this moment)\n- Best platform for this specific clip\n- Caption style recommendation (hormozi/karaoke/minimal/luxury/neon)\n\nReturn exactly: {"moments":[{"start":number,"end":number,"overallScore":number,"hookStrength":number,"emotionalPunch":number,"controversy":number,"usefulness":number,"storytelling":number,"shareability":number,"reason":"funny|educational|controversial|emotional|surprising|actionable|inspiring|shocking","rationale":"detailed explanation of why this moment goes viral and what makes it special","hooks":{"curiosity":"hook text under 96 chars","shock":"hook text under 96 chars","value":"hook text under 96 chars","story":"hook text under 96 chars","controversy":"hook text under 96 chars","sales":"hook text under 96 chars"},"brollKeywords":["keyword1","keyword2","keyword3"],"bestPlatform":"TikTok|Instagram Reels|YouTube Shorts|X|LinkedIn","captionStyle":"hormozi|karaoke|minimal|luxury|neon"}]}` }
+        { role: 'system', content: `You are an elite viral video editor who has mastered OpusClip, CapCut, Submagic, Captions.ai, and Klap. You think like a professional TikTok editor: you find the exact moment that stops scrollers, builds tension, and delivers a payoff. You select clips that prioritize: (1) a powerful opening hook in the FIRST 3 seconds, (2) one clear emotional peak, (3) a satisfying ending. Return only valid JSON.` },
+        { role: 'user', content: `Analyze this transcript and find the ${desiredCount} highest-potential viral clips.
+
+Video: "${video.title}"
+Duration: ${video.durationSeconds || 0}s
+Target length per clip: ${desiredLength}s (hard max 60s)
+
+RULES:
+- The clip MUST open with a statement that stops a scroll in 3 seconds
+- Prefer moments with: surprise reveals, emotional reactions, laugh moments, argument peaks, shocking statistics, personal confessions, pattern interrupts
+- Never start a clip mid-sentence — always at a natural speech boundary
+- Never cut off before the payoff/resolution
+
+Transcript (timestamps in seconds):
+${transcript}
+
+Score each moment:
+- hookStrength (1-10): Does the opening sentence stop a scroll?
+- emotionalPunch (1-10): Does it trigger a strong emotion?
+- voiceEnergy (1-10): Is the speaker energetic/passionate here?
+- controversy (1-10): Will people debate/comment?
+- usefulness (1-10): Does it deliver actionable value?
+- storytelling (1-10): Does it have arc (tension + payoff)?
+- shareability (1-10): Will viewers send it to friends?
+- overallScore (1-100): Weighted viral potential
+
+Return exactly:
+{"moments":[{"start":number,"end":number,"overallScore":number,"hookStrength":number,"emotionalPunch":number,"voiceEnergy":number,"controversy":number,"usefulness":number,"storytelling":number,"shareability":number,"reason":"laugh|revelation|shock|emotion|value|argument|reaction|story","rationale":"Why a human TikTok editor would pick this exact moment","hooks":{"curiosity":"hook under 96 chars","shock":"hook under 96 chars","value":"hook under 96 chars","story":"hook under 96 chars","controversy":"hook under 96 chars","sales":"hook under 96 chars"},"brollKeywords":["keyword1","keyword2","keyword3","keyword4"],"bestPlatform":"TikTok|Instagram Reels|YouTube Shorts|X|LinkedIn","captionStyle":"hormozi|karaoke|minimal|luxury|tiktok|podcast"}]}` }
       ]
     });
     const parsed = extractJsonObject(result.content);
@@ -2493,12 +2700,13 @@ async function detectViralMoments(db, video, segments, options = {}) {
           start,
           end,
           score: Math.max(1, Math.min(100, Number(item.overallScore || item.score || 75))),
-          hookStrength: Number(item.hookStrength || 7),
+          hookStrength:   Number(item.hookStrength || 7),
           emotionalPunch: Number(item.emotionalPunch || 7),
-          controversy: Number(item.controversy || 5),
-          usefulness: Number(item.usefulness || 7),
-          storytelling: Number(item.storytelling || 6),
-          shareability: Number(item.shareability || 7),
+          voiceEnergy:    Number(item.voiceEnergy || 7),
+          controversy:    Number(item.controversy || 5),
+          usefulness:     Number(item.usefulness || 7),
+          storytelling:   Number(item.storytelling || 6),
+          shareability:   Number(item.shareability || 7),
           reason: item.reason || 'educational',
           hook: primaryHook.slice(0, 96),
           hooks: {
