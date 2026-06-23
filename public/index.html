@@ -4,10 +4,12 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#080812">
-    <title>ClipForge AI — Viral clips, no effort</title>
+    <title>ClipForge AI</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
+
+    <!-- ── Auth ── -->
     <section id="authShell" class="auth-shell">
       <div class="auth-glow"></div>
       <form id="authForm" class="auth-card">
@@ -27,27 +29,34 @@
           <button type="button" class="text-btn" id="toggleAuth">Create account</button>
           <button type="button" class="text-btn" id="forgotPassword">Forgot password?</button>
         </div>
-        <div id="authMessage" class="message"></div>
+        <div id="authMessage" class="message error"></div>
       </form>
     </section>
 
+    <!-- ── App ── -->
     <div id="appShell" class="app-shell hidden">
+
+      <!-- Sidebar (desktop) -->
       <aside class="side-nav">
         <div class="brand">
           <div class="brand-icon">⚡</div>
           <b>ClipForge AI</b>
         </div>
         <nav id="sideNav"></nav>
+        <button class="more-btn" id="sideMoreBtn">
+          <span class="more-btn-icon">≡</span>
+          <span>More</span>
+        </button>
         <div class="user-box">
           <div class="user-avatar" id="userAvatar">U</div>
           <div class="user-info">
             <b id="userName">User</b>
             <small id="userPlan">— credits</small>
           </div>
-          <button class="icon-btn logout-btn" id="logoutBtn" title="Sign out">↩</button>
         </div>
       </aside>
 
+      <!-- Main content -->
       <main class="main">
         <header class="app-top">
           <div>
@@ -55,7 +64,7 @@
             <h1 id="pageTitle">Dashboard</h1>
           </div>
           <div class="top-actions">
-            <button class="icon-btn" data-view-jump="settings" title="Settings">⚙</button>
+            <button class="icon-btn" id="topMoreBtn" title="Menu">≡</button>
           </div>
         </header>
 
@@ -71,7 +80,24 @@
         <section id="admin"      class="view"></section>
       </main>
 
+      <!-- Bottom nav (mobile) -->
       <nav id="bottomNav" class="bottom-nav"></nav>
+
+      <!-- Drawer backdrop -->
+      <div id="drawerBd" class="drawer-bd hidden"></div>
+
+      <!-- More drawer -->
+      <div id="menuDrawer" class="menu-drawer hidden">
+        <div class="drawer-head">
+          <div class="brand">
+            <div class="brand-icon">⚡</div>
+            <b>ClipForge AI</b>
+          </div>
+          <button class="icon-btn" id="drawerClose">✕</button>
+        </div>
+        <div id="drawerContent"></div>
+      </div>
+
     </div>
 
     <script src="/app.js"></script>

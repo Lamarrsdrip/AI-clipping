@@ -52,53 +52,144 @@ const state = {
   thumbTab: 0
 };
 
-/* ── Nav ─────────────────────────────────────────────────────────── */
+/* ── Nav (4 core items only) ─────────────────────────────────────── */
 const NAV = [
-  { id:'home', icon:'⌂', label:'Dashboard' },
-  { id:'create', icon:'✦', label:'Create' },
-  { id:'clips', icon:'▶', label:'Clips' },
-  { id:'studio', icon:'⚡', label:'AI Studio' },
-  { id:'scheduler', icon:'◷', label:'Schedule' },
-  { id:'billing', icon:'◇', label:'Credits' },
-  { id:'settings', icon:'⚙', label:'Settings' }
+  { id:'home',      icon:'⌂', label:'Home'     },
+  { id:'create',    icon:'✦', label:'Create'   },
+  { id:'clips',     icon:'▶', label:'Clips'    },
+  { id:'scheduler', icon:'◷', label:'Schedule' }
+];
+
+const MENU_ITEMS = [
+  { id:'studio',     icon:'⚡', label:'AI Studio',       desc:'B-roll, faceless, thumbnails' },
+  { id:'transcript', icon:'◑', label:'Transcripts',      desc:'Full video transcripts' },
+  { id:'billing',    icon:'◇', label:'Credits & Billing',desc:'Plans and usage' },
+  { id:'settings',   icon:'⚙', label:'Settings',         desc:'Profile and preferences' }
+];
+const MENU_ITEMS_ADMIN = [
+  { id:'admin', icon:'◈', label:'Admin panel', desc:'Users, logs, API keys' }
 ];
 
 function renderNav() {
   const user = state.session?.user;
-  const isAdmin = user?.role === 'admin';
-  const items = isAdmin ? [...NAV, { id:'admin', icon:'◈', label:'Admin' }] : NAV;
-  const navHtml = items.map(n => `<a class="nav-item ${state.view===n.id?'active':''}" data-view="${n.id}"><span class="nav-icon">${n.icon}</span><span class="nav-label">${n.label}</span></a>`).join('');
-  const bottomHtml = items.map(n => `<a class="bottom-item ${state.view===n.id?'active':''}" data-view="${n.id}"><span>${n.icon}</span><small>${n.label}</small></a>`).join('');
+  const navHtml = NAV.map(n => `
+    <a class="nav-item ${state.view===n.id?'active':''}" data-view="${n.id}">
+      <span class="nav-icon">${n.icon}</span>
+      <span class="nav-label">${n.label}</span>
+    </a>`).join('');
+  const bottomHtml = NAV.map(n => `
+    <a class="bottom-item ${state.view===n.id?'active':''}" data-view="${n.id}">
+      <span>${n.icon}</span><small>${n.label}</small>
+    </a>`).join('') +
+    `<button class="bottom-item" id="bottomMoreBtn"><span>≡</span><small>More</small></button>`;
+
   $('#sideNav').innerHTML = navHtml;
   $('#bottomNav').innerHTML = bottomHtml;
+  $('#bottomMoreBtn')?.addEventListener('click', openMenu);
+
   if (user) {
-    const av = (user.name||user.email||'U')[0].toUpperCase();
-    $('#userAvatar').textContent = av;
-    $('#userName').textContent = user.name || user.email;
-    $('#userPlan').textContent = `${user.credits ?? 0} credits`;
+    $('#userAvatar').textContent = (user.name||user.email||'U')[0].toUpperCase();
+    $('#userName').textContent   = user.name || user.email;
+    $('#userPlan').textContent   = `${user.credits ?? 0} credits`;
   }
 }
 
+/* ── Drawer ──────────────────────────────────────────────────────── */
+function openMenu() {
+  const user = state.session?.user;
+  const isAdmin = user?.role === 'admin';
+  const allItems = isAdmin ? [...MENU_ITEMS, ...MENU_ITEMS_ADMIN] : MENU_ITEMS;
+  $('#drawerContent').innerHTML = `
+    <div class="drawer-user">
+      <div class="drawer-avatar">${(user?.name||user?.email||'U')[0].toUpperCase()}</div>
+      <div>
+        <b>${esc(user?.name||user?.email||'')}</b>
+        <small>${user?.credits ?? 0} credits · ${esc(user?.plan||'Free')}</small>
+      </div>
+    </div>
+    <nav class="drawer-nav">
+      ${allItems.map(item => `
+        <a class="drawer-item" data-view="${item.id}" data-close-drawer>
+          <span class="drawer-icon">${item.icon}</span>
+          <div>
+            <b>${item.label}</b>
+            <small>${item.desc}</small>
+          </div>
+        </a>`).join('')}
+    </nav>
+    <div class="drawer-footer">
+      <a class="drawer-item" href="https://console.x.ai" target="_blank" rel="noopener">
+        <span class="drawer-icon">🔑</span>
+        <div><b>Get Grok API key</b><small>console.x.ai — free tier</small></div>
+      </a>
+      <button class="drawer-item danger" id="drawerLogout">
+        <span class="drawer-icon">↩</span>
+        <div><b>Sign out</b><small>${esc(user?.email||'')}</small></div>
+      </button>
+    </div>`;
+
+  $('#menuDrawer').classList.remove('hidden');
+  $('#drawerBd').classList.remove('hidden');
+  requestAnimationFrame(() => {
+    $('#menuDrawer').classList.add('open');
+    $('#drawerBd').classList.add('open');
+  });
+
+  $('#drawerClose')?.addEventListener('click', closeMenu);
+  $('#drawerBd')?.addEventListener('click', closeMenu);
+  $('#drawerLogout')?.addEventListener('click', () => {
+    localStorage.removeItem('clipforge:userId'); location.reload();
+  });
+}
+
+function closeMenu() {
+  $('#menuDrawer')?.classList.remove('open');
+  $('#drawerBd')?.classList.remove('open');
+  setTimeout(() => {
+    $('#menuDrawer')?.classList.add('hidden');
+    $('#drawerBd')?.classList.add('hidden');
+  }, 280);
+}
+
+/* ── setView ─────────────────────────────────────────────────────── */
+const PAGE_META = {
+  home:       { eyebrow:'Overview',      title:'Dashboard'      },
+  create:     { eyebrow:'New project',   title:'Create clips'   },
+  clips:      { eyebrow:'Library',       title:'Your clips'     },
+  clipDetail: { eyebrow:'Clip detail',   title:'Clip'           },
+  scheduler:  { eyebrow:'Publishing',    title:'Schedule'       },
+  studio:     { eyebrow:'AI tools',      title:'AI Studio'      },
+  transcript: { eyebrow:'AI tools',      title:'Transcript'     },
+  billing:    { eyebrow:'Account',       title:'Credits'        },
+  settings:   { eyebrow:'Account',       title:'Settings'       },
+  admin:      { eyebrow:'Admin',         title:'Admin panel'    }
+};
+
 function setView(id) {
+  closeMenu();
+  // clipDetail needs a clip loaded
+  if (id === 'clipDetail' && !state.clip) { setView('clips'); return; }
+
   state.view = id;
   $$('.view').forEach(el => el.classList.remove('active'));
   const el = $(`#${id}`);
   if (el) el.classList.add('active');
-  const eyebrows = { home:'Dashboard', create:'New Project', clips:'Clips Library', studio:'AI Studio', scheduler:'Schedule', billing:'Credits & Plans', settings:'Settings', admin:'Admin', clipDetail:'Clip Detail', transcript:'Transcript', faceless:'Faceless Mode' };
-  const titles = { home:'Welcome back', create:'Create clips', clips:'Your clips', studio:'AI Studio', scheduler:'Post schedule', billing:'Credits & billing', settings:'Settings', admin:'Admin panel', clipDetail:'Clip detail', transcript:'Transcript', faceless:'Faceless content' };
-  $('#pageEyebrow').textContent = eyebrows[id] || id;
-  $('#pageTitle').textContent = titles[id] || id;
+
+  const meta = PAGE_META[id] || { eyebrow: id, title: id };
+  $('#pageEyebrow').textContent = meta.eyebrow;
+  $('#pageTitle').textContent   = meta.title;
   renderNav();
-  if (id === 'home') renderHome();
-  if (id === 'create') renderCreate();
-  if (id === 'clips') renderClips();
-  if (id === 'studio') renderStudio();
-  if (id === 'clipDetail' && state.clip) renderClipDetail();
+
+  if (id === 'home')       renderHome();
+  if (id === 'create')     renderCreate();
+  if (id === 'clips')      renderClips();
+  if (id === 'clipDetail') renderClipDetail();
+  if (id === 'studio')     renderStudio();
   if (id === 'transcript') renderTranscript();
-  if (id === 'billing') renderBilling();
-  if (id === 'settings') renderSettings();
-  if (id === 'admin') renderAdmin();
-  if (id === 'scheduler') renderScheduler();
+  if (id === 'billing')    renderBilling();
+  if (id === 'settings')   renderSettings();
+  if (id === 'admin')      renderAdmin();
+  if (id === 'scheduler')  renderScheduler();
 }
 
 /* ── Data loading ─────────────────────────────────────────────────── */
@@ -119,86 +210,77 @@ async function loadAll() {
 
 /* ── Home ─────────────────────────────────────────────────────────── */
 function renderHome() {
-  const { clips, jobs, videos } = state.library;
+  const { clips=[], jobs=[], videos=[] } = state.library;
   const user = state.session?.user || {};
-  const activeJobs = (jobs||[]).filter(j => ['queued','running'].includes(j.status));
-  const doneClips = (clips||[]).filter(c => c.outputPath && !c.demoMode);
-  const totalScore = doneClips.length ? Math.round(doneClips.reduce((s,c) => s+(c.score||0),0)/doneClips.length) : 0;
+  const name = (user.name||user.email||'').split(' ')[0] || 'there';
+  const activeJobs = jobs.filter(j => ['queued','running'].includes(j.status));
+  const failedJobs = jobs.filter(j => j.status==='failed');
+  const doneClips  = clips.filter(c => c.outputPath && !c.demoMode);
+  const isNew = !doneClips.length && !activeJobs.length;
 
   $('#home').innerHTML = `
     <div class="home-wrap">
-      <div class="stats-row">
-        <div class="stat-card">
-          <div class="stat-num">${doneClips.length}</div>
-          <div class="stat-label">Clips Generated</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-num">${(videos||[]).length}</div>
-          <div class="stat-label">Videos Imported</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-num">${totalScore || '—'}</div>
-          <div class="stat-label">Avg Viral Score</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-num">${user.credits ?? 0}</div>
-          <div class="stat-label">Credits Left</div>
-        </div>
-      </div>
 
-      ${activeJobs.length ? `
-        <section class="panel" style="margin-bottom:16px">
-          <h2 style="margin-bottom:12px">Processing now</h2>
-          ${activeJobs.map(j => `
-            <div class="job-row active">
-              <div class="job-info">
-                <b>${esc((videos||[]).find(v=>v.id===j.videoId)?.title||'Video')}</b>
-                <span class="pill warn">${esc(j.stage||j.status)}</span>
-              </div>
-              <div class="progress"><span style="width:${j.progress||0}%"></span></div>
-            </div>
-          `).join('')}
-        </section>
-      ` : ''}
-
-      <div class="quick-actions">
-        <button class="qcard" data-view="create">
-          <div class="qcard-icon">✦</div>
-          <b>Create new clips</b>
-          <small>Upload video or paste YouTube link</small>
-        </button>
-        <button class="qcard" data-view="studio">
-          <div class="qcard-icon">⚡</div>
-          <b>AI Studio</b>
-          <small>B-roll suggestions, faceless content, thumbnails</small>
-        </button>
-        <button class="qcard" data-view="clips">
-          <div class="qcard-icon">▶</div>
-          <b>View clips</b>
-          <small>${doneClips.length} clips ready to post</small>
-        </button>
-        <button class="qcard" data-view="scheduler">
-          <div class="qcard-icon">◷</div>
-          <b>Schedule posts</b>
-          <small>Plan your content calendar</small>
-        </button>
-      </div>
-
-      ${doneClips.length ? `
-        <section style="margin-top:24px">
-          <div class="panel-head" style="margin-bottom:12px">
-            <h2>Recent clips</h2>
-            <button class="ghost" data-view="clips">View all</button>
+      ${/* ── Active jobs banner ── */activeJobs.length ? `
+        <div class="processing-banner">
+          <div class="processing-pulse"></div>
+          <div>
+            <b>Generating ${activeJobs.length === 1 ? 'clips' : activeJobs.length + ' jobs'}…</b>
+            <span class="muted">${esc(activeJobs[0].stage||'Processing')} · ${activeJobs[0].progress||0}%</span>
           </div>
-          <div class="card-grid">${doneClips.slice(0,4).map(clipCard).join('')}</div>
-        </section>
+          <button class="ghost" data-view="clips">View →</button>
+        </div>` : ''}
+
+      ${/* ── First-time onboarding ── */isNew ? `
+        <div class="onboard-hero">
+          <div class="onboard-badge">⚡</div>
+          <h2>Hey ${esc(name)}, let's make your first clip</h2>
+          <p>Upload a video or paste a YouTube link — AI finds the viral moments and cuts them automatically.</p>
+          <button data-view="create" style="margin-top:20px;padding:14px 32px;font-size:1rem">Start creating →</button>
+        </div>
+        <div class="journey-steps">
+          ${[['✦','Import video','Upload or paste a YouTube URL'],
+             ['◎','AI analysis','Finds the best moments automatically'],
+             ['▶','Review clips','Preview, edit hooks, and download'],
+             ['◷','Schedule','Plan posts across all platforms']].map(([ic,t,d],i)=>`
+            <div class="journey-step">
+              <div class="journey-num">${i+1}</div>
+              <div class="journey-icon">${ic}</div>
+              <b>${t}</b>
+              <small>${d}</small>
+            </div>`).join('')}
+        </div>
       ` : `
-        <section class="panel empty-state" style="margin-top:24px">
-          <div class="empty-icon">✦</div>
-          <h2>Start your first project</h2>
-          <p>Upload a video or paste a YouTube URL to generate viral short-form clips with AI.</p>
-          <button data-view="create" style="margin-top:16px">Create first clip</button>
-        </section>
+        ${/* ── Stats row ── */`
+        <div class="stats-row">
+          <div class="stat-card"><div class="stat-num">${doneClips.length}</div><div class="stat-label">Clips ready</div></div>
+          <div class="stat-card"><div class="stat-num">${videos.length}</div><div class="stat-label">Videos</div></div>
+          <div class="stat-card"><div class="stat-num">${doneClips.length?Math.round(doneClips.reduce((s,c)=>s+(c.score||0),0)/doneClips.length):'—'}</div><div class="stat-label">Avg score</div></div>
+          <div class="stat-card"><div class="stat-num">${user.credits??0}</div><div class="stat-label">Credits</div></div>
+        </div>`}
+
+        ${failedJobs.length ? `
+          <div class="alert-banner">
+            <span>⚠ ${failedJobs.length} job${failedJobs.length>1?'s':''} failed</span>
+            <button class="ghost" data-view="clips">Review →</button>
+          </div>` : ''}
+
+        <div class="home-actions">
+          <button class="primary-action" data-view="create">
+            <span class="pa-icon">✦</span>
+            <div><b>New project</b><small>Upload or import a video</small></div>
+          </button>
+          <button class="primary-action" data-view="clips">
+            <span class="pa-icon">▶</span>
+            <div><b>View clips</b><small>${doneClips.length} clip${doneClips.length!==1?'s':''} ready</small></div>
+          </button>
+        </div>
+
+        <div class="panel-head" style="margin:24px 0 12px">
+          <h2>Recent clips</h2>
+          <button class="ghost" data-view="clips">View all</button>
+        </div>
+        <div class="card-grid">${doneClips.slice(0,4).map(clipCard).join('')}</div>
       `}
     </div>`;
 }
@@ -214,84 +296,89 @@ function activeVideos() {
 function renderCreate() {
   const allVideos = state.library?.videos || [];
   const videos = activeVideos();
-  const hasAny = allVideos.length > 0;
+  const hasVideos = videos.length > 0;
+  const statusType = state.importStatus?.type || '';
 
   $('#create').innerHTML = `
-    <div class="create-grid">
-      <section class="panel">
-        <span class="eyebrow">Step 1</span>
-        <h2>Import your video</h2>
-        <p>Upload an mp4, mov, webm, or m4v file. Your Mac processes everything locally.</p>
+    <div class="create-wrap">
 
-        <div class="upload-box">
-          <form id="uploadForm" class="stack">
-            <input id="uploadVideo" type="file" accept="video/mp4,video/quicktime,video/webm,.m4v">
-            <button ${state.importing?'disabled':''}>${state.importing?'Uploading…':'Upload video file'}</button>
+      <!-- Step 1: Import -->
+      <section class="create-step panel">
+        <div class="step-label"><span class="step-num">1</span> Import video</div>
+
+        <div class="upload-drop" id="uploadDrop">
+          <form id="uploadForm">
+            <label for="uploadVideo" class="upload-label">
+              <div class="upload-icon">⬆</div>
+              <b>${state.importing && state.uploadProgress ? `Uploading… ${state.uploadProgress}%` : 'Click to upload'}</b>
+              <small>MP4, MOV, WEBM, M4V · up to 300 MB</small>
+              <input id="uploadVideo" type="file" accept="video/mp4,video/quicktime,video/webm,.m4v" style="display:none">
+            </label>
           </form>
-          ${state.importing&&state.uploadProgress?`<div class="progress"><span style="width:${state.uploadProgress}%"></span></div><p class="muted">${state.uploadProgress}% uploaded</p>`:''}
+          ${state.importing && state.uploadProgress ? `<div class="progress upload-progress"><span style="width:${state.uploadProgress}%"></span></div>` : ''}
         </div>
 
-        <div class="divider-label">or</div>
+        <div class="divider-label">or paste a link</div>
 
         <form id="importForm" class="source-form">
-          <input id="sourceUrl" type="text" value="${esc(state.importUrl)}" placeholder="Paste YouTube URL" ${state.importing?'disabled':''}>
-          <button ${state.importing?'disabled':''}>Import</button>
+          <input id="sourceUrl" type="text" value="${esc(state.importUrl)}" placeholder="YouTube URL — youtube.com/watch?v=…" ${state.importing?'disabled':''}>
+          <button type="submit" ${state.importing?'disabled':''}>${state.importing?'…':'Import'}</button>
         </form>
 
-        <div id="importMessage" class="message ${state.importStatus?.type==='error'?'error':state.importStatus?.type==='success'?'success':''}">${state.importStatus?.text||''}</div>
+        ${state.importStatus?.text ? `<div class="import-msg ${statusType}">${esc(state.importStatus.text)}</div>` : ''}
       </section>
 
-      <section class="panel">
-        <div class="panel-head">
-          <div><span class="eyebrow">Step 2</span><h2>Select &amp; generate</h2></div>
-          ${state.selected.size?`<span class="pill ok">${state.selected.size} selected</span>`:''}
-        </div>
+      <!-- Step 2: Select & configure -->
+      <section class="create-step panel ${!hasVideos?'step-locked':''}">
+        <div class="step-label"><span class="step-num">2</span> Select &amp; configure</div>
 
-        ${videos.length ? `
-          <div class="stack">${videoCards(videos)}</div>
-          ${hasAny?`<button class="ghost danger-btn" id="clearAllVideos" style="margin-top:8px">Clear all videos &amp; clips</button>`:''}
-        ` : empty('No videos yet. Upload a file or paste a YouTube URL.')}
+        ${hasVideos ? `
+          <div class="video-list">${videoCards(videos)}</div>
+          ${allVideos.length > 1 ? `<button class="ghost danger-btn" id="clearAllVideos" style="margin-top:4px;font-size:.8rem">Remove all videos</button>` : ''}
 
-        <label class="permission" style="margin-top:16px"><input id="rightsBulk" type="checkbox"> I own these videos or have permission to reuse them.</label>
-
-        <div class="gen-options">
-          <div class="option-row">
-            <label>Clips to generate</label>
-            <select id="clipCount">
-              <option value="3">3 clips</option>
-              <option value="5">5 clips</option>
-              <option value="10">10 clips</option>
-            </select>
+          <div class="gen-options" style="margin-top:16px">
+            <div class="option-row"><label>Clips</label>
+              <select id="clipCount">
+                <option value="3">3 clips</option>
+                <option value="5">5 clips</option>
+                <option value="10">10 clips</option>
+              </select>
+            </div>
+            <div class="option-row"><label>Length</label>
+              <select id="clipLength">
+                <option value="15">15 s</option>
+                <option value="30">30 s</option>
+                <option value="45">45 s</option>
+                <option value="60">60 s</option>
+              </select>
+            </div>
+            <div class="option-row"><label>Captions</label>
+              <select id="captionStyle">
+                ${CAPTION_STYLES.map(s=>`<option value="${s}">${s.charAt(0).toUpperCase()+s.slice(1)}</option>`).join('')}
+              </select>
+            </div>
           </div>
-          <div class="option-row">
-            <label>Target length</label>
-            <select id="clipLength">
-              <option value="15">15 seconds</option>
-              <option value="30">30 seconds</option>
-              <option value="45">45 seconds</option>
-              <option value="60">60 seconds</option>
-            </select>
-          </div>
-          <div class="option-row">
-            <label>Caption style</label>
-            <select id="captionStyle">
-              ${CAPTION_STYLES.map(s=>`<option value="${s}">${s.charAt(0).toUpperCase()+s.slice(1)}</option>`).join('')}
-            </select>
-          </div>
-        </div>
 
-        <button id="processSelected" ${state.selected.size?'':'disabled'}>Generate clips with AI →</button>
+          <label class="permission" style="margin-top:12px"><input id="rightsBulk" type="checkbox"> I own or have permission to use this content.</label>
+          <button id="processSelected" style="margin-top:12px;width:100%" ${state.selected.size?'':'disabled'}>
+            Generate ${state.selected.size||''} video${state.selected.size!==1?'s':''} with AI →
+          </button>
+        ` : `
+          <div class="step-empty">
+            <p class="muted">Import a video above to continue.</p>
+          </div>
+        `}
       </section>
     </div>`;
 
   $('#importForm').addEventListener('submit', importSource);
-  $('#uploadForm').addEventListener('submit', uploadSource);
+  $('#uploadVideo').addEventListener('change', e => { if (e.target.files?.[0]) uploadSource(e); });
   $$('#create [data-select-video]').forEach(b => b.addEventListener('click', () => {
     const id = b.dataset.selectVideo;
     state.selected.has(id) ? state.selected.delete(id) : state.selected.add(id);
     renderCreate();
   }));
-  $('#processSelected').addEventListener('click', processSelected);
+  $('#processSelected')?.addEventListener('click', processSelected);
 }
 
 function videoCards(videos) {
@@ -329,8 +416,8 @@ async function importSource(e) {
 }
 
 async function uploadSource(e) {
-  e.preventDefault();
-  const file=$('#uploadVideo').files?.[0];
+  if (e.preventDefault) e.preventDefault();
+  const file=e.target?.files?.[0] || $('#uploadVideo').files?.[0];
   if (!file) { state.importStatus={type:'error',text:'Choose a video file first.'}; renderCreate(); return; }
   const ext=file.name.split('.').pop().toLowerCase();
   if (!['mp4','mov','webm','m4v'].includes(ext)) { state.importStatus={type:'error',text:'Unsupported format. Use mp4, mov, webm, or m4v.'}; renderCreate(); return; }
@@ -391,28 +478,45 @@ async function processSelected() {
 /* ── Clips ─────────────────────────────────────────────────────────── */
 function renderClips() {
   const clips=(state.library.clips||[]).filter(c=>c.outputPath&&!c.demoMode);
-  const jobs=(state.library.jobs||[]).filter(j=>!['complete','completed'].includes(j.status));
+  const allJobs=state.library.jobs||[];
+  const activeJobs=allJobs.filter(j=>['queued','running'].includes(j.status));
+  const failedJobs=allJobs.filter(j=>j.status==='failed');
 
   $('#clips').innerHTML = `
-    ${jobs.length?`<section class="panel" style="margin-bottom:16px">
-      <h2 style="margin-bottom:12px">Processing</h2>
-      ${jobs.map(jobCard).join('')}
-    </section>`:''}
-    ${clips.length
-      ? `<div class="panel-head" style="margin-bottom:12px">
-           <div><span class="eyebrow">Library</span><h2>Clips ready to post (${clips.length})</h2></div>
-           <div style="display:flex;gap:8px">
-             <button data-view-jump="create">+ New</button>
-             <button class="ghost danger-btn" id="clearAllClips">Clear all</button>
-           </div>
-         </div>
-         <div class="card-grid">${clips.map(clipCard).join('')}</div>`
-      : `<section class="panel empty-state">
-           <div class="empty-icon">▶</div>
-           <h2>No clips yet</h2>
-           <p>Upload a video and generate clips to see them here.</p>
-           <button data-view-jump="create" style="margin-top:16px">Create first clip</button>
-         </section>`}`;
+    ${activeJobs.length ? `
+      <section class="panel processing-panel" style="margin-bottom:16px">
+        <div class="panel-head" style="margin-bottom:12px">
+          <div style="display:flex;align-items:center;gap:10px">
+            <div class="processing-pulse"></div>
+            <h2>Processing ${activeJobs.length} job${activeJobs.length!==1?'s':''}…</h2>
+          </div>
+          <small class="muted">Auto-refreshing</small>
+        </div>
+        ${activeJobs.map(jobCard).join('')}
+      </section>` : ''}
+
+    ${failedJobs.length ? `
+      <section class="panel" style="margin-bottom:16px;border-color:rgba(248,113,113,.25)">
+        <h2 style="margin-bottom:12px;color:var(--danger)">Failed (${failedJobs.length})</h2>
+        ${failedJobs.map(jobCard).join('')}
+      </section>` : ''}
+
+    ${clips.length ? `
+      <div class="panel-head" style="margin-bottom:12px">
+        <h2>${clips.length} clip${clips.length!==1?'s':''} ready</h2>
+        <div style="display:flex;gap:8px">
+          <button data-view="create">+ New</button>
+          <button class="ghost danger-btn" id="clearAllClips">Clear all</button>
+        </div>
+      </div>
+      <div class="card-grid">${clips.map(clipCard).join('')}</div>`
+    : activeJobs.length ? '' : `
+      <section class="panel empty-state">
+        <div class="empty-icon">▶</div>
+        <h2>No clips yet</h2>
+        <p>Create a project to generate your first viral clips.</p>
+        <button data-view="create" style="margin-top:20px">Start creating</button>
+      </section>`}`;
 }
 
 function jobCard(j) {
@@ -993,25 +1097,52 @@ async function renderTranscript() {
 /* ── Scheduler ─────────────────────────────────────────────────────── */
 function renderScheduler() {
   const scheduled=(state.library.scheduledPosts||[]);
-  const clips=state.library.clips||[];
+  const clips=(state.library.clips||[]).filter(c=>c.outputPath&&!c.demoMode);
+
   $('#scheduler').innerHTML = `
-    <div class="panel">
-      <h2>Post schedule</h2>
-      ${scheduled.length
-        ? `<div class="schedule-list">
-             ${scheduled.map(p=>{
-               const clip=clips.find(c=>c.id===p.clipId);
-               return `<div class="schedule-item">
-                 <div><b>${esc(clip?.hook||'Clip')}</b> <span class="pill">${esc(p.platform)}</span></div>
-                 <div class="meta"><span>${new Date(p.scheduledFor).toLocaleString()}</span><span>${pill(p.status, p.status==='scheduled'?'warn':p.status==='posted'?'ok':'')}</span></div>
-               </div>`;
-             }).join('')}
-           </div>`
-        : `<div class="empty-state" style="padding:32px">
-             <div class="empty-icon">◷</div>
-             <p>No scheduled posts yet. Generate clips and schedule them from the clip detail page.</p>
-             <button data-view-jump="create">Create clips →</button>
-           </div>`}
+    <div class="scheduler-wrap">
+      ${scheduled.length ? `
+        <div class="panel-head" style="margin-bottom:14px">
+          <h2>${scheduled.length} scheduled post${scheduled.length!==1?'s':''}</h2>
+        </div>
+        <div class="schedule-list">
+          ${scheduled.map(p=>{
+            const clip=clips.find(c=>c.id===p.clipId);
+            return `<div class="schedule-item">
+              <div class="schedule-thumb">▶</div>
+              <div class="schedule-info">
+                <b>${esc(clip?.hook||'Clip')}</b>
+                <div class="meta">
+                  <span>${pill(p.platform)}</span>
+                  <span>${new Date(p.scheduledFor).toLocaleDateString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</span>
+                  ${pill(p.status, p.status==='scheduled'?'warn':p.status==='posted'?'ok':'')}
+                </div>
+              </div>
+            </div>`;
+          }).join('')}
+        </div>
+      ` : `
+        <div class="panel empty-state">
+          <div class="empty-icon">◷</div>
+          <h2>Nothing scheduled yet</h2>
+          <p>Generate clips first, then open a clip to schedule it for posting.</p>
+          ${clips.length
+            ? `<button data-view="clips" style="margin-top:20px">View your ${clips.length} clips</button>`
+            : `<button data-view="create" style="margin-top:20px">Create first clips</button>`}
+        </div>
+
+        <div class="platform-connect-panel panel" style="margin-top:16px">
+          <h3>Connect your accounts</h3>
+          <p style="margin-top:4px">Direct posting requires OAuth setup in Admin → API Configuration.</p>
+          <div class="platform-connect-list">
+            ${['TikTok','YouTube','Instagram','X / Twitter','LinkedIn'].map(p=>`
+              <div class="platform-connect-item">
+                <span>${p}</span>
+                <span class="pill">Coming soon</span>
+              </div>`).join('')}
+          </div>
+        </div>
+      `}
     </div>`;
 }
 
@@ -1319,13 +1450,14 @@ $('#forgotPassword')?.addEventListener('click', () => {
   $('#authMessage').textContent='Contact your admin to reset your password.';
 });
 
-document.getElementById('logoutBtn')?.addEventListener('click', () => {
-  localStorage.removeItem('clipforge:userId');
-  location.reload();
-});
+// Logout handled inside drawer
 
 /* ── Event delegation ─────────────────────────────────────────────── */
 document.addEventListener('click', e => {
+  // More / drawer buttons
+  if (e.target.closest('#sideMoreBtn') || e.target.closest('#topMoreBtn')) { openMenu(); return; }
+  if (e.target.closest('[data-close-drawer]')) closeMenu();
+
   const jump=e.target.closest('[data-view],[data-view-jump]');
   if (jump) { e.preventDefault(); setView(jump.dataset.view||jump.dataset.viewJump); }
 
