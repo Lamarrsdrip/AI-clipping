@@ -1,4 +1,14 @@
 /* ── ClipForge AI — 2026 Content Repurposing Studio ─────────────── */
+
+/* ── Toast notifications ─────────────────────────────────────────── */
+function showToast(msg, type='ok', duration=4000) {
+  const t = document.createElement('div');
+  t.className = `toast toast-${type}`;
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.classList.add('visible'), 10);
+  setTimeout(() => { t.classList.remove('visible'); setTimeout(() => t.remove(), 300); }, duration);
+}
 const $ = sel => document.querySelector(sel);
 const $$ = sel => [...document.querySelectorAll(sel)];
 const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -13,6 +23,19 @@ function api(path, opts = {}) {
 function empty(msg) { return `<div class="empty-state"><div class="empty-icon">✦</div><p>${esc(msg)}</p></div>`; }
 function pill(label, cls='') { return `<span class="pill ${cls}">${esc(label)}</span>`; }
 function scoreColor(n) { return n>=85?'ok':n>=70?'warn':''; }
+
+/* ── Path helper: convert absolute filesystem path → /media/… URL ─── */
+function clipUrl(outputPath) {
+  if (!outputPath) return '';
+  // If it's already a relative/absolute URL (starts with / but not /Users)
+  if (outputPath.startsWith('/') && !outputPath.startsWith('/Users')) return outputPath;
+  // Extract everything after 'storage/'
+  const idx = outputPath.indexOf('storage/');
+  if (idx !== -1) return '/media/' + outputPath.slice(idx + 'storage/'.length);
+  // Fallback: just use the filename
+  const filename = outputPath.split('/').pop();
+  return `/media/clips/${filename}`;
+}
 
 const PLATFORMS = ['TikTok','YouTube Shorts','Instagram Reels','X','LinkedIn','Facebook'];
 const CAPTION_STYLES = ['bold','hormozi','luxury','neon','minimal','karaoke'];
@@ -100,6 +123,17 @@ function renderNav() {
     $('#userAvatar').textContent = (user.name||user.email||'U')[0].toUpperCase();
     $('#userName').textContent   = user.name || user.email;
     $('#userPlan').textContent   = `${user.credits ?? 0} credits`;
+    // Credits bar in sidebar
+    const creditsEl = $('#navCreditsBar');
+    if (creditsEl) {
+      const credits = user.credits ?? 0;
+      const maxCredits = credits >= 9999 ? 9999 : 100;
+      const pct = credits >= 9999 ? 100 : Math.min(100, Math.round((credits / maxCredits) * 100));
+      creditsEl.innerHTML = `<div class="nav-credits">
+        <div class="nav-credits-bar"><div class="nav-credits-fill" style="width:${pct}%"></div></div>
+        <small>${credits >= 9999 ? 'Unlimited' : credits + ' credits left'}</small>
+      </div>`;
+    }
   }
 }
 
@@ -186,7 +220,14 @@ function setView(id) {
   if (el) el.classList.add('active');
 
   const meta = PAGE_META[id] || { eyebrow: id, title: id };
-  $('#pageEyebrow').textContent = meta.eyebrow;
+  let eyebrow = meta.eyebrow;
+  if (id === 'home') {
+    const hour = new Date().getHours();
+    const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+    const name = (state.session?.user?.name || state.session?.user?.email || '').split(' ')[0] || '';
+    eyebrow = name ? `${greeting}, ${name}` : greeting;
+  }
+  $('#pageEyebrow').textContent = eyebrow;
   $('#pageTitle').textContent   = meta.title;
   renderNav();
 
@@ -496,7 +537,9 @@ async function processSelected() {
   if (!$('#rightsBulk').checked) return alert('Confirm permission first.');
   const selected=[...state.selected];
   if (!selected.length) return alert('Select at least one video first.');
-  const btn=$('#processSelected'); btn.disabled=true; btn.textContent='Starting…';
+  const btn=$('#processSelected');
+  const origLabel=btn.textContent;
+  btn.disabled=true; btn.textContent='Processing…';
   const clipCount=Number($('#clipCount')?.value||3);
   const clipLength=Number($('#clipLength')?.value||15);
   const captionStyle=$('#captionStyle')?.value||'bold';
@@ -508,6 +551,9 @@ async function processSelected() {
   } catch(err) {
     state.importStatus={type:'error',text:err.message||'Could not start generation.'};
     await loadAll(); renderCreate();
+    // Re-enable button on failure (renderCreate re-renders the button anyway, but guard here too)
+    const b2=$('#processSelected');
+    if (b2) { b2.disabled=false; b2.textContent=origLabel; }
   }
 }
 
@@ -546,7 +592,12 @@ function renderClips() {
         </div>
       </div>
       <div class="card-grid">${clips.map(clipCard).join('')}</div>`
-    : activeJobs.length ? '' : `
+    : activeJobs.length ? `
+      <section class="panel empty-state">
+        <div class="empty-icon processing-pulse" style="display:inline-block;margin-bottom:12px"></div>
+        <h2>Generating your clips…</h2>
+        <p>This usually takes 2–5 minutes. You'll see them appear here when ready.</p>
+      </section>` : `
       <section class="panel empty-state">
         <div class="empty-icon">▶</div>
         <h2>No clips yet</h2>
@@ -580,9 +631,10 @@ function jobCard(j) {
 
 function clipCard(c) {
   const dur2=Math.round((c.endSeconds||0)-(c.startSeconds||0));
+  const mediaUrl=clipUrl(c.outputPath);
   const preview=c.thumbnailPath
     ?`<img src="${c.thumbnailPath}" alt="Clip thumbnail" loading="lazy">`
-    :`<video src="${c.outputPath}" muted playsinline preload="none"></video>`;
+    :`<video src="${mediaUrl}" muted playsinline preload="none"></video>`;
   return `<article class="clip-card" data-open-clip="${c.id}">
     <div class="clip-preview">${preview}<span class="pill ${scoreColor(c.score)}">${c.score}/100</span><span class="clip-dur">${dur2}s</span></div>
     <div class="clip-body">
@@ -594,7 +646,7 @@ function clipCard(c) {
       </div>
       <div class="actions">
         <button data-open-clip="${c.id}">View</button>
-        <a class="button ghost" href="${c.outputPath}" download="clip-${c.id}.mp4">Download</a>
+        <a class="clip-dl-btn button ghost" href="${mediaUrl}" download="clip-${c.id}.mp4">↓ Download</a>
         <button class="ghost danger-btn" data-delete-clip="${c.id}">Delete</button>
       </div>
     </div>
@@ -617,7 +669,7 @@ function renderClipDetail() {
       <!-- Left: video + scores -->
       <section class="panel stack">
         <div class="phone-frame">
-          ${c.outputPath?`<video src="${c.outputPath}" controls poster="${c.thumbnailPath||''}" playsinline></video>`:`<div class="demo-frame">${esc(c.hook)}</div>`}
+          ${c.outputPath?`<video src="${clipUrl(c.outputPath)}" controls poster="${c.thumbnailPath||''}" playsinline></video>`:`<div class="demo-frame">${esc(c.hook)}</div>`}
         </div>
         <div class="score-panel">
           <div class="big-score ${scoreColor(c.score)}">${c.score}<small>/100</small></div>
@@ -630,7 +682,7 @@ function renderClipDetail() {
           <span>${esc(c.reason||'educational')}</span>
           <span>Style: ${esc(c.captionStyle||'bold')}</span>
         </div>
-        <a class="button" href="${c.outputPath}" download="clip-${c.id}.mp4" style="text-align:center">⬇ Download clip</a>
+        <a class="button" href="${clipUrl(c.outputPath)}" download="clip-${c.id}.mp4" style="text-align:center">⬇ Download clip</a>
         ${thumbOptions.length?`
           <div>
             <h4 style="margin-bottom:8px">Thumbnail options</h4>
@@ -1945,7 +1997,7 @@ document.addEventListener('click', e => {
   }
 
   const copy=e.target.closest('[data-copy]');
-  if (copy) navigator.clipboard?.writeText(decodeURIComponent(copy.dataset.copy));
+  if (copy) { navigator.clipboard?.writeText(decodeURIComponent(copy.dataset.copy)); showToast('Copied to clipboard', 'ok', 2000); }
 
   const retryJob=e.target.closest('[data-retry-job]');
   if (retryJob) api('/api/job',{method:'PATCH',body:JSON.stringify({jobId:retryJob.dataset.retryJob,action:'retry'})}).then(loadAll).then(()=>setView('clips'));
@@ -1982,16 +2034,40 @@ document.addEventListener('click', e => {
 });
 
 /* ── Auto-refresh active jobs ─────────────────────────────────────── */
+const _refresh = { startedAt: 0, lastProgressAt: 0, timer: null };
 function scheduleRefresh() {
-  const activeJobs=(state.library.jobs||[]).filter(j=>['queued','running'].includes(j.status));
+  if (_refresh.timer) { clearTimeout(_refresh.timer); _refresh.timer = null; }
+  const now = Date.now();
+  if (!_refresh.startedAt) _refresh.startedAt = now;
+
+  const activeJobs = (state.library.jobs||[]).filter(j=>['queued','running'].includes(j.status));
   if (activeJobs.length) {
-    setTimeout(async()=>{
+    // Track progress to detect stalls
+    _refresh.lastProgressAt = now;
+    _refresh.timer = setTimeout(async () => {
+      const prevJobIds = new Set((state.library.jobs||[]).filter(j=>['queued','running'].includes(j.status)).map(j=>j.id));
       await loadAll();
       if (['clips','home'].includes(state.view)) setView(state.view);
+      // Detect newly-completed jobs and show toast
+      const nowActive = new Set((state.library.jobs||[]).filter(j=>['queued','running'].includes(j.status)).map(j=>j.id));
+      const completedCount = [...prevJobIds].filter(id=>!nowActive.has(id)).length;
+      if (completedCount > 0) {
+        showToast(`${completedCount} clip${completedCount!==1?'s':''} finished! Check your library.`, 'ok');
+      }
       scheduleRefresh();
     }, 3000);
   } else {
-    setTimeout(scheduleRefresh, 8000);
+    // No active jobs — poll slowly, but stop after 30 min of no progress
+    const elapsed = now - (_refresh.lastProgressAt || _refresh.startedAt);
+    if (elapsed > 30 * 60 * 1000) {
+      // 30 minutes with no active jobs — stop polling to save battery
+      _refresh.startedAt = 0;
+      return;
+    }
+    _refresh.timer = setTimeout(async () => {
+      await loadAll();
+      scheduleRefresh();
+    }, 10000);
   }
 }
 
@@ -2024,5 +2100,24 @@ async function boot() {
     console.error('Boot render error:', e);
   }
 }
+
+/* ── Keyboard shortcuts ───────────────────────────────────────────── */
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+  if (e.key === 'n') { e.preventDefault(); setView('create'); }
+  if (e.key === 'h') setView('home');
+  if (e.key === 'Escape') {
+    const drawer = document.querySelector('.menu-drawer.open');
+    if (drawer) { closeMenu(); return; }
+    setView('home');
+  }
+  if (e.key === '/') {
+    e.preventDefault();
+    if (state.view === 'create') {
+      const urlInput = $('#sourceUrl');
+      if (urlInput) { urlInput.focus(); urlInput.select(); }
+    }
+  }
+});
 
 boot();

@@ -4,14 +4,25 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#080812">
-    <title>ClipForge AI</title>
+    <meta name="description" content="ClipForge AI — Turn long videos into viral short clips with AI. Auto-captions, face tracking, and one-click export for TikTok, Reels, and Shorts.">
+    <meta name="robots" content="noindex">
+    <meta property="og:title" content="ClipForge AI — Viral Clip Generator">
+    <meta property="og:description" content="AI-powered clip generator. Paste a YouTube link, get viral short-form clips in minutes.">
+    <meta property="og:type" content="website">
+    <title>ClipForge AI — Viral Clip Generator</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/styles.css">
+    <!-- Preload critical assets -->
+    <link rel="preload" href="/app.js" as="script">
   </head>
   <body>
 
     <!-- ── Auth ── -->
     <section id="authShell" class="auth-shell">
       <div class="auth-glow"></div>
+      <div class="auth-ambient-1"></div>
+      <div class="auth-ambient-2"></div>
       <form id="authForm" class="auth-card">
         <div class="brand">
           <div class="brand-icon">⚡</div>
@@ -30,6 +41,11 @@
           <button type="button" class="text-btn" id="forgotPassword">Forgot password?</button>
         </div>
         <div id="authMessage" class="message error"></div>
+        <div class="auth-feature-list">
+          <div class="auth-feature">⚡ AI finds viral moments automatically</div>
+          <div class="auth-feature">◎ Face tracking &amp; smart reframing</div>
+          <div class="auth-feature">▶ Word-level karaoke captions</div>
+        </div>
       </form>
     </section>
 
@@ -47,6 +63,7 @@
           <span class="more-btn-icon">≡</span>
           <span>More</span>
         </button>
+        <div id="navCreditsBar"></div>
         <div class="user-box">
           <div class="user-avatar" id="userAvatar">U</div>
           <div class="user-info">
@@ -64,6 +81,7 @@
             <h1 id="pageTitle">Dashboard</h1>
           </div>
           <div class="top-actions">
+            <button class="ghost" data-view="create" style="font-size:.82rem;padding:8px 14px">+ New clip</button>
             <button class="icon-btn" id="topMoreBtn" title="Menu">≡</button>
           </div>
         </header>
