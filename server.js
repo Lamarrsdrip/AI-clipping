@@ -2616,24 +2616,86 @@ async function suggestBrollKeywords(db, transcript, title) {
   }
 }
 
-async function generateFacelessScript(db, topic, style, targetSeconds = 45) {
+async function generateFacelessScript(db, topic, opts = {}) {
+  const {
+    style = 'documentary', targetSeconds = 45, tone = 'mysterious',
+    language = 'English', platform = 'TikTok', hookStrength = 8,
+    audienceType = 'general', ctaType = 'follow', storytellingMode = 'revelation'
+  } = opts;
   const styleGuides = {
     documentary: 'Cinematic documentary narration, mysterious, factual, authoritative',
-    motivation: 'High-energy motivational, direct, punchy sentences, calls to action',
-    finance: 'Professional financial analysis, data-driven, confident, expert tone',
-    crypto: 'Crypto-native, alpha-focused, community language, bullish energy',
-    education: 'Clear educational breakdown, step-by-step, relatable examples',
-    comedy: 'Absurdist humor, self-aware, gen-Z energy, meme references',
-    luxury: 'Premium lifestyle, aspirational, exclusive tone, elite perspective',
-    horror: 'Dark, suspenseful, slow burn reveal, chilling delivery'
+    motivation:  'High-energy motivational, direct, punchy sentences, calls to action',
+    finance:     'Professional financial analysis, data-driven, confident, expert tone',
+    crypto:      'Crypto-native, alpha-focused, community language, bullish energy',
+    education:   'Clear educational breakdown, step-by-step, relatable examples',
+    comedy:      'Absurdist humor, self-aware, gen-Z energy, meme references',
+    luxury:      'Premium lifestyle, aspirational, exclusive tone, elite perspective',
+    horror:      'Dark, suspenseful, slow burn reveal, chilling delivery',
+    ai:          'Tech-forward, mind-expanding, future-focused, awe-inspiring',
+    history:     'Epic historical drama, vivid storytelling, dramatic reveals',
+    crime:       'True-crime thriller, tense, suspenseful, detail-obsessed',
+    health:      'Empathetic, science-backed, actionable, credible expert voice',
+    business:    'Sharp entrepreneurial insight, tactical, results-oriented',
+    space:       'Cosmic wonder, scientific awe, scale-bending perspective'
+  };
+  const ctaMap = {
+    follow:     'Follow for more content like this',
+    comment:    'Comment your thoughts below',
+    share:      'Share this with someone who needs to see it',
+    link:       'Check the link in bio for more',
+    subscribe:  'Subscribe so you never miss a drop',
+    save:       'Save this for later'
   };
   const guide = styleGuides[style] || styleGuides.documentary;
+  const ctaText = ctaMap[ctaType] || ctaMap.follow;
+  const wordsPerSecond = 2.5;
+  const targetWords = Math.round(targetSeconds * wordsPerSecond);
   try {
     const result = await aiChat(db, {
       purpose: 'faceless video script',
       messages: [
-        { role: 'system', content: 'You write viral faceless video scripts. Return only JSON.' },
-        { role: 'user', content: `Create a ${targetSeconds}-second faceless short video script.\nTopic: "${topic}"\nStyle: ${guide}\n\nThe script should:\n- Open with an INSANE hook in the first 3 seconds\n- Build curiosity or tension through the middle\n- End with a powerful payoff or CTA\n- Be exactly ${targetSeconds} seconds when spoken at normal pace (~2.5 words/second)\n\nReturn: {"title":"","hook":"opening line (first 3 seconds)","script":"full narration text","scenes":[{"timestamp":"0-5s","narration":"","visualDirection":"what to show on screen","brollQuery":"stock footage search term"}],"voiceStyle":"calm|energetic|mysterious|authoritative|conversational","backgroundMusic":"genre and energy: e.g. dark ambient, upbeat electronic","wordCount":number,"estimatedSeconds":number,"captions":["line 1","line 2","line 3"]}` }
+        { role: 'system', content: 'You are an elite viral content strategist who writes faceless short-form video scripts optimized for TikTok, YouTube Shorts, and Instagram Reels algorithm virality. You ONLY respond with valid JSON, no markdown, no explanation.' },
+        { role: 'user', content: `Create a complete ${targetSeconds}-second faceless video script package.
+
+Topic: "${topic}"
+Style: ${guide}
+Tone: ${tone}
+Platform: ${platform}
+Language: ${language}
+Hook Strength: ${hookStrength}/10 (${hookStrength>=8?'ultra-viral aggressive opener':hookStrength>=6?'strong curiosity hook':'moderate hook'})
+Audience: ${audienceType}
+Storytelling Mode: ${storytellingMode}
+CTA: "${ctaText}"
+Target word count: ~${targetWords} words (spoken at 2.5 words/second)
+
+Return this exact JSON structure (no markdown fences):
+{
+  "title": "viral video title",
+  "hook": "opening line — first 3 seconds, must stop the scroll",
+  "script": "full narration text — all ${targetWords} words",
+  "scenes": [
+    {
+      "timestamp": "0-5s",
+      "narration": "exact words spoken",
+      "visualDirection": "specific visual description — what camera/shot to use",
+      "brollQuery": "stock footage search term",
+      "imagePrompt": "AI image generation prompt for this scene (Midjourney/DALL-E style)",
+      "videoPrompt": "AI video generation prompt for this scene (Sora/Kling style)"
+    }
+  ],
+  "voiceStyle": "calm|energetic|mysterious|authoritative|conversational|dramatic",
+  "backgroundMusic": "specific genre + energy description",
+  "brollKeywords": ["keyword1","keyword2","keyword3","keyword4","keyword5","keyword6"],
+  "captions": ["caption line 1","caption line 2","caption line 3","caption line 4","caption line 5"],
+  "thumbnailTitle": "text overlay for thumbnail — max 6 words, all caps",
+  "thumbnailPrompt": "AI image prompt for the thumbnail — ultra specific cinematic description",
+  "seoTitle": "SEO-optimized video title with keywords",
+  "description": "full video description with natural keyword integration, 80-120 words",
+  "hashtags": ["#hashtag1","#hashtag2","#hashtag3","#hashtag4","#hashtag5","#hashtag6","#hashtag7","#hashtag8","#hashtag9","#hashtag10","#hashtag11","#hashtag12"],
+  "cta": "the specific call to action line used at the end",
+  "wordCount": ${targetWords},
+  "estimatedSeconds": ${targetSeconds}
+}` }
       ]
     });
     const parsed = extractJsonObject(result.content) || {};
@@ -2953,7 +3015,17 @@ async function handleApi(req, res, pathname) {
       const body = await readJson(req);
       if (!body.topic) throw new Error('Topic is required.');
       const db = loadDb();
-      const result = await generateFacelessScript(db, String(body.topic), String(body.style || 'documentary'), Number(body.duration || 45));
+      const result = await generateFacelessScript(db, String(body.topic), {
+        style:           String(body.style || 'documentary'),
+        targetSeconds:   Number(body.duration || 45),
+        tone:            String(body.tone || 'mysterious'),
+        language:        String(body.language || 'English'),
+        platform:        String(body.platform || 'TikTok'),
+        hookStrength:    Number(body.hookStrength || 8),
+        audienceType:    String(body.audienceType || 'general'),
+        ctaType:         String(body.ctaType || 'follow'),
+        storytellingMode:String(body.storytellingMode || 'revelation')
+      });
       if (result.ok) {
         if (!Array.isArray(db.studioGenerations)) db.studioGenerations = [];
         db.studioGenerations.unshift({ id: randomUUID(), type: 'faceless_script', topic: body.topic, style: body.style, result, createdAt: new Date().toISOString() });

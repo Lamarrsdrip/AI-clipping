@@ -35,6 +35,14 @@ const state = {
   facelessStyle: 'documentary',
   facelessTopic: '',
   facelessResult: null,
+  facelessLoading: false,
+  // Dedicated faceless page state
+  fl: {
+    topic: '', style: 'documentary', duration: 45,
+    tone: 'mysterious', language: 'English', platform: 'TikTok',
+    hookStrength: 8, audienceType: 'general', ctaType: 'follow',
+    storytellingMode: 'revelation', result: null, loading: false
+  },
   studioStatus: null,
   studioModels: [],
   generatorMode: 't2v',
@@ -61,10 +69,11 @@ const NAV = [
 ];
 
 const MENU_ITEMS = [
-  { id:'studio',     icon:'⚡', label:'AI Studio',       desc:'B-roll, faceless, thumbnails' },
-  { id:'transcript', icon:'◑', label:'Transcripts',      desc:'Full video transcripts' },
-  { id:'billing',    icon:'◇', label:'Credits & Billing',desc:'Plans and usage' },
-  { id:'settings',   icon:'⚙', label:'Settings',         desc:'Profile and preferences' }
+  { id:'faceless',   icon:'◈', label:'Faceless Content', desc:'AI scripts for faceless videos' },
+  { id:'studio',     icon:'⚡', label:'AI Studio',        desc:'B-roll, thumbnails, AI video' },
+  { id:'transcript', icon:'◑', label:'Transcripts',       desc:'Full video transcripts' },
+  { id:'billing',    icon:'◇', label:'Credits & Billing', desc:'Plans and usage' },
+  { id:'settings',   icon:'⚙', label:'Settings',          desc:'Profile and preferences' }
 ];
 const MENU_ITEMS_ADMIN = [
   { id:'admin', icon:'◈', label:'Admin panel', desc:'Users, logs, API keys' }
@@ -153,16 +162,17 @@ function closeMenu() {
 
 /* ── setView ─────────────────────────────────────────────────────── */
 const PAGE_META = {
-  home:       { eyebrow:'Overview',      title:'Dashboard'      },
-  create:     { eyebrow:'New project',   title:'Create clips'   },
-  clips:      { eyebrow:'Library',       title:'Your clips'     },
-  clipDetail: { eyebrow:'Clip detail',   title:'Clip'           },
-  scheduler:  { eyebrow:'Publishing',    title:'Schedule'       },
-  studio:     { eyebrow:'AI tools',      title:'AI Studio'      },
-  transcript: { eyebrow:'AI tools',      title:'Transcript'     },
-  billing:    { eyebrow:'Account',       title:'Credits'        },
-  settings:   { eyebrow:'Account',       title:'Settings'       },
-  admin:      { eyebrow:'Admin',         title:'Admin panel'    }
+  home:       { eyebrow:'Overview',        title:'Dashboard'        },
+  create:     { eyebrow:'New project',     title:'Create clips'     },
+  clips:      { eyebrow:'Library',         title:'Your clips'       },
+  clipDetail: { eyebrow:'Clip detail',     title:'Clip'             },
+  faceless:   { eyebrow:'AI Content',      title:'Faceless Studio'  },
+  scheduler:  { eyebrow:'Publishing',      title:'Schedule'         },
+  studio:     { eyebrow:'AI tools',        title:'AI Studio'        },
+  transcript: { eyebrow:'AI tools',        title:'Transcript'       },
+  billing:    { eyebrow:'Account',         title:'Credits'          },
+  settings:   { eyebrow:'Account',         title:'Settings'         },
+  admin:      { eyebrow:'Admin',           title:'Admin panel'      }
 };
 
 function setView(id) {
@@ -184,6 +194,7 @@ function setView(id) {
   if (id === 'create')     renderCreate();
   if (id === 'clips')      renderClips();
   if (id === 'clipDetail') renderClipDetail();
+  if (id === 'faceless')   renderFaceless();
   if (id === 'studio')     renderStudio();
   if (id === 'transcript') renderTranscript();
   if (id === 'billing')    renderBilling();
@@ -933,6 +944,319 @@ async function runAiGenerator(e) {
     state.generatorResult = { error: err.message };
     state.generatorRunning = false;
     renderStudio();
+  }
+}
+
+/* ── Faceless Studio (dedicated page) ────────────────────────────── */
+const FL_STYLES = [
+  {v:'documentary',l:'Documentary'},{v:'motivation',l:'Motivation'},{v:'finance',l:'Finance'},
+  {v:'crypto',l:'Crypto'},{v:'education',l:'Education'},{v:'comedy',l:'Comedy'},
+  {v:'luxury',l:'Luxury'},{v:'horror',l:'Horror'},{v:'ai',l:'AI & Tech'},
+  {v:'history',l:'History'},{v:'crime',l:'True Crime'},{v:'health',l:'Health'},
+  {v:'business',l:'Business'},{v:'space',l:'Space'}
+];
+const FL_TONES = ['mysterious','energetic','calm','authoritative','conversational','dramatic','inspirational','urgent'];
+const FL_PLATFORMS = ['TikTok','YouTube Shorts','Instagram Reels'];
+const FL_DURATIONS = [{v:15,l:'15s'},{v:30,l:'30s'},{v:45,l:'45s'},{v:60,l:'60s'},{v:90,l:'90s'}];
+const FL_LANGUAGES = ['English','Spanish','French','Portuguese','German','Arabic','Hindi','Japanese'];
+const FL_AUDIENCES = [
+  {v:'general',l:'General'},{v:'18-24',l:'18-24 Gen Z'},{v:'25-35',l:'25-35 Millennials'},
+  {v:'entrepreneurs',l:'Entrepreneurs'},{v:'students',l:'Students'},{v:'investors',l:'Investors'},
+  {v:'fitness',l:'Fitness'},{v:'parents',l:'Parents'}
+];
+const FL_CTAS = [
+  {v:'follow',l:'Follow for more'},{v:'comment',l:'Comment below'},{v:'share',l:'Share this'},
+  {v:'link',l:'Link in bio'},{v:'subscribe',l:'Subscribe'},{v:'save',l:'Save for later'}
+];
+const FL_MODES = [
+  {v:'revelation',l:'Revelation'},{v:'countdown',l:'Countdown'},{v:'story',l:'Storytelling'},
+  {v:'tutorial',l:'Tutorial'},{v:'debate',l:'Debate'},{v:'mystery',l:'Mystery'}
+];
+
+function renderFaceless() {
+  const f = state.fl;
+  const res = f.result;
+  const loading = f.loading;
+
+  $('#faceless').innerHTML = `
+    <div class="fl-wrap">
+      <div class="fl-form-col">
+        <div class="fl-form-head">
+          <div class="fl-badge">AI Content Generator</div>
+          <p>Type a topic. AI writes a complete viral script, scene directions, prompts, SEO copy, and hashtags — ready to produce.</p>
+        </div>
+        <form id="flForm" class="fl-form">
+          <div class="fl-field">
+            <label class="fl-label">Topic <span class="fl-req">*</span></label>
+            <input id="flTopic" class="fl-input" type="text" placeholder="e.g. Why Bitcoin will hit $1M this cycle" value="${esc(f.topic)}" required autocomplete="off">
+          </div>
+
+          <div class="fl-row2">
+            <div class="fl-field">
+              <label class="fl-label">Style</label>
+              <select id="flStyle" class="fl-select">
+                ${FL_STYLES.map(s=>`<option value="${s.v}" ${f.style===s.v?'selected':''}>${s.l}</option>`).join('')}
+              </select>
+            </div>
+            <div class="fl-field">
+              <label class="fl-label">Duration</label>
+              <select id="flDuration" class="fl-select">
+                ${FL_DURATIONS.map(d=>`<option value="${d.v}" ${f.duration==d.v?'selected':''}>${d.l}</option>`).join('')}
+              </select>
+            </div>
+          </div>
+
+          <div class="fl-row2">
+            <div class="fl-field">
+              <label class="fl-label">Platform</label>
+              <select id="flPlatform" class="fl-select">
+                ${FL_PLATFORMS.map(p=>`<option value="${p}" ${f.platform===p?'selected':''}>${p}</option>`).join('')}
+              </select>
+            </div>
+            <div class="fl-field">
+              <label class="fl-label">Tone</label>
+              <select id="flTone" class="fl-select">
+                ${FL_TONES.map(t=>`<option value="${t}" ${f.tone===t?'selected':''}>${t.charAt(0).toUpperCase()+t.slice(1)}</option>`).join('')}
+              </select>
+            </div>
+          </div>
+
+          <div class="fl-row2">
+            <div class="fl-field">
+              <label class="fl-label">Language</label>
+              <select id="flLanguage" class="fl-select">
+                ${FL_LANGUAGES.map(l=>`<option value="${l}" ${f.language===l?'selected':''}>${l}</option>`).join('')}
+              </select>
+            </div>
+            <div class="fl-field">
+              <label class="fl-label">Audience</label>
+              <select id="flAudience" class="fl-select">
+                ${FL_AUDIENCES.map(a=>`<option value="${a.v}" ${f.audienceType===a.v?'selected':''}>${a.l}</option>`).join('')}
+              </select>
+            </div>
+          </div>
+
+          <div class="fl-row2">
+            <div class="fl-field">
+              <label class="fl-label">Storytelling Mode</label>
+              <select id="flMode" class="fl-select">
+                ${FL_MODES.map(m=>`<option value="${m.v}" ${f.storytellingMode===m.v?'selected':''}>${m.l}</option>`).join('')}
+              </select>
+            </div>
+            <div class="fl-field">
+              <label class="fl-label">CTA Type</label>
+              <select id="flCta" class="fl-select">
+                ${FL_CTAS.map(c=>`<option value="${c.v}" ${f.ctaType===c.v?'selected':''}>${c.l}</option>`).join('')}
+              </select>
+            </div>
+          </div>
+
+          <div class="fl-field">
+            <label class="fl-label">Hook Strength: <b id="flHookVal">${f.hookStrength}</b>/10</label>
+            <input id="flHook" type="range" min="1" max="10" value="${f.hookStrength}" class="fl-range">
+            <div class="fl-range-labels"><span>Subtle</span><span>Balanced</span><span>Ultra-viral</span></div>
+          </div>
+
+          <button type="submit" class="fl-submit ${loading?'loading':''}" ${loading?'disabled':''}>
+            ${loading?'<span class="fl-spinner"></span> Generating script…':'Generate script'}
+          </button>
+        </form>
+
+        <div class="fl-coming">
+          <div class="fl-coming-title">Coming soon</div>
+          <div class="fl-coming-grid">
+            <div class="fl-coming-item">🎙 AI Voiceover</div>
+            <div class="fl-coming-item">💋 Lip Sync</div>
+            <div class="fl-coming-item">🎨 AI Images</div>
+            <div class="fl-coming-item">🎬 AI Video</div>
+            <div class="fl-coming-item">🎞 B-roll Auto</div>
+            <div class="fl-coming-item">🌐 Caption Translation</div>
+            <div class="fl-coming-item">📲 Social Posting</div>
+            <div class="fl-coming-item">📊 A/B Testing</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="fl-output-col">
+        ${loading ? `
+          <div class="fl-generating">
+            <div class="fl-gen-spinner"></div>
+            <p>AI is writing your script…</p>
+            <small>Takes 10-30 seconds</small>
+          </div>
+        ` : res ? renderFacelessOutput(res) : `
+          <div class="fl-empty">
+            <div class="fl-empty-icon">◈</div>
+            <h3>Your script will appear here</h3>
+            <p>Fill in your topic and preferences, then click Generate to get a complete viral script package.</p>
+          </div>
+        `}
+      </div>
+    </div>`;
+
+  $('#flHook')?.addEventListener('input', e => { $('#flHookVal').textContent = e.target.value; });
+  $('#flForm')?.addEventListener('submit', submitFaceless);
+  $('#flCopyAll')?.addEventListener('click', () => {
+    if (!f.result) return;
+    const r = f.result;
+    const all = [
+      `TITLE: ${r.title||''}`,
+      `\nHOOK:\n${r.hook||''}`,
+      `\nFULL SCRIPT:\n${r.script||''}`,
+      r.scenes?.length ? `\nSCENES:\n${r.scenes.map(s=>`[${s.timestamp}]\nNarration: ${s.narration}\nVisual: ${s.visualDirection}\nB-roll: ${s.brollQuery}\nImage prompt: ${s.imagePrompt||''}\nVideo prompt: ${s.videoPrompt||''}`).join('\n\n')}` : '',
+      r.brollKeywords?.length ? `\nB-ROLL KEYWORDS:\n${r.brollKeywords.join(', ')}` : '',
+      r.thumbnailTitle ? `\nTHUMBNAIL TITLE:\n${r.thumbnailTitle}` : '',
+      r.thumbnailPrompt ? `\nTHUMBNAIL PROMPT:\n${r.thumbnailPrompt}` : '',
+      r.seoTitle ? `\nSEO TITLE:\n${r.seoTitle}` : '',
+      r.description ? `\nDESCRIPTION:\n${r.description}` : '',
+      r.hashtags?.length ? `\nHASHTAGS:\n${r.hashtags.join(' ')}` : '',
+      r.cta ? `\nCTA:\n${r.cta}` : '',
+      r.captions?.length ? `\nCAPTIONS:\n${r.captions.join('\n')}` : '',
+    ].filter(Boolean).join('\n');
+    navigator.clipboard?.writeText(all).then(() => {
+      const btn = $('#flCopyAll'); const orig = btn.textContent; btn.textContent = 'Copied all!';
+      setTimeout(() => { btn.textContent = orig; }, 1800);
+    });
+  });
+}
+
+function renderFacelessOutput(res) {
+  if (!res.ok) return `<div class="fl-error"><div class="fl-err-icon">⚠</div><p>${esc(res.error || 'Generation failed. Check your API key in Admin settings.')}</p><button data-view="admin" class="ghost" style="margin-top:12px">Open Admin settings</button></div>`;
+
+  const copyBtn = (text, label='Copy') =>
+    `<button class="fl-copy-btn ghost" data-copy="${encodeURIComponent(text||'')}">${label}</button>`;
+
+  const section = (title, content, extraBtn='') => `
+    <div class="fl-section">
+      <div class="fl-section-head">
+        <span class="fl-section-title">${title}</span>
+        <div class="fl-section-actions">${extraBtn}${copyBtn(content)}</div>
+      </div>
+      <div class="fl-section-body">${content}</div>
+    </div>`;
+
+  const blockSection = (title, textContent) =>
+    section(title, textContent, '');
+
+  const scenes = (res.scenes||[]).map((s,i) => `
+    <div class="fl-scene">
+      <div class="fl-scene-ts">${esc(s.timestamp||`Scene ${i+1}`)}</div>
+      <div class="fl-scene-narr">${esc(s.narration||'')}</div>
+      <div class="fl-scene-details">
+        <div class="fl-scene-row"><span class="fl-scene-label">Visual</span><span>${esc(s.visualDirection||'')}</span></div>
+        <div class="fl-scene-row"><span class="fl-scene-label">B-roll</span><span>${esc(s.brollQuery||'')}</span></div>
+        ${s.imagePrompt?`<div class="fl-scene-row"><span class="fl-scene-label">Image prompt</span><span>${esc(s.imagePrompt)}</span>${copyBtn(s.imagePrompt,'Copy')}</div>`:''}
+        ${s.videoPrompt?`<div class="fl-scene-row"><span class="fl-scene-label">Video prompt</span><span>${esc(s.videoPrompt)}</span>${copyBtn(s.videoPrompt,'Copy')}</div>`:''}
+      </div>
+    </div>`).join('');
+
+  const hashtagStr = (res.hashtags||[]).join(' ');
+  const captionStr = (res.captions||[]).join('\n');
+  const brollStr = (res.brollKeywords||[]).join(', ');
+
+  return `<div class="fl-output">
+    <div class="fl-output-header">
+      <div>
+        <div class="fl-output-title">${esc(res.title||'Generated Script')}</div>
+        <div class="fl-output-meta">
+          ${res.estimatedSeconds?`<span>${res.estimatedSeconds}s</span>`:''}
+          ${res.voiceStyle?`<span>Voice: ${esc(res.voiceStyle)}</span>`:''}
+          ${res.wordCount?`<span>${res.wordCount} words</span>`:''}
+        </div>
+      </div>
+      <button id="flCopyAll" class="fl-copy-all-btn">Copy all</button>
+    </div>
+
+    <div class="fl-section fl-hook-section">
+      <div class="fl-section-head">
+        <span class="fl-section-title">Hook — First 3 seconds</span>
+        ${copyBtn(res.hook||'')}
+      </div>
+      <div class="fl-hook-text">"${esc(res.hook||'')}"</div>
+    </div>
+
+    ${blockSection('Full Script', res.script||'')}
+
+    <div class="fl-section">
+      <div class="fl-section-head">
+        <span class="fl-section-title">Scene Breakdown (${(res.scenes||[]).length} scenes)</span>
+        ${copyBtn((res.scenes||[]).map(s=>`[${s.timestamp}] ${s.narration} | Visual: ${s.visualDirection} | B-roll: ${s.brollQuery}`).join('\n'))}
+      </div>
+      <div class="fl-scenes">${scenes||'<p class="muted">No scenes generated.</p>'}</div>
+    </div>
+
+    ${res.brollKeywords?.length ? `
+    <div class="fl-section">
+      <div class="fl-section-head">
+        <span class="fl-section-title">B-roll Keywords</span>
+        ${copyBtn(brollStr)}
+      </div>
+      <div class="fl-chips">${(res.brollKeywords||[]).map(k=>`<span class="fl-chip" data-copy="${encodeURIComponent(k)}">${esc(k)}</span>`).join('')}</div>
+    </div>` : ''}
+
+    ${res.thumbnailTitle ? blockSection('Thumbnail Title', res.thumbnailTitle) : ''}
+    ${res.thumbnailPrompt ? blockSection('Thumbnail Image Prompt', res.thumbnailPrompt) : ''}
+    ${res.seoTitle ? blockSection('SEO Title', res.seoTitle) : ''}
+    ${res.description ? blockSection('Video Description', res.description) : ''}
+
+    ${res.hashtags?.length ? `
+    <div class="fl-section">
+      <div class="fl-section-head">
+        <span class="fl-section-title">Hashtags (${(res.hashtags||[]).length})</span>
+        ${copyBtn(hashtagStr)}
+      </div>
+      <div class="fl-chips">${(res.hashtags||[]).map(h=>`<span class="fl-chip tag" data-copy="${encodeURIComponent(h)}">${esc(h)}</span>`).join('')}</div>
+    </div>` : ''}
+
+    ${res.cta ? blockSection('Call to Action', res.cta) : ''}
+
+    ${res.captions?.length ? `
+    <div class="fl-section">
+      <div class="fl-section-head">
+        <span class="fl-section-title">Caption Lines</span>
+        ${copyBtn(captionStr)}
+      </div>
+      <div class="fl-caption-list">${(res.captions||[]).map(c=>`<div class="fl-caption-line">${esc(c)}</div>`).join('')}</div>
+    </div>` : ''}
+
+    ${res.backgroundMusic ? `
+    <div class="fl-section fl-music">
+      <span class="fl-section-title">Background Music</span>
+      <span class="fl-music-val">${esc(res.backgroundMusic)}</span>
+    </div>` : ''}
+  </div>`;
+}
+
+async function submitFaceless(e) {
+  e.preventDefault();
+  const f = state.fl;
+  f.topic = $('#flTopic')?.value?.trim() || '';
+  f.style = $('#flStyle')?.value || 'documentary';
+  f.duration = Number($('#flDuration')?.value || 45);
+  f.platform = $('#flPlatform')?.value || 'TikTok';
+  f.tone = $('#flTone')?.value || 'mysterious';
+  f.language = $('#flLanguage')?.value || 'English';
+  f.audienceType = $('#flAudience')?.value || 'general';
+  f.storytellingMode = $('#flMode')?.value || 'revelation';
+  f.ctaType = $('#flCta')?.value || 'follow';
+  f.hookStrength = Number($('#flHook')?.value || 8);
+  if (!f.topic) return;
+  f.result = null;
+  f.loading = true;
+  renderFaceless();
+  try {
+    const res = await api('/api/faceless/generate', { method:'POST', body: JSON.stringify({
+      topic: f.topic, style: f.style, duration: f.duration,
+      tone: f.tone, language: f.language, platform: f.platform,
+      hookStrength: f.hookStrength, audienceType: f.audienceType,
+      ctaType: f.ctaType, storytellingMode: f.storytellingMode
+    })});
+    f.result = res;
+  } catch(err) {
+    f.result = { ok: false, error: err.message };
+  } finally {
+    f.loading = false;
+    renderFaceless();
   }
 }
 
