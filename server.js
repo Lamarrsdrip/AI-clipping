@@ -1282,7 +1282,7 @@ async function transcribeAudioWithWhisper(db, mediaPath, videoId) {
     const fileName = 'audio.mp3';
     const modelName = provider === 'openai' ? 'whisper-1' : 'whisper-1';
     const part1 = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: audio/mpeg\r\n\r\n`);
-    const part2 = Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${modelName}\r\n--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\nverbose_json\r\n--${boundary}\r\nContent-Disposition: form-data; name="timestamp_granularities[]"\r\n\r\nword\r\n--${boundary}\r\nContent-Disposition: form-data; name="timestamp_granularities[]"\r\n\r\nsegment\r\n--${boundary}--\r\n`);
+    const part2 = Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${modelName}\r\n--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\nverbose_json\r\n--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nen\r\n--${boundary}\r\nContent-Disposition: form-data; name="timestamp_granularities[]"\r\n\r\nword\r\n--${boundary}\r\nContent-Disposition: form-data; name="timestamp_granularities[]"\r\n\r\nsegment\r\n--${boundary}--\r\n`);
     const body = Buffer.concat([part1, audioBytes, part2]);
     const whisperEndpoint = provider === 'openai' ? 'https://api.openai.com/v1/audio/transcriptions' : 'https://api.openai.com/v1/audio/transcriptions';
     const controller = new AbortController();
@@ -1453,70 +1453,70 @@ const ASS_PRESETS = {
   hormozi: {
     name:'Hormozi', font:'Arial Black', size:92, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&H99000000&',
-    outlineW:4, shadow:4, borderStyle:1, alignment:2, marginV:200, marginLR:70,
+    outlineW:4, shadow:4, borderStyle:1, alignment:2, marginV:260, marginLR:70,
     highlight:'&H0000FFFF&', context:'&H90FFFFFF&',
     phraseSize:3, uppercase:true, spacing:1, fad:'60,40',
   },
   mrbeast: {
     name:'MrBeast', font:'Impact', size:100, bold:0, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H000060FF&', outline:'&H00000000&', back:'&H88000000&',
-    outlineW:5, shadow:5, borderStyle:1, alignment:2, marginV:180, marginLR:55,
+    outlineW:5, shadow:5, borderStyle:1, alignment:2, marginV:250, marginLR:55,
     highlight:'&H000060FF&', context:'&H80FFFFFF&',
     phraseSize:3, uppercase:true, spacing:2, fad:'50,30',
   },
   podcast: {
     name:'Podcast', font:'Arial', size:68, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&HCC000000&',
-    outlineW:2, shadow:3, borderStyle:4, alignment:2, marginV:140, marginLR:90,
+    outlineW:2, shadow:3, borderStyle:4, alignment:2, marginV:230, marginLR:90,
     highlight:'&H0000FFFF&', context:'&H99FFFFFF&',
     phraseSize:6, uppercase:false, spacing:0, fad:'40,30',
   },
   minimal: {
     name:'Minimal', font:'Arial', size:58, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H00FFFFFF&', outline:'&H00000000&', back:'&H00000000&',
-    outlineW:3, shadow:3, borderStyle:1, alignment:2, marginV:120, marginLR:110,
+    outlineW:3, shadow:3, borderStyle:1, alignment:2, marginV:210, marginLR:110,
     highlight:'&H00FFFFFF&', context:'&H88FFFFFF&',
     phraseSize:6, uppercase:false, spacing:0, fad:'35,25',
   },
   luxury: {
     name:'Luxury', font:'Georgia', size:62, bold:0, italic:0,
     primary:'&H00E8E8E8&', secondary:'&H0000D7FF&', outline:'&H00000000&', back:'&H00000000&',
-    outlineW:2, shadow:3, borderStyle:1, alignment:2, marginV:150, marginLR:95,
+    outlineW:2, shadow:3, borderStyle:1, alignment:2, marginV:240, marginLR:95,
     highlight:'&H0000D7FF&', context:'&H80E8E8E8&',
     phraseSize:5, uppercase:false, spacing:2, fad:'70,50',
   },
   finance: {
     name:'Finance', font:'Arial', size:64, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H00FF7800&', outline:'&H00050505&', back:'&H99000000&',
-    outlineW:3, shadow:3, borderStyle:1, alignment:2, marginV:140, marginLR:90,
+    outlineW:3, shadow:3, borderStyle:1, alignment:2, marginV:230, marginLR:90,
     highlight:'&H00FF7800&', context:'&H88FFFFFF&',
     phraseSize:5, uppercase:false, spacing:0, fad:'45,30',
   },
   tiktok: {
     name:'TikTok', font:'Arial Black', size:86, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&H00000000&',
-    outlineW:4, shadow:4, borderStyle:1, alignment:2, marginV:180, marginLR:65,
+    outlineW:4, shadow:4, borderStyle:1, alignment:2, marginV:260, marginLR:65,
     highlight:'&H0000FFFF&', context:'&H80FFFFFF&',
     phraseSize:4, uppercase:true, spacing:1, fad:'45,30',
   },
   instagram: {
     name:'Instagram', font:'Arial', size:70, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H00FF7800&', outline:'&H00000000&', back:'&HCC000000&',
-    outlineW:2, shadow:3, borderStyle:4, alignment:2, marginV:155, marginLR:75,
+    outlineW:2, shadow:3, borderStyle:4, alignment:2, marginV:245, marginLR:75,
     highlight:'&H00FF7800&', context:'&H88FFFFFF&',
     phraseSize:5, uppercase:false, spacing:0, fad:'50,35',
   },
   bold: {
     name:'Bold', font:'Arial Black', size:84, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&H99000000&',
-    outlineW:4, shadow:4, borderStyle:1, alignment:2, marginV:170, marginLR:75,
+    outlineW:4, shadow:4, borderStyle:1, alignment:2, marginV:250, marginLR:75,
     highlight:'&H0000FFFF&', context:'&H80FFFFFF&',
     phraseSize:4, uppercase:true, spacing:0, fad:'55,35',
   },
   karaoke: {
     name:'Karaoke', font:'Arial Black', size:78, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&HDD000000&',
-    outlineW:2, shadow:2, borderStyle:4, alignment:2, marginV:160, marginLR:80,
+    outlineW:2, shadow:2, borderStyle:4, alignment:2, marginV:250, marginLR:80,
     highlight:'&H0000FFFF&', context:'&HBBFFFFFF&',
     phraseSize:5, uppercase:false, spacing:0, fad:'40,25',
   },
@@ -1546,6 +1546,13 @@ function buildASSFile(words, clipStart, clipEnd, presetName, W=1080, H=1920) {
       re:   Math.min(dur, w.end - clipStart),
     }))
     .filter(w => w.re > w.rs + 0.01 && w.word.trim());
+
+  // Enforce strictly non-overlapping timing to prevent caption duplication
+  for (let i = 0; i < cw.length - 1; i++) {
+    if (cw[i].re > cw[i + 1].rs) {
+      cw[i].re = Math.max(cw[i].rs + 0.01, cw[i + 1].rs - 0.001);
+    }
+  }
 
   const header = `[Script Info]
 ScriptType: v4.00+
@@ -1589,12 +1596,24 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   return header + events.join('\n') + '\n';
 }
 
+// ─── Transcript post-processing ──────────────────────────────────
+function cleanTranscriptText(text) {
+  if (!text) return text;
+  // Remove consecutive duplicate words (case-insensitive), e.g. "the the" → "the"
+  let cleaned = text.replace(/\b(\w+)(\s+\1)+\b/gi, '$1');
+  // Collapse repeated filler words (uh, um, ah) to a single instance
+  cleaned = cleaned.replace(/\b(uh|um|ah|er|hmm)(\s+\1)+\b/gi, '$1');
+  // Collapse multiple spaces
+  cleaned = cleaned.replace(/\s{2,}/g, ' ').trim();
+  return cleaned;
+}
+
 // ─── Word timing helpers ──────────────────────────────────────────
 function estimateWordTimings(segments, clipStart, clipEnd) {
   const words = [];
   for (const seg of (segments || [])) {
     if (!seg.text || seg.end <= clipStart || seg.start >= clipEnd) continue;
-    const ws = seg.text.trim().split(/\s+/).filter(Boolean);
+    const ws = cleanTranscriptText(seg.text).trim().split(/\s+/).filter(Boolean);
     if (!ws.length) continue;
     const s = Math.max(seg.start, clipStart);
     const e = Math.min(seg.end, clipEnd);
@@ -1876,7 +1895,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   }
   // Fallback: estimate from moment text if still empty
   if (!wordTimings.length && moment.text) {
-    const words = moment.text.split(/\s+/).filter(Boolean);
+    const words = cleanTranscriptText(moment.text).split(/\s+/).filter(Boolean);
     const dur   = moment.end - moment.start;
     const wd    = dur / Math.max(1, words.length);
     wordTimings = words.map((w, i) => ({ word:w, start:moment.start+i*wd, end:moment.start+(i+1)*wd }));
@@ -2305,9 +2324,15 @@ function publicUser(user) {
   return safe;
 }
 
-function requireAdmin(req, db) {
+function requireUser(req, db) {
   const user = currentUser(req, db);
-  if (user.role !== 'admin') throw new Error('Admin access required.');
+  if (!user) throw Object.assign(new Error('Authentication required.'), { status: 401 });
+  return user;
+}
+
+function requireAdmin(req, db) {
+  const user = requireUser(req, db);
+  if (user.role !== 'admin') throw Object.assign(new Error('Admin access required.'), { status: 403 });
   return user;
 }
 
@@ -3170,7 +3195,38 @@ async function handleApi(req, res, pathname) {
       if (!Array.isArray(db.socialAccounts)) db.socialAccounts = [];
       if (!Array.isArray(db.transcriptions)) db.transcriptions = [];
       if (!Array.isArray(db.studioGenerations)) db.studioGenerations = [];
-      return json(res, 200, db);
+      const user = requireUser(req, db);
+      const isAdmin = user.role === 'admin';
+      // Scope all collections to the requesting user (admins see everything)
+      const myVideos = isAdmin ? db.videos : db.videos.filter(v => v.userId === user.id || v.createdBy === user.id);
+      const myVideoIds = new Set(myVideos.map(v => v.id));
+      const myClips = isAdmin ? db.clips : db.clips.filter(c => c.userId === user.id || c.createdBy === user.id || myVideoIds.has(c.videoId));
+      const myJobs = isAdmin ? db.jobs : db.jobs.filter(j => j.userId === user.id || j.createdBy === user.id || myVideoIds.has(j.videoId));
+      const myProjects = isAdmin ? db.projects : db.projects.filter(p => p.userId === user.id || p.createdBy === user.id);
+      const mySocialAccounts = isAdmin ? db.socialAccounts : db.socialAccounts.filter(a => a.userId === user.id);
+      const myScheduledPosts = isAdmin ? db.scheduledPosts : db.scheduledPosts.filter(p => {
+        const clip = db.clips.find(c => c.id === p.clipId);
+        return clip && (clip.userId === user.id || clip.createdBy === user.id || myVideoIds.has(clip.videoId));
+      });
+      const myTranscriptions = isAdmin ? db.transcriptions : db.transcriptions.filter(t => myVideoIds.has(t.videoId));
+      const myStudioGenerations = isAdmin ? db.studioGenerations : db.studioGenerations.filter(g => g.userId === user.id);
+      const scopedDb = {
+        ...db,
+        videos: myVideos,
+        clips: myClips,
+        jobs: myJobs,
+        projects: myProjects,
+        socialAccounts: mySocialAccounts,
+        scheduledPosts: myScheduledPosts,
+        transcriptions: myTranscriptions,
+        studioGenerations: myStudioGenerations,
+        // Strip other users' data from sensitive collections
+        users: [db.users.find(u => u.id === user.id)].filter(Boolean),
+        subscriptions: isAdmin ? db.subscriptions : db.subscriptions.filter(s => s.userId === user.id),
+        creditTransactions: isAdmin ? db.creditTransactions : db.creditTransactions.filter(t => t.userId === user.id),
+        paymentRequests: isAdmin ? db.paymentRequests : db.paymentRequests.filter(p => p.userId === user.id),
+      };
+      return json(res, 200, scopedDb);
     }
     if (pathname === '/api/transcript' && req.method === 'GET') {
       const videoId = new URL(req.url, `http://${req.headers.host}`).searchParams.get('videoId');
@@ -3803,7 +3859,8 @@ async function handleApi(req, res, pathname) {
     }
     return json(res, 404, { error: 'Not found' });
   } catch (error) {
-    return json(res, 400, { error: error.message });
+    const httpStatus = error.status || 400;
+    return json(res, httpStatus, { error: error.message });
   }
 }
 
