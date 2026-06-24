@@ -47,6 +47,7 @@ const MAX_RSS_MB = Number(process.env.MAX_RSS_MB || 420);
 const RENDER_WIDTH = Number(process.env.RENDER_WIDTH || 720);
 const RENDER_HEIGHT = Number(process.env.RENDER_HEIGHT || 1280);
 const importAttempts = new Map();
+const importUserAttempts = new Map(); // userId → [timestamps] for rate-limiting by user
 const ytdlpBlock = { until: 0, reason: '' };
 let activeRenderJobs = 0;
 const renderQueue = [];
@@ -445,6 +446,8 @@ function assertMemoryAvailable() {
   }
 }
 
+const JOB_RUNNING_MAX_MS = Number(process.env.JOB_RUNNING_MAX_MS || 30 * 60 * 1000); // 30 minutes hard cap for running jobs
+
 function recoverStaleJobs(reason = 'startup') {
   const db = loadDb();
   const now = Date.now();
@@ -453,11 +456,20 @@ function recoverStaleJobs(reason = 'startup') {
     if (!['queued', 'running'].includes(job.status)) continue;
     const last = Date.parse(job.updatedAt || job.createdAt || 0) || 0;
     const created = Date.parse(job.createdAt || 0) || last;
-    if (now - last > JOB_STALE_MS || now - created > PROCESS_TIMEOUT_MS + JOB_STALE_MS) {
+    const startedAt = Date.parse(job.startedAt || 0) || created;
+    // A queued/running job that hasn't been updated in JOB_STALE_MS is stale
+    const isStaleByUpdate = now - last > JOB_STALE_MS;
+    // A running job that has been running for > 30 minutes is definitely stuck
+    const isStaleByRuntime = job.status === 'running' && now - startedAt > JOB_RUNNING_MAX_MS;
+    // A job created longer ago than PROCESS_TIMEOUT_MS + JOB_STALE_MS with no activity
+    const isStaleByCreation = now - created > PROCESS_TIMEOUT_MS + JOB_STALE_MS;
+    if (isStaleByUpdate || isStaleByRuntime || isStaleByCreation) {
       job.status = 'failed';
       job.progress = 100;
       job.stage = 'failed';
-      job.error = `Job stopped responding after restart or timeout. Start a retry.`;
+      job.error = isStaleByRuntime
+        ? `Job exceeded the 30-minute time limit and was automatically stopped. Start a retry.`
+        : `Job stopped responding after restart or timeout. Start a retry.`;
       job.updatedAt = new Date().toISOString();
       job.recoveredBy = reason;
       changed += 1;
@@ -2082,7 +2094,8 @@ function completeJobWithClips(jobId, videoId, clipRows) {
   freshJob.updatedAt = new Date().toISOString();
   freshJob.steps = processingSteps(freshJob.stage, freshJob.progress);
   freshVideo.status = 'complete';
-  fresh.clips.unshift(...clipRows.map(clip => ({ ...clip, jobId, videoId, status: 'ready' })));
+  const clipUserId = freshJob.userId || freshVideo.userId || freshVideo.createdBy || '';
+  fresh.clips.unshift(...clipRows.map(clip => ({ ...clip, jobId, videoId, userId: clipUserId, status: 'ready' })));
   const watch = fresh.watchedChannels.find(item => item.id === freshVideo.watchedChannelId);
   if (watch?.autoSchedule && watch.platforms?.length) {
     let minuteOffset = 30;
@@ -2157,8 +2170,14 @@ function createQueuedProcessingJob(payload) {
   const { videoId, rightsConfirmed, fairUseMode, transformationNote } = payload;
   if (!rightsConfirmed) throw new Error('Confirm that you own this video or have permission to reuse it before processing.');
   const db = loadDb();
-  const user = db.users[0];
-  const video = db.videos.find(item => item.id === videoId);
+  // Use the userId from payload (set by the route handler), falling back to the video owner or first admin
+  const requestingUserId = payload.userId;
+  const db2video = db.videos.find(item => item.id === videoId);
+  const user = (requestingUserId && db.users.find(u => u.id === requestingUserId))
+    || (db2video && db.users.find(u => u.id === (db2video.userId || db2video.createdBy)))
+    || db.users.find(u => u.role === 'admin')
+    || db.users[0];
+  const video = db2video;
   if (!video) throw new Error('Video not found.');
   const existingJob = db.jobs.find(item => item.videoId === videoId && ['queued', 'running'].includes(item.status));
   if (existingJob) return { ...existingJob, duplicate: true };
@@ -2216,7 +2235,7 @@ async function processVideo(payload) {
   if (!job) {
     job = {
       id: randomUUID(),
-      userId: user.id,
+      userId: jobOwner.id,
       videoId,
       createdAt: new Date().toISOString()
     };
@@ -3143,6 +3162,16 @@ async function handleApi(req, res, pathname) {
       const body = await readJson(req);
       const db = loadDb();
       const user = requireUser(req, db);
+      // Rate-limit: max 10 import requests per user per 60 seconds
+      const importRateWindow = 60 * 1000;
+      const importRateMax = 10;
+      const now = Date.now();
+      const userImportTimes = (importUserAttempts.get(user.id) || []).filter(t => now - t < importRateWindow);
+      if (userImportTimes.length >= importRateMax) {
+        throw Object.assign(new Error('Too many import requests. Please wait 60 seconds before importing again.'), { status: 429 });
+      }
+      userImportTimes.push(now);
+      importUserAttempts.set(user.id, userImportTimes);
       return json(res, 200, await importSource(body.sourceUrl || '', user.id));
     }
     if (pathname === '/api/upload' && req.method === 'POST') {
@@ -3481,13 +3510,32 @@ async function handleApi(req, res, pathname) {
       saveDb(db);
       return json(res, 200, { plan: plan.id, credits: db.users[idx]?.credits });
     }
+    if (pathname === '/api/credits/status') {
+      const db = loadDb();
+      const user = requireUser(req, db);
+      const plan = db.billingPlans.find(p => p.id === user.plan) || db.billingPlans.find(p => p.id === (user.plan || '').toLowerCase()) || db.billingPlans[0];
+      const txns = db.creditTransactions.filter(t => t.userId === user.id).slice(0, 5);
+      return json(res, 200, { credits: user.credits, plan: plan.name, planId: plan.id, recent: txns });
+    }
     if (pathname === '/api/process' && req.method === 'POST') {
       const body = await readJson(req);
-      const job = createQueuedProcessingJob(body);
+      const db = loadDb();
+      const user = requireUser(req, db);
+      // Check clip count warning for the user's plan
+      const { plan } = subscriptionFor(db, user.id);
+      const now = new Date();
+      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+      const completedThisMonth = db.jobs.filter(j =>
+        j.userId === user.id && j.status === 'complete' &&
+        j.updatedAt && j.updatedAt >= monthStart
+      ).length;
+      const planMonthlyLimit = (plan.maxClipsPerVideo || 3) * 10; // 10 videos worth per month as soft cap
+      const atLimit = completedThisMonth >= planMonthlyLimit;
+      const job = createQueuedProcessingJob({ ...body, userId: user.id });
       if (job.duplicate) return json(res, 202, { queued: true, duplicate: true, jobId: job.id, queueDepth: renderQueue.length, activeRenderJobs });
-      const jobPromise = enqueueRenderJob({ ...body, jobId: job.id });
+      const jobPromise = enqueueRenderJob({ ...body, userId: user.id, jobId: job.id });
       jobPromise.catch(error => console.error('[job:background-failed]', String(error.message || error).slice(0, 2000)));
-      return json(res, 202, { queued: true, jobId: job.id, queueDepth: renderQueue.length, activeRenderJobs });
+      return json(res, 202, { queued: true, jobId: job.id, queueDepth: renderQueue.length, activeRenderJobs, warning: atLimit ? `You have processed ${completedThisMonth} jobs this month. Consider upgrading your plan for more capacity.` : null });
     }
     if (pathname === '/api/job' && req.method === 'PATCH') {
       const body = await readJson(req);
@@ -3525,17 +3573,31 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/video' && req.method === 'DELETE') {
       const body = await readJson(req);
       const db = loadDb();
+      const user = requireUser(req, db);
       const video = db.videos.find(v => v.id === body.videoId);
       if (!video) throw new Error('Video not found.');
+      // Only the video owner or an admin can delete
+      if (user.role !== 'admin' && video.userId !== user.id && video.createdBy !== user.id) {
+        throw Object.assign(new Error('You do not have permission to delete this video.'), { status: 403 });
+      }
       killActiveJobProcesses(video.id);
       // Delete source file from disk
       if (video.storagePath) unlinkQuiet(video.storagePath);
       // Delete all clips and their files that belong to this video
       const videoClips = db.clips.filter(c => c.videoId === video.id);
+      const deletedClipIds = new Set(videoClips.map(c => c.id));
       for (const clip of videoClips) {
         if (clip.outputPath) unlinkQuiet(path.join(STORAGE_DIR, 'clips', path.basename(clip.outputPath)));
         if (clip.thumbnailPath) unlinkQuiet(path.join(STORAGE_DIR, 'thumbs', path.basename(clip.thumbnailPath)));
+        // Also remove thumbnail options files
+        if (Array.isArray(clip.thumbnailOptions)) {
+          for (const opt of clip.thumbnailOptions) {
+            if (opt.path) unlinkQuiet(path.join(STORAGE_DIR, opt.path.replace('/media/', '')));
+          }
+        }
       }
+      // Delete scheduled posts linked to these clips
+      db.scheduledPosts = (db.scheduledPosts || []).filter(p => !deletedClipIds.has(p.clipId));
       // Remove from db
       db.clips = db.clips.filter(c => c.videoId !== video.id);
       db.jobs = db.jobs.filter(j => j.videoId !== video.id);
@@ -3543,6 +3605,33 @@ async function handleApi(req, res, pathname) {
       db.projects = db.projects.filter(p => db.videos.some(v => v.projectId === p.id));
       saveDb(db);
       return json(res, 200, { deleted: true });
+    }
+    if (pathname === '/api/clip/download' && req.method === 'GET') {
+      // Authenticated clip download — checks ownership before serving
+      const clipId = new URL(req.url, `http://${req.headers.host}`).searchParams.get('clipId');
+      const db = loadDb();
+      const user = requireUser(req, db);
+      const clip = db.clips.find(c => c.id === clipId);
+      if (!clip) return json(res, 404, { error: 'Clip not found.' });
+      // Only the clip owner or an admin can download via this route
+      if (user.role !== 'admin' && clip.userId !== user.id && clip.createdBy !== user.id) {
+        // Also allow if the clip belongs to a video owned by the user
+        const video = db.videos.find(v => v.id === clip.videoId);
+        const videoOwnedByUser = video && (video.userId === user.id || video.createdBy === user.id);
+        if (!videoOwnedByUser) {
+          throw Object.assign(new Error('You do not have permission to download this clip.'), { status: 403 });
+        }
+      }
+      if (!clip.outputPath) return json(res, 404, { error: 'Clip file path not found.' });
+      const clipFile = path.join(STORAGE_DIR, 'clips', path.basename(clip.outputPath));
+      if (!existsSync(clipFile)) return json(res, 404, { error: 'Clip file not found on disk.' });
+      res.writeHead(200, {
+        'content-type': 'video/mp4',
+        'content-length': statSync(clipFile).size,
+        'content-disposition': `attachment; filename="${path.basename(clipFile)}"`,
+        'cache-control': 'no-store'
+      });
+      return res.end(readFileSync(clipFile));
     }
     if (pathname === '/api/clip' && req.method === 'DELETE') {
       const body = await readJson(req);
