@@ -14,3 +14,9 @@ yarn-error.log*
 *.local
 screenshots/*
 !screenshots/.gitkeep
+storage/thumbnails/*
+storage/thumbs/*
+storage/uploads/*
+!storage/thumbnails/.gitkeep
+!storage/thumbs/.gitkeep
+!storage/uploads/.gitkeep
