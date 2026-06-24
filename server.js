@@ -1544,6 +1544,63 @@ const ASS_PRESETS = {
     highlight:'&H0000FFFF&', context:'&HBBFFFFFF&',
     phraseSize:5, uppercase:false, spacing:0, fad:'40,25',
   },
+  // ── 2026 Elite Viral Styles ──────────────────────────────────────────
+  viral: {
+    name:'Viral', font:'Arial Black', size:96, bold:-1, italic:0,
+    primary:'&H00FFFFFF&', secondary:'&H0014F0FF&', outline:'&H00000000&', back:'&H00000000&',
+    outlineW:5, shadow:6, borderStyle:1, alignment:2, marginV:270, marginLR:60,
+    highlight:'&H0014F0FF&', context:'&H70FFFFFF&',
+    phraseSize:3, uppercase:true, spacing:2, fad:'55,35',
+  },
+  neon: {
+    name:'Neon', font:'Arial Black', size:82, bold:-1, italic:0,
+    primary:'&H00CCFFEE&', secondary:'&H0000FF99&', outline:'&H00003320&', back:'&H00000000&',
+    outlineW:4, shadow:5, borderStyle:1, alignment:2, marginV:255, marginLR:70,
+    highlight:'&H0000FF99&', context:'&H88CCFFEE&',
+    phraseSize:4, uppercase:true, spacing:1, fad:'50,30',
+  },
+  fire: {
+    name:'Fire', font:'Arial Black', size:88, bold:-1, italic:0,
+    primary:'&H00FFFFFF&', secondary:'&H000078FF&', outline:'&H00000000&', back:'&H00000000&',
+    outlineW:4, shadow:5, borderStyle:1, alignment:2, marginV:260, marginLR:65,
+    highlight:'&H000078FF&', context:'&H80FFFFFF&',
+    phraseSize:4, uppercase:true, spacing:1, fad:'50,30',
+  },
+  cinema: {
+    name:'Cinema', font:'Georgia', size:56, bold:0, italic:1,
+    primary:'&H00F5F0E0&', secondary:'&H00D4AF37&', outline:'&H00000000&', back:'&HCC000000&',
+    outlineW:2, shadow:2, borderStyle:4, alignment:8, marginV:200, marginLR:100,
+    highlight:'&H00D4AF37&', context:'&H99F5F0E0&',
+    phraseSize:7, uppercase:false, spacing:0, fad:'80,60',
+  },
+  hype: {
+    name:'Hype', font:'Impact', size:112, bold:0, italic:0,
+    primary:'&H00FFFFFF&', secondary:'&H0000EEFF&', outline:'&H00000000&', back:'&H00000000&',
+    outlineW:6, shadow:7, borderStyle:1, alignment:2, marginV:280, marginLR:50,
+    highlight:'&H0000EEFF&', context:'&H60FFFFFF&',
+    phraseSize:2, uppercase:true, spacing:3, fad:'45,25',
+  },
+  reels: {
+    name:'Reels', font:'Arial', size:72, bold:-1, italic:0,
+    primary:'&H00FFFFFF&', secondary:'&H00FF6EB4&', outline:'&H00000000&', back:'&HAA000000&',
+    outlineW:3, shadow:3, borderStyle:4, alignment:2, marginV:248, marginLR:80,
+    highlight:'&H00FF6EB4&', context:'&H90FFFFFF&',
+    phraseSize:5, uppercase:false, spacing:0, fad:'60,40',
+  },
+  faceless: {
+    name:'Faceless', font:'Arial', size:64, bold:-1, italic:0,
+    primary:'&H00FFFFFF&', secondary:'&H0099AAFF&', outline:'&H00000000&', back:'&HBB000000&',
+    outlineW:2, shadow:3, borderStyle:4, alignment:2, marginV:235, marginLR:95,
+    highlight:'&H0099AAFF&', context:'&H88FFFFFF&',
+    phraseSize:6, uppercase:false, spacing:0, fad:'50,40',
+  },
+  kids: {
+    name:'Kids', font:'Arial Rounded MT Bold', size:90, bold:-1, italic:0,
+    primary:'&H00FFFFFF&', secondary:'&H0000EECC&', outline:'&H00220011&', back:'&H00000000&',
+    outlineW:5, shadow:4, borderStyle:1, alignment:2, marginV:265, marginLR:60,
+    highlight:'&H0000EECC&', context:'&H80FFEECC&',
+    phraseSize:4, uppercase:false, spacing:1, fad:'70,50',
+  },
 };
 
 function assTime(s) {
@@ -2208,14 +2265,16 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   // Helpers for building filter strings from pfObj
   const assInject = hasASS ? `,ass='${assPath}'` : '';
   const assSuffix = hasASS ? `;[_vout_pre]ass='${assPath}'[vout]` : '';
+  // Quality enhancement: sharpen + subtle contrast/saturation lift for premium look
+  const qualityF = ',unsharp=5:5:0.7:3:3:0.3,eq=contrast=1.04:saturation=1.10:brightness=0.01';
 
   // Build a crop+scale filter for a specific static X (used in EDL segments)
   function segFillFilter(cropX) {
-    return `crop=${pfObj.cropW}:${pfObj.cropH}:${cropX}:0,scale=${RW}:${RH}:flags=lanczos,setsar=1`;
+    return `crop=${pfObj.cropW}:${pfObj.cropH}:${cropX}:0,scale=${RW}:${RH}:flags=lanczos,setsar=1${qualityF}`;
   }
   function segBlurFilter(cropX) {
     return {
-      fg: `crop=${pfObj.cropW}:${pfObj.cropH}:${cropX}:0,scale=${RW}:${pfObj.scaledH}:flags=lanczos,setsar=1`,
+      fg: `crop=${pfObj.cropW}:${pfObj.cropH}:${cropX}:0,scale=${RW}:${pfObj.scaledH}:flags=lanczos,setsar=1${qualityF}`,
       bg: pfObj.bgFilter,
     };
   }
@@ -2278,22 +2337,20 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
 
     if (pfObj.portraitFill) {
       filterComplex =
-        `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,${pfObj.portraitFill}${assInject}[vout];` +
+        `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,${pfObj.portraitFill}${qualityF}${assInject}[vout];` +
         `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
     } else if (pfObj.type === 'fill') {
-      // Dynamic: crop=CW:CH:x='EXPR':y=0:eval=frame,scale,setsar
       filterComplex =
         `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,` +
         `crop=${pfObj.cropW}:${pfObj.cropH}:x='${xExpr}':y=0:eval=frame,` +
-        `scale=${RW}:${RH}:flags=lanczos,setsar=1${assInject}[vout];` +
+        `scale=${RW}:${RH}:flags=lanczos,setsar=1${qualityF}${assInject}[vout];` +
         `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
     } else {
-      // Dynamic blurred: split → bg (static blur) + fg (dynamic crop) → overlay
       filterComplex =
         `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,split[_dvbg][_dvfg];` +
         `[_dvbg]${pfObj.bgFilter}[_dbbg];` +
         `[_dvfg]crop=${pfObj.cropW}:${pfObj.cropH}:x='${xExpr}':y=0:eval=frame,` +
-        `scale=${RW}:${pfObj.scaledH}:flags=lanczos,setsar=1[_dbfg];` +
+        `scale=${RW}:${pfObj.scaledH}:flags=lanczos,setsar=1${qualityF}[_dbfg];` +
         `[_dbbg][_dbfg]overlay=x=0:y=(H-h)/2${assInject}[vout];` +
         `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
     }
@@ -3047,34 +3104,40 @@ async function detectViralMoments(db, video, segments, options = {}) {
     const result = await aiChat(db, {
       purpose: 'viral moment detection',
       messages: [
-        { role: 'system', content: `You are an elite viral video editor who has mastered OpusClip, CapCut, Submagic, Captions.ai, and Klap. You think like a professional TikTok editor: you find the exact moment that stops scrollers, builds tension, and delivers a payoff. You select clips that prioritize: (1) a powerful opening hook in the FIRST 3 seconds, (2) one clear emotional peak, (3) a satisfying ending. Return only valid JSON.` },
-        { role: 'user', content: `Analyze this transcript and find the ${desiredCount} highest-potential viral clips.
+        { role: 'system', content: `You are a world-class viral video editor — the best in the industry. You have cracked the code on what makes content blow up on TikTok, YouTube Shorts, Instagram Reels, and X. You think frame-by-frame like a director, word-by-word like a copywriter, and platform-by-platform like a growth hacker. Your job: identify the EXACT moments that will stop scrollers cold, force an emotional reaction, and get shared. You know that: (1) the first 3 seconds decide everything — a weak open is a dead clip; (2) the best clips have ONE clear emotional arc — a setup, a turn, and a payoff; (3) energy and authenticity beat production quality; (4) controversy and surprise generate comments; (5) actionable value earns saves and shares. Return only valid JSON.` },
+        { role: 'user', content: `Analyze this transcript and identify the ${desiredCount} highest-potential viral clips.
 
 Video: "${video.title}"
-Duration: ${video.durationSeconds || 0}s
-Target length per clip: ${desiredLength}s (hard max 60s)
+Total duration: ${video.durationSeconds || 0}s
+Target clip length: ${desiredLength}s (absolute max: 62s)
 
-RULES:
-- The clip MUST open with a statement that stops a scroll in 3 seconds
-- Prefer moments with: surprise reveals, emotional reactions, laugh moments, argument peaks, shocking statistics, personal confessions, pattern interrupts
-- Never start a clip mid-sentence — always at a natural speech boundary
-- Never cut off before the payoff/resolution
+SELECTION RULES:
+1. Opening line MUST hook within 3 seconds — pattern interrupt, shocking fact, strong opinion, or story setup
+2. Prioritize moments with: jaw-dropping reveals, emotional peaks, laugh moments, heated arguments, shocking stats, vulnerable confessions, contrarian takes, "you won't believe this" structures
+3. NEVER start mid-sentence — always at a clean sentence boundary
+4. NEVER cut before the punchline, resolution, or payoff
+5. Avoid filler, transitions ("so anyway..."), or meandering sections
+6. Pick diverse moment types if possible — don't select 3 identical clips
+
+RETENTION PREDICTION:
+- retentionScore (1-10): Would viewers watch 80%+ of this clip to the end?
+- dropoffRisk: "low|medium|high" — risk of viewers leaving before the payoff
 
 Transcript (timestamps in seconds):
 ${transcript}
 
-Score each moment:
-- hookStrength (1-10): Does the opening sentence stop a scroll?
-- emotionalPunch (1-10): Does it trigger a strong emotion?
-- voiceEnergy (1-10): Is the speaker energetic/passionate here?
-- controversy (1-10): Will people debate/comment?
-- usefulness (1-10): Does it deliver actionable value?
-- storytelling (1-10): Does it have arc (tension + payoff)?
-- shareability (1-10): Will viewers send it to friends?
-- overallScore (1-100): Weighted viral potential
+Score each moment on these 1-10 dimensions:
+- hookStrength: Does the OPENING LINE stop a scroll cold?
+- emotionalPunch: Emotion intensity (anger/joy/shock/sadness/inspiration)
+- voiceEnergy: Speaker energy level and passion
+- controversy: Comment-bait potential — will people argue?
+- usefulness: Actionable value viewers can apply immediately
+- storytelling: Tension + turn + payoff arc quality
+- shareability: "I need to send this to someone" factor
+- overallScore (1-100): Weighted viral potential score
 
-Return exactly:
-{"moments":[{"start":number,"end":number,"overallScore":number,"hookStrength":number,"emotionalPunch":number,"voiceEnergy":number,"controversy":number,"usefulness":number,"storytelling":number,"shareability":number,"reason":"laugh|revelation|shock|emotion|value|argument|reaction|story","rationale":"Why a human TikTok editor would pick this exact moment","hooks":{"curiosity":"hook under 96 chars","shock":"hook under 96 chars","value":"hook under 96 chars","story":"hook under 96 chars","controversy":"hook under 96 chars","sales":"hook under 96 chars"},"brollKeywords":["keyword1","keyword2","keyword3","keyword4"],"bestPlatform":"TikTok|Instagram Reels|YouTube Shorts|X|LinkedIn","captionStyle":"hormozi|karaoke|minimal|luxury|tiktok|podcast"}]}` }
+Return exactly this JSON (no extra fields, no markdown):
+{"moments":[{"start":number,"end":number,"overallScore":number,"hookStrength":number,"emotionalPunch":number,"voiceEnergy":number,"controversy":number,"usefulness":number,"storytelling":number,"shareability":number,"retentionScore":number,"dropoffRisk":"low|medium|high","reason":"laugh|revelation|shock|emotion|value|argument|reaction|story|inspiration|confession","rationale":"2-3 sentences: why a top TikTok editor would cut this exact moment, what makes it viral","hooks":{"curiosity":"hook under 96 chars that creates open loop","shock":"hook under 96 chars, pattern interrupt","value":"hook under 96 chars, clear immediate benefit","story":"hook under 96 chars, personal story opener","controversy":"hook under 96 chars, bold contrarian take","sales":"hook under 96 chars, benefit + urgency"},"brollKeywords":["keyword1","keyword2","keyword3","keyword4","keyword5","keyword6"],"bestPlatform":"TikTok|Instagram Reels|YouTube Shorts|X|LinkedIn","captionStyle":"hormozi|mrbeast|karaoke|tiktok|viral|neon|fire|hype|reels|podcast|minimal|luxury|finance|bold","contentWarning":"none|mild|mature"}]}` }
       ]
     });
     const parsed = extractJsonObject(result.content);
@@ -3108,9 +3171,12 @@ Return exactly:
           },
           brollKeywords: Array.isArray(item.brollKeywords) ? item.brollKeywords.slice(0, 8) : [],
           bestPlatform: item.bestPlatform || 'TikTok',
-          captionStyle: item.captionStyle || 'hormozi',
+          captionStyle: item.captionStyle || 'viral',
           framingMode: options.framingMode || 'dynamic',
           rationale: item.rationale || 'AI-selected viral moment.',
+          retentionScore: Number(item.retentionScore || 7),
+          dropoffRisk: item.dropoffRisk || 'medium',
+          contentWarning: item.contentWarning || 'none',
           text: text || primaryHook || video.title
         };
       })
@@ -3221,20 +3287,28 @@ async function generateFacelessScript(db, topic, opts = {}) {
     audienceType = 'general', ctaType = 'follow', storytellingMode = 'revelation'
   } = opts;
   const styleGuides = {
-    documentary: 'Cinematic documentary narration, mysterious, factual, authoritative',
-    motivation:  'High-energy motivational, direct, punchy sentences, calls to action',
-    finance:     'Professional financial analysis, data-driven, confident, expert tone',
-    crypto:      'Crypto-native, alpha-focused, community language, bullish energy',
-    education:   'Clear educational breakdown, step-by-step, relatable examples',
-    comedy:      'Absurdist humor, self-aware, gen-Z energy, meme references',
-    luxury:      'Premium lifestyle, aspirational, exclusive tone, elite perspective',
-    horror:      'Dark, suspenseful, slow burn reveal, chilling delivery',
-    ai:          'Tech-forward, mind-expanding, future-focused, awe-inspiring',
-    history:     'Epic historical drama, vivid storytelling, dramatic reveals',
-    crime:       'True-crime thriller, tense, suspenseful, detail-obsessed',
-    health:      'Empathetic, science-backed, actionable, credible expert voice',
-    business:    'Sharp entrepreneurial insight, tactical, results-oriented',
-    space:       'Cosmic wonder, scientific awe, scale-bending perspective'
+    documentary: 'Cinematic documentary narration, mysterious, factual, authoritative — think National Geographic meets Netflix true crime',
+    motivation:  'High-energy motivational, direct, punchy sentences — every line hits like a punch, no filler, pure fuel for action',
+    finance:     'Professional financial analysis, data-driven, confident expert tone — like a Wall Street insider sharing alpha',
+    crypto:      'Crypto-native, alpha-focused, community language, bullish energy — degens and builders will feel seen',
+    education:   'Clear educational breakdown, step-by-step, relatable real-world examples — the viewer learns something valuable by the end',
+    comedy:      'Absurdist humor, self-aware, gen-Z energy, meme references — timing is everything, punchline on the last line',
+    luxury:      'Premium lifestyle, aspirational, exclusive tone — makes the viewer feel they are being let into a secret world of the elite',
+    horror:      'Dark, suspenseful, slow-burn reveal, chilling delivery — each sentence escalates dread until the shocking reveal',
+    ai:          'Tech-forward, mind-expanding, future-focused, awe-inspiring — the viewer feels like they are seeing the future first',
+    history:     'Epic historical drama, vivid cinematic storytelling, dramatic reveals — brings the past to life like a blockbuster film',
+    crime:       'True-crime thriller, tense, suspenseful, detail-obsessed — hooks with a shocking fact, builds tension, delivers the twist',
+    health:      'Empathetic, science-backed, actionable, credible expert voice — viewer walks away with something they can use today',
+    business:    'Sharp entrepreneurial insight, tactical, results-oriented — founder/operator speak, no corporate BS, pure signal',
+    space:       'Cosmic wonder, scientific awe, scale-bending perspective — makes viewers feel small and amazed at the universe',
+    reddit:      'Reddit-style first-person storytelling, conversational, confessional — "So this happened to me..." feels authentic and relatable',
+    kids:        'Fun, energetic, age-appropriate educational content — bright energy, simple language, encouraging tone, teaches one clear lesson',
+    news:        'Breaking news urgency, punchy headlines, quick facts — get to the point immediately, every second counts',
+    wellness:    'Calm, grounding, science-backed wellness advice — the viewer feels healthier, calmer, and more in control by the end',
+    sports:      'High-energy sports commentary, peak moments, dramatic narration — pumps up the viewer like a championship highlight reel',
+    conspiracy:  'Mystery and intrigue, "what they do not want you to know" energy — provocative questions, subtle reveals, audience hooked on the truth',
+    travel:      'Wanderlust-inducing, vivid sensory descriptions, adventure energy — viewer books a flight or starts saving money immediately',
+    relationship:'Raw, honest relationship insight, relatably painful or joyful — viewer pauses and thinks "this is exactly my situation"',
   };
   const ctaMap = {
     follow:     'Follow for more content like this',

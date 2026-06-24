@@ -38,8 +38,14 @@ function clipUrl(outputPath) {
 }
 
 const PLATFORMS = ['TikTok','YouTube Shorts','Instagram Reels','X','LinkedIn','Facebook'];
-const CAPTION_STYLES = ['bold','hormozi','luxury','neon','minimal','karaoke'];
-const FACELESS_STYLES = ['documentary','motivation','finance','crypto','education','comedy','luxury','horror'];
+const CAPTION_STYLES = ['viral','hormozi','hype','mrbeast','tiktok','reels','fire','neon','karaoke','bold','podcast','minimal','luxury','finance','cinema','faceless','kids'];
+const CAPTION_STYLE_LABELS = {
+  viral:'Viral',hormozi:'Hormozi',hype:'Hype',mrbeast:'MrBeast',tiktok:'TikTok',
+  reels:'Reels',fire:'Fire',neon:'Neon',karaoke:'Karaoke',bold:'Bold',
+  podcast:'Podcast',minimal:'Minimal',luxury:'Luxury',finance:'Finance',
+  cinema:'Cinema',faceless:'Faceless',kids:'Kids'
+};
+const FACELESS_STYLES = ['documentary','motivation','finance','crypto','education','comedy','luxury','horror','ai','history','crime','health','business','space','reddit','kids','news','wellness','sports','travel','relationship'];
 const HOOK_LABELS = { curiosity:'Curiosity','shock':'Shock','value':'Value','story':'Story','controversy':'Controversy','sales':'Sales' };
 
 const state = {
@@ -385,34 +391,76 @@ function renderHome() {
   const failedJobs = jobs.filter(j => j.status==='failed');
   const doneClips  = clips.filter(c => c.outputPath && !c.demoMode);
   const isNew = !doneClips.length && !activeJobs.length;
+  const avgScore = doneClips.length ? Math.round(doneClips.reduce((s,c)=>s+(c.score||0),0)/doneClips.length) : 0;
+  const topClip  = doneClips.length ? doneClips.slice().sort((a,b)=>(b.score||0)-(a.score||0))[0] : null;
+  const highScoreClips = doneClips.filter(c => (c.score||0) >= 80).length;
 
   $('#home').innerHTML = `
     <div class="home-wrap">
+      <!-- SVG gradient defs for score rings -->
+      <svg class="score-svg-defs" aria-hidden="true">
+        <defs>
+          <linearGradient id="ringGreen" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#22d3a2"/><stop offset="100%" stop-color="#059669"/></linearGradient>
+          <linearGradient id="ringBlue"  x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#7c6ef5"/><stop offset="100%" stop-color="#a899ff"/></linearGradient>
+          <linearGradient id="ringAmber" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#f59e0b"/><stop offset="100%" stop-color="#fbbf24"/></linearGradient>
+        </defs>
+      </svg>
 
-      ${/* ── Active jobs banner ── */activeJobs.length ? `
+      ${activeJobs.length ? `
         <div class="processing-banner">
           <div class="processing-pulse"></div>
-          <div>
-            <b>Generating ${activeJobs.length === 1 ? 'clips' : activeJobs.length + ' jobs'}…</b>
-            <span class="muted">${esc(activeJobs[0].stage||'Processing')} · ${activeJobs[0].progress||0}%</span>
+          <div style="flex:1">
+            <b>AI is generating ${activeJobs.length === 1 ? 'your clips' : activeJobs.length + ' jobs'}…</b>
+            <span class="muted" style="display:flex;align-items:center;gap:6px;margin-top:3px">
+              ${esc(activeJobs[0].stage||'Processing')}
+              <div class="processing-dots"><span></span><span></span><span></span></div>
+              ${activeJobs[0].progress||0}%
+            </span>
           </div>
-          <button class="ghost" data-view="clips">View →</button>
-        </div>` : ''}
+          <div style="text-align:right">
+            <div style="font-size:.7rem;color:var(--muted);margin-bottom:4px">${activeJobs[0].progress||0}% done</div>
+            <button class="ghost" data-view="clips" style="padding:6px 14px;font-size:.8rem">View →</button>
+          </div>
+        </div>
+        <div class="progress glow" style="margin-bottom:22px;height:3px"><span style="width:${activeJobs[0].progress||0}%"></span></div>
+      ` : ''}
 
-      ${/* ── First-time onboarding ── */isNew ? `
+      ${isNew ? `
         <div class="onboard-hero">
           <div class="onboard-badge">⚡</div>
           <h2>Hey ${esc(name)}, let's make your first clip</h2>
-          <p>Upload a video or paste a YouTube link — AI finds the viral moments and cuts them automatically.</p>
-          <button data-view="create" style="margin-top:20px;padding:14px 32px;font-size:1rem">Start creating →</button>
+          <p>Upload a video or paste a YouTube link — AI finds the viral moments, auto-reframes, and adds captions automatically.</p>
+          <div style="display:flex;gap:10px;justify-content:center;margin-top:24px;flex-wrap:wrap">
+            <button data-view="create" style="padding:14px 28px;font-size:.95rem">Start creating →</button>
+            <button data-view="faceless" class="ghost" style="padding:14px 24px;font-size:.95rem">Try faceless content</button>
+          </div>
+        </div>
+        <div style="margin:8px 0 20px">
+          <div class="feature-highlight-grid">
+            <div class="feature-highlight-card">
+              <div class="fh-icon">🎯</div>
+              <b>AI Viral Detection</b>
+              <small>Finds the exact moments that stop scrollers — hooks, reveals, emotional peaks.</small>
+            </div>
+            <div class="feature-highlight-card">
+              <div class="fh-icon green">🎬</div>
+              <b>Smart Auto-Reframe</b>
+              <small>Scene-aware camera tracks faces, predicts movement, always frames perfectly.</small>
+            </div>
+            <div class="feature-highlight-card">
+              <div class="fh-icon pink">✨</div>
+              <b>Elite Captions</b>
+              <small>Word-by-word karaoke captions in 14 viral styles with perfect timing.</small>
+            </div>
+          </div>
         </div>
         <div class="journey-steps">
           ${[['✦','Import video','Upload or paste a YouTube URL'],
-             ['◎','AI analysis','Finds the best moments automatically'],
-             ['▶','Review clips','Preview, edit hooks, and download'],
-             ['◷','Schedule','Plan posts across all platforms']].map(([ic,t,d],i)=>`
+             ['◎','AI analysis','Finds the best viral moments'],
+             ['▶','Review clips','Preview, edit hooks, download'],
+             ['◷','Share','Optimized for every platform']].map(([ic,t,d],i)=>`
             <div class="journey-step">
-              <div class="journey-num">${i+1}</div>
+              <div class="journey-num">Step ${i+1}</div>
               <div class="journey-icon">${ic}</div>
               <b>${t}</b>
               <small>${d}</small>
@@ -423,18 +471,21 @@ function renderHome() {
           <div class="stat-card" style="cursor:pointer" data-view="clips">
             <div class="stat-num">${doneClips.length}</div>
             <div class="stat-label">Clips ready</div>
+            ${highScoreClips ? `<div class="stat-card-trend up">▲ ${highScoreClips} viral (80+)</div>` : ''}
           </div>
           <div class="stat-card" style="cursor:pointer" data-view="create">
             <div class="stat-num">${videos.length}</div>
-            <div class="stat-label">Videos</div>
+            <div class="stat-label">Videos imported</div>
           </div>
           <div class="stat-card">
-            <div class="stat-num">${doneClips.length ? Math.round(doneClips.reduce((s,c)=>s+(c.score||0),0)/doneClips.length) : '—'}</div>
-            <div class="stat-label">Avg score</div>
+            <div class="stat-num" style="${avgScore>=80?'background:linear-gradient(135deg,#22d3a2,#059669);-webkit-background-clip:text;-webkit-text-fill-color:transparent':avgScore>=60?'':'background:linear-gradient(135deg,#f87171,#dc2626);-webkit-background-clip:text;-webkit-text-fill-color:transparent'}">${avgScore || '—'}</div>
+            <div class="stat-label">Avg viral score</div>
+            ${topClip ? `<div class="stat-card-trend ${avgScore>=70?'up':'neutral'}">Best: ${topClip.score}/100</div>` : ''}
           </div>
           <div class="stat-card" style="cursor:pointer" data-view="billing">
             <div class="stat-num">${(user.credits??0) >= 9999 ? '∞' : (user.credits??0)}</div>
             <div class="stat-label">Credits left</div>
+            ${(user.credits??0) < 20 && (user.credits??0) < 9999 ? `<div class="stat-card-trend down">Running low</div>` : ''}
           </div>
         </div>
 
@@ -453,11 +504,11 @@ function renderHome() {
         <div class="home-actions">
           <button class="primary-action" data-view="create">
             <div class="pa-icon">✦</div>
-            <div><b>New project</b><small>Upload or import a video to start clipping</small></div>
+            <div><b>New project</b><small>Upload video or paste a YouTube link</small></div>
           </button>
           <button class="primary-action" data-view="faceless">
             <div class="pa-icon">◈</div>
-            <div><b>Faceless content</b><small>AI scripts for faceless video creation</small></div>
+            <div><b>Faceless content</b><small>AI-written scripts for faceless videos</small></div>
           </button>
           <button class="primary-action" data-view="clips">
             <div class="pa-icon">▶</div>
@@ -470,11 +521,11 @@ function renderHome() {
         </div>
 
         ${doneClips.length ? `
-          <div class="panel-head" style="margin:28px 0 12px">
-            <h2>Recent clips</h2>
+          <div class="panel-head" style="margin:28px 0 14px">
+            <h2>Top clips by viral score</h2>
             <button class="ghost" data-view="clips">View all →</button>
           </div>
-          <div class="card-grid">${doneClips.slice(0,4).map(clipCard).join('')}</div>
+          <div class="card-grid">${doneClips.slice().sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,4).map(clipCard).join('')}</div>
         ` : ''}
       `}
     </div>`;
@@ -549,7 +600,7 @@ function renderCreate() {
             </div>
             <div class="option-row"><label>Captions</label>
               <select id="captionStyle">
-                ${CAPTION_STYLES.map(s=>`<option value="${s}">${s.charAt(0).toUpperCase()+s.slice(1)}</option>`).join('')}
+                ${CAPTION_STYLES.map(s=>`<option value="${s}">${CAPTION_STYLE_LABELS[s]||s}</option>`).join('')}
               </select>
             </div>
             <div class="option-row"><label>Framing</label>
@@ -872,10 +923,14 @@ function clipCard(c) {
   const score = Number(c.score || 0);
   const hookPct = c.hookStrength ? Math.round(c.hookStrength*10) : score;
   const viralPct = c.emotionalPunch ? Math.round(c.emotionalPunch*10) : Math.round(score*.9);
-  const sharePct = c.shareability ? Math.round(c.shareability*10) : Math.round(score*.85);
+  const retentionPct = c.retentionScore ? Math.round(c.retentionScore*10) : Math.round(score*.88);
   const title = clipTitle(c);
   const isSelected = state.clipsBulkSelected.has(c.id);
   const menuOpen = state.openMenuClipId === c.id;
+  const dropoffRisk = c.dropoffRisk || 'medium';
+  const ringColor = score >= 80 ? 'green' : score >= 60 ? 'blue' : 'amber';
+  // Score ring dash offset: 175 = full circle; 0 = empty
+  const dashOffset = Math.round(175 - (score/100)*175);
 
   const thumbEl = c.thumbnailPath
     ? `<img class="clip-thumb-img" src="${esc(c.thumbnailPath)}" alt="${esc(title)}" loading="lazy">`
@@ -911,16 +966,23 @@ function clipCard(c) {
           </div>
         </div>
         <div class="analytic-row">
-          <span class="analytic-label">📤 Share</span>
+          <span class="analytic-label">📊 Retention</span>
           <div class="analytic-bar-wrap">
-            <div class="analytic-bar"><div class="analytic-fill green" style="width:${sharePct}%"></div></div>
-            <span class="analytic-pct">${sharePct}%</span>
+            <div class="analytic-bar"><div class="analytic-fill ${retentionPct>=80?'green':retentionPct>=60?'':' amber'}" style="width:${retentionPct}%"></div></div>
+            <span class="analytic-pct">${retentionPct}%</span>
           </div>
         </div>
       </div>
-      <div class="clip-meta-row">
-        <span>${when(c.createdAt)}</span>
-        <span>${esc(c.captionStyle||'bold')}</span>
+      <div class="clip-intel-row">
+        <div class="clip-intel-item">
+          <span>Style:</span>
+          <b>${esc(c.captionStyle||'viral')}</b>
+        </div>
+        <div class="retention-badge ${dropoffRisk}">
+          <div class="retention-dot"></div>
+          ${dropoffRisk} drop-off
+        </div>
+        <div class="clip-intel-item"><span>${when(c.createdAt)}</span></div>
       </div>
       <div class="clip-actions" style="position:relative">
         <button class="clip-action-primary">▶ Preview</button>
@@ -929,7 +991,7 @@ function clipCard(c) {
         ${menuOpen ? `
         <div class="clip-context-menu">
           <button class="clip-menu-item" data-open-clip-detail="${c.id}"><span class="clip-menu-icon">◎</span>Full detail</button>
-          <button class="clip-menu-item" data-copy="${encodeURIComponent(title)}"><span class="clip-menu-icon">⎘</span>Copy caption</button>
+          <button class="clip-menu-item" data-copy="${encodeURIComponent(title)}"><span class="clip-menu-icon">⎘</span>Copy hook</button>
           <a class="clip-menu-item" href="${esc(mediaUrl)}" download="clip-${c.id}.mp4" onclick="event.stopPropagation()"><span class="clip-menu-icon">⬇</span>Download</a>
           <div style="height:1px;background:var(--border);margin:5px 0"></div>
           <button class="clip-menu-item danger" data-delete-clip-id="${c.id}"><span class="clip-menu-icon">✕</span>Delete</button>
@@ -1318,7 +1380,10 @@ const FL_STYLES = [
   {v:'crypto',l:'Crypto'},{v:'education',l:'Education'},{v:'comedy',l:'Comedy'},
   {v:'luxury',l:'Luxury'},{v:'horror',l:'Horror'},{v:'ai',l:'AI & Tech'},
   {v:'history',l:'History'},{v:'crime',l:'True Crime'},{v:'health',l:'Health'},
-  {v:'business',l:'Business'},{v:'space',l:'Space'}
+  {v:'business',l:'Business'},{v:'space',l:'Space'},
+  {v:'reddit',l:'Reddit Story'},{v:'kids',l:'Kids Content'},{v:'news',l:'Breaking News'},
+  {v:'wellness',l:'Wellness'},{v:'sports',l:'Sports'},{v:'travel',l:'Travel'},
+  {v:'relationship',l:'Relationship'},{v:'conspiracy',l:'Mystery/Conspiracy'}
 ];
 const FL_TONES = ['mysterious','energetic','calm','authoritative','conversational','dramatic','inspirational','urgent'];
 const FL_PLATFORMS = ['TikTok','YouTube Shorts','Instagram Reels'];
@@ -2017,9 +2082,10 @@ function renderSettings() {
         </form>
       </section>
       <section class="panel" style="margin-top:16px">
-        <h2>Caption style default</h2>
+        <h2>Caption style preview</h2>
+        <p style="margin-bottom:12px">These are the caption styles available when generating clips. Each style is tuned for a different platform and content type.</p>
         <div class="style-swatches">
-          ${CAPTION_STYLES.map(s=>`<div class="swatch ${s}" data-style="${s}"><small>${s}</small></div>`).join('')}
+          ${CAPTION_STYLES.map(s=>`<div class="swatch ${s}" data-style="${s}" title="${CAPTION_STYLE_LABELS[s]||s}"><small>${CAPTION_STYLE_LABELS[s]||s}</small></div>`).join('')}
         </div>
       </section>
     </div>`;
