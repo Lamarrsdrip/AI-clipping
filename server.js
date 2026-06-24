@@ -1936,14 +1936,19 @@ async function trackFaces(mediaPath, start, end) {
 
 // ── Helper: piecewise-linear FFmpeg expression for smooth crop X ──
 function buildCropXExpr(keyframes, cropW, srcW, timeOffset = 0) {
-  // keyframes: [{t (clip-relative seconds), cx (0..1), confidence}]
+  // keyframes: [{t, cx, confidence, quality?}]  — quality field from face_track v6
   // timeOffset: subtract from t to shift into output timeline (for blackOffset)
-  // Returns an FFmpeg arithmetic expression for the x parameter of crop=
   const defaultX = Math.max(0, Math.min(srcW - cropW, Math.round(0.5 * srcW - cropW / 2)));
 
   if (!keyframes || keyframes.length === 0) return String(defaultX);
 
-  const pts = keyframes
+  // Drop frames where v6 quality score signals a bad shot (floor/shoes/empty).
+  // If all frames are bad, keep all (prevents blank output).
+  const hasQuality = keyframes.some(kf => kf.quality != null);
+  const goodKfs    = hasQuality ? keyframes.filter(kf => (kf.quality ?? 50) >= 35) : keyframes;
+  const useKfs     = goodKfs.length >= 2 ? goodKfs : keyframes;
+
+  const pts = useKfs
     .map(kf => ({
       t: Math.max(0, kf.t - timeOffset),
       x: Math.max(0, Math.min(srcW - cropW, Math.round(kf.cx * srcW - cropW / 2))),
@@ -1983,10 +1988,17 @@ function getSegmentCropX(keyframes, segStart, segEnd, momentStart, cropW, srcW) 
   const relEnd   = segEnd   - momentStart + 0.4;
 
   const pool = keyframes.filter(kf => kf.t >= relStart && kf.t <= relEnd);
-  const src  = pool.length > 0 ? pool : keyframes;  // fall back to all keyframes
+  const src  = pool.length > 0 ? pool : keyframes;
 
-  const totalConf = src.reduce((s, kf) => s + (kf.confidence || 0.7), 0) || 1;
-  const avgCx     = src.reduce((s, kf) => s + kf.cx * (kf.confidence || 0.7), 0) / totalConf;
+  // Weight by both confidence and v6 quality score (ignores floor/shoe shots)
+  const totalConf = src.reduce((s, kf) => {
+    const q = (kf.quality ?? 50) / 100;
+    return s + (kf.confidence || 0.7) * Math.max(0.1, q);
+  }, 0) || 1;
+  const avgCx = src.reduce((s, kf) => {
+    const q = (kf.quality ?? 50) / 100;
+    return s + kf.cx * (kf.confidence || 0.7) * Math.max(0.1, q);
+  }, 0) / totalConf;
 
   return Math.max(0, Math.min(srcW - cropW, Math.round(avgCx * srcW - cropW / 2)));
 }
@@ -2041,47 +2053,60 @@ function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920,
   const meanFaceX   = faceData?.meanFaceX   ?? (speakerSide === 'left' ? 0.35 : speakerSide === 'right' ? 0.65 : 0.5);
 
   // Use globalCropFrac from face_track.py if available (scene-aware)
-  const suggestedFrac = faceData?.globalCropFrac ?? 0;
+  const suggestedFrac  = faceData?.globalCropFrac ?? 0;
+  const framingModeAI  = faceData?.framingMode    ?? '';
 
   // ── Crop fraction ──────────────────────────────────────────────────
+  // "close"/"medium"/"wide" are user overrides; "dynamic" = trust face_track v6.
+  // v6 cinematic defaults (more breathing room, less zoom):
+  //   single_speaker: 0.58  podcast: 0.68  interview: 0.78  group: 0.88
   let cropFrac;
   if (framingMode === 'close') {
-    cropFrac = tightFrac;
+    cropFrac = tightFrac * 1.25;           // tight but not mugshot (was tightFrac)
   } else if (framingMode === 'medium') {
-    cropFrac = sceneType === 'group' ? 0.50 : sceneType === 'interview' ? 0.46 : 0.40;
+    cropFrac = sceneType === 'group' ? 0.65 : sceneType === 'interview' ? 0.62 : 0.52;
   } else if (framingMode === 'wide') {
-    cropFrac = sceneType === 'group' ? 0.65 : sceneType === 'interview' ? 0.56 : 0.52;
+    cropFrac = sceneType === 'group' ? 0.88 : sceneType === 'interview' ? 0.80 : 0.70;
   } else if (framingMode === 'original') {
-    cropFrac = 0.70;
+    cropFrac = 0.85;
   } else {
-    // 'dynamic': use scene-type-aware suggestion from face tracking
+    // 'dynamic': trust v6 face_track suggestion first
     if (suggestedFrac > 0.01) {
       cropFrac = suggestedFrac;
     } else if (!hasFaces) {
-      cropFrac = 0.42;
+      cropFrac = 0.60;                     // no faces → show context (was 0.42)
     } else {
       switch (sceneType) {
-        case 'group':          cropFrac = 0.62; break;
-        case 'interview':      cropFrac = faceCount >= 2 ? 0.52 : 0.44; break;
-        case 'podcast':        cropFrac = faceCount >= 2 ? 0.48 : 0.42; break;
-        case 'reaction':       cropFrac = 0.52; break;
-        case 'wide_shot':      cropFrac = 0.40; break;
-        case 'close_up':       cropFrac = 0.44; break;
-        default:               cropFrac = rangeCX > 0.20 ? 0.44 : 0.38;
+        case 'group':          cropFrac = 0.88; break;
+        case 'interview':      cropFrac = faceCount >= 2 ? 0.78 : 0.62; break;
+        case 'podcast':        cropFrac = faceCount >= 2 ? 0.68 : 0.58; break;
+        case 'reaction':       cropFrac = 0.62; break;
+        case 'wide_shot':      cropFrac = 0.75; break;
+        case 'close_up':       cropFrac = 0.48; break;
+        default:               cropFrac = rangeCX > 0.20 ? 0.60 : 0.58;
       }
     }
   }
-  cropFrac = Math.max(tightFrac, Math.min(0.72, cropFrac));
+  cropFrac = Math.max(tightFrac, Math.min(0.92, cropFrac));
 
   // ── Compute crop dimensions ────────────────────────────────────────
   const cropW = Math.max(2, Math.round(Math.min(srcW, cropFrac * srcW) / 2) * 2);
   const cropH = srcH;
 
-  // ── Global crop X (weighted average of all keyframe positions) ─────
+  // ── Global crop X: quality + confidence weighted average ─────────
+  // Skip frames with quality < 35 (floor shots, shoe shots, empty frames).
   let globalCx;
   if (keyframes.length > 0) {
-    const totalConf = keyframes.reduce((s, kf) => s + (kf.confidence || 0.7), 0) || 1;
-    globalCx = keyframes.reduce((s, kf) => s + kf.cx * (kf.confidence || 0.7), 0) / totalConf;
+    const goodKfs = keyframes.filter(kf => (kf.quality ?? 50) >= 35);
+    const srcKfs  = goodKfs.length >= 2 ? goodKfs : keyframes;
+    const totalW  = srcKfs.reduce((s, kf) => {
+      const q = (kf.quality ?? 50) / 100;
+      return s + (kf.confidence || 0.7) * Math.max(0.1, q);
+    }, 0) || 1;
+    globalCx = srcKfs.reduce((s, kf) => {
+      const q = (kf.quality ?? 50) / 100;
+      return s + kf.cx * (kf.confidence || 0.7) * Math.max(0.1, q);
+    }, 0) / totalW;
   } else {
     globalCx = Math.max(0.08, Math.min(0.92, meanFaceX));
   }
