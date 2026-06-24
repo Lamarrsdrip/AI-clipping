@@ -1289,14 +1289,24 @@ async function transcribeAudioWithWhisper(db, mediaPath, videoId) {
   if (!apiKey) return [];
   const audioPath = path.join(STORAGE_DIR, 'originals', `${videoId}_audio.mp3`);
   try {
-    await run(FFMPEG, ['-y', '-i', mediaPath, '-vn', '-ar', '16000', '-ac', '1', '-b:a', '64k', '-t', '600', audioPath], { timeoutMs: 3 * 60 * 1000, label: 'extract audio for whisper' });
+    // 16kHz mono is Whisper's native format; 96k bitrate improves accuracy vs 64k.
+    await run(FFMPEG, ['-y', '-i', mediaPath, '-vn', '-ar', '16000', '-ac', '1', '-b:a', '96k', '-t', '600', audioPath], { timeoutMs: 3 * 60 * 1000, label: 'extract audio for whisper' });
     if (!existsSync(audioPath) || statSync(audioPath).size < 512) return [];
     const audioBytes = readFileSync(audioPath);
     const boundary = `--------whisper${randomUUID().replace(/-/g, '')}`;
     const fileName = 'audio.mp3';
     const modelName = provider === 'openai' ? 'whisper-1' : 'whisper-1';
     const part1 = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: audio/mpeg\r\n\r\n`);
-    const part2 = Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${modelName}\r\n--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\nverbose_json\r\n--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nen\r\n--${boundary}\r\nContent-Disposition: form-data; name="timestamp_granularities[]"\r\n\r\nword\r\n--${boundary}\r\nContent-Disposition: form-data; name="timestamp_granularities[]"\r\n\r\nsegment\r\n--${boundary}--\r\n`);
+    // Include a prompt to improve accuracy for accents, slang, and fast speech.
+    const whisperPrompt = 'Transcribe accurately. Include fillers like "um", "uh" only if clearly spoken. Preserve slang and casual speech. Add natural punctuation.';
+    const part2 = Buffer.from(
+      `\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${modelName}` +
+      `\r\n--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\nverbose_json` +
+      `\r\n--${boundary}\r\nContent-Disposition: form-data; name="timestamp_granularities[]"\r\n\r\nword` +
+      `\r\n--${boundary}\r\nContent-Disposition: form-data; name="timestamp_granularities[]"\r\n\r\nsegment` +
+      `\r\n--${boundary}\r\nContent-Disposition: form-data; name="prompt"\r\n\r\n${whisperPrompt}` +
+      `\r\n--${boundary}--\r\n`
+    );
     const body = Buffer.concat([part1, audioBytes, part2]);
     const whisperEndpoint = provider === 'openai' ? 'https://api.openai.com/v1/audio/transcriptions' : 'https://api.openai.com/v1/audio/transcriptions';
     const controller = new AbortController();
@@ -1587,22 +1597,27 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
   const events = [];
   for (let i = 0; i < cw.length; i += SZ) {
-    const phrase = cw.slice(i, i + SZ);
-    const phraseStart = phrase[0].rs;
-    const phraseEnd   = phrase[phrase.length - 1].re;
+    const phrase    = cw.slice(i, i + SZ);
+    const nextPhrase = cw.slice(i + SZ, i + SZ + 1);
+    const phraseEnd  = phrase[phrase.length - 1].re;
 
     for (let wi = 0; wi < phrase.length; wi++) {
-      const w = phrase[wi];
+      const w     = phrase[wi];
+      const nextW = phrase[wi + 1];
       if (w.re <= 0) continue;
-      // Show phrase from start of phrase, hide it at the end of the phrase
-      // Only the active word gets the highlight color + bold
+
+      // Extend each word's display to the next word's start within the phrase
+      // — this prevents the "flicker" / gaps where captions vanish between words.
+      // Between phrases there's still a natural gap (intentional visual reset).
+      const displayEnd = nextW ? Math.max(w.re, nextW.rs - 0.001) : phraseEnd;
+
       const parts = phrase.map((pw, j) =>
         j === wi
           ? `{\\c${p.highlight}\\b1\\3a&H00&}${pw.word}{\\r}`
-          : `{\\c${p.context}}${pw.word}`
+          : `{\\c${p.context}\\b0}${pw.word}`
       );
       events.push(
-        `Dialogue: 0,${assTime(w.rs)},${assTime(w.re)},${p.name},,0,0,0,,` +
+        `Dialogue: 0,${assTime(w.rs)},${assTime(displayEnd)},${p.name},,0,0,0,,` +
         `{\\an${p.alignment}\\fad(${p.fad})}${parts.join(' ')}`
       );
     }
@@ -1624,15 +1639,38 @@ function cleanTranscriptText(text) {
 
 // ─── Word timing helpers ──────────────────────────────────────────
 function estimateWordTimings(segments, clipStart, clipEnd) {
+  // Average spoken English: ~2.5 words/sec, but ranges 1.8–3.5 depending on speaker.
+  // Use a per-segment estimate rather than a constant rate for better sync.
+  const WORDS_PER_SEC = 2.5;
+  const MIN_WORD_DUR  = 0.08;  // shortest plausible word (a, I, …)
+  const MAX_WORD_DUR  = 0.8;   // longest plausible word before it feels slow
+
   const words = [];
   for (const seg of (segments || [])) {
     if (!seg.text || seg.end <= clipStart || seg.start >= clipEnd) continue;
     const ws = cleanTranscriptText(seg.text).trim().split(/\s+/).filter(Boolean);
     if (!ws.length) continue;
+
     const s = Math.max(seg.start, clipStart);
     const e = Math.min(seg.end, clipEnd);
-    const d = (e - s) / ws.length;
-    ws.forEach((w, i) => words.push({ word:w, start:s+i*d, end:s+(i+1)*d }));
+    const segDur = e - s;
+
+    // Estimate duration per word, clamped to plausible range.
+    const naturalDur = segDur / ws.length;
+    const wordDur = Math.max(MIN_WORD_DUR, Math.min(MAX_WORD_DUR, naturalDur));
+
+    // If natural duration is much faster/slower than average speech,
+    // we know the segment timing is probably inaccurate (common with background music).
+    // In that case, bias towards speech-rate estimate but anchored at seg.start.
+    const rateRatio = segDur / (ws.length / WORDS_PER_SEC);
+    const useNatural = rateRatio > 0.4 && rateRatio < 2.5; // segment timing looks plausible
+
+    let t = s;
+    ws.forEach((w, i) => {
+      const d = useNatural ? naturalDur : (1 / WORDS_PER_SEC);
+      words.push({ word: w, start: t, end: Math.min(e, t + d) });
+      t += d;
+    });
   }
   return words;
 }
@@ -1784,47 +1822,67 @@ async function trackFaces(mediaPath, start, end) {
 //   - maintains safe margins (never crops forehead/mouth)
 //   - applies sharpening for social media clarity
 // faceX: 0..1 relative face center X in source video (from face_track.py), 0.5 = center
+// Maximum scale factor for landscape→portrait reframe.
+// 1.0 = no zoom (pillarbox), 1.5 = moderate zoom (CapCut-like), 1.778 = full fill (cuts off sides badly).
+const MAX_PORTRAIT_ZOOM = 1.45;
+
 function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920, speakerSide='center', clipDuration=30, faceX=0.5) {
   if (srcH >= srcW) {
-    // Already portrait/square — scale to fill
+    // Already portrait/square — scale to fill, center crop
     return [
       `scale=${outW}:${outH}:force_original_aspect_ratio=increase:flags=lanczos`,
       `crop=${outW}:${outH}:(iw-${outW})/2:(ih-${outH})/2`,
-      `unsharp=lx=3:ly=3:la=0.3:cx=3:cy=3:ca=0`,
+      `unsharp=lx=3:ly=3:la=0.25`,
       `setsar=1`,
     ].join(',');
   }
 
-  // Landscape → portrait
-  // Scale so height fills outH, then crop a portrait slice
-  const scaledW = Math.ceil((srcW / srcH) * outH / 2) * 2;
-  const maxCropX = scaledW - outW;
+  // Landscape → portrait reframe
+  // Determine scale: we want to show as much context as possible while centering the speaker.
+  // idealScaleH fills portrait height but can be too zoomed for wide scenes.
+  const idealScaleH = outH / srcH;
+  // Cap at MAX_PORTRAIT_ZOOM — this is the key fix for over-cropping.
+  const scaleH = Math.min(idealScaleH, MAX_PORTRAIT_ZOOM);
 
-  // Compute the desired crop-X center from face position
-  // faceX is in source-video coordinate (0..1), map to scaled-video pixels
+  const scaledW = Math.ceil(srcW * scaleH / 2) * 2;
+  const scaledH = Math.ceil(srcH * scaleH / 2) * 2;
+
+  // Compute desired crop-center X in scaled-video pixels.
+  // Use a wider safe zone (±8% threshold before tracking, was ±5%).
   let targetCenterX;
-  if (faceX !== 0.5 && Math.abs(faceX - 0.5) > 0.05) {
-    // Face detected with meaningful offset — track it
-    targetCenterX = Math.round(faceX * scaledW);
+  if (faceX !== 0.5 && Math.abs(faceX - 0.5) > 0.08) {
+    // Clamp tracking: don't follow face all the way to edge — keep 10% buffer.
+    const clampedFaceX = Math.max(0.10, Math.min(0.90, faceX));
+    targetCenterX = Math.round(clampedFaceX * scaledW);
   } else if (speakerSide === 'left') {
-    targetCenterX = Math.round(scaledW * 0.35);
+    targetCenterX = Math.round(scaledW * 0.38);
   } else if (speakerSide === 'right') {
-    targetCenterX = Math.round(scaledW * 0.65);
+    targetCenterX = Math.round(scaledW * 0.62);
   } else {
     targetCenterX = Math.round(scaledW * 0.5);
   }
 
-  // Clamp so we never show outside the frame
+  // Crop X: ensure output width fits entirely inside the scaled frame.
   const halfOut = Math.floor(outW / 2);
-  const cropX   = Math.max(0, Math.min(maxCropX, targetCenterX - halfOut));
+  const maxCropX = scaledW - outW;
+  const cropX = Math.max(0, Math.min(maxCropX, targetCenterX - halfOut));
 
-  // Vertical: start from top (portrait uses full height of scaled landscape)
-  const cropY = '0';
+  if (scaledH < outH) {
+    // Portrait height not fully filled — pad with black (letterbox).
+    const padTop = Math.floor((outH - scaledH) / 2);
+    return [
+      `scale=${scaledW}:${scaledH}:flags=lanczos`,
+      `crop=${outW}:${scaledH}:${cropX}:0`,
+      `pad=${outW}:${outH}:0:${padTop}:color=black`,
+      `unsharp=lx=3:ly=3:la=0.25`,
+      `setsar=1`,
+    ].join(',');
+  }
 
   return [
-    `scale=${scaledW}:${outH}:flags=lanczos`,
-    `crop=${outW}:${outH}:${cropX}:${cropY}`,
-    `unsharp=lx=5:ly=5:la=0.5:cx=5:cy=5:ca=0`,
+    `scale=${scaledW}:${scaledH}:flags=lanczos`,
+    `crop=${outW}:${outH}:${cropX}:0`,
+    `unsharp=lx=3:ly=3:la=0.25`,
     `setsar=1`,
   ].join(',');
 }

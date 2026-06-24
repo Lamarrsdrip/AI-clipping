@@ -80,8 +80,122 @@ const state = {
   transcriptVideoId: null,
   platformTab: 'tiktok',
   hookTab: 'curiosity',
-  thumbTab: 0
+  thumbTab: 0,
+  // Clips library state
+  clipsSearch: '',
+  clipsSort: 'newest',
+  clipsBulkSelected: new Set(),
+  openMenuClipId: null,
 };
+
+/* ── Clip helpers ────────────────────────────────────────────────── */
+function clipTitle(c) {
+  const hook = c.hook || '';
+  // Use hook if it reads like a title (not too long, not starting with quotes/pronouns)
+  if (hook && hook.length <= 72) return hook;
+  if (hook) return hook.slice(0, 68) + '…';
+  return c.title || 'Untitled clip';
+}
+
+function scoreChip(score) {
+  const n = Number(score || 0);
+  const cls = n >= 90 ? 'clip-score-green' : n >= 80 ? 'clip-score-blue' : n >= 70 ? 'clip-score-amber' : 'clip-score-red';
+  return `<div class="clip-score-chip ${cls}">${n}<span>/100</span></div>`;
+}
+
+function platformBadge(platform) {
+  const p = platform || 'TikTok';
+  const short = p.replace('YouTube ','').replace('Instagram ','');
+  return `<span class="clip-platform-badge">${esc(short)}</span>`;
+}
+
+function statusBadge(status) {
+  const s = status || 'ready';
+  const dot = `<span class="clip-status-dot"></span>`;
+  const labels = { ready:'Ready', queued:'Queued', running:'Processing', failed:'Failed', published:'Published' };
+  return `<span class="clip-status ${s}">${dot}${labels[s] || s}</span>`;
+}
+
+/* ── Clip Modal ──────────────────────────────────────────────────── */
+function openClipModal(clipId) {
+  const c = (state.library.clips || []).find(x => x.id === clipId);
+  if (!c) return;
+  const dur2 = Math.round((c.endSeconds || 0) - (c.startSeconds || 0));
+  const url = clipUrl(c.outputPath);
+  const title = clipTitle(c);
+  const score = Number(c.score || 0);
+  const hook = c.hookStrength ? Math.round(c.hookStrength * 10) : score;
+  const viral = c.emotionalPunch ? Math.round(c.emotionalPunch * 10) : Math.round(score * 0.9);
+  const share = c.shareability ? Math.round(c.shareability * 10) : Math.round(score * 0.85);
+
+  let modal = document.getElementById('globalClipModal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'globalClipModal';
+    document.body.appendChild(modal);
+  }
+  modal.innerHTML = `
+    <div class="clip-modal-overlay" id="clipModalOverlay">
+      <div class="clip-modal">
+        <div class="clip-modal-video-col">
+          <video id="modalVideoEl" src="${esc(url)}" controls autoplay playsinline
+            poster="${esc(c.thumbnailPath || '')}"
+            style="width:100%;height:100%;object-fit:contain;display:block">
+          </video>
+        </div>
+        <div class="clip-modal-info">
+          <div class="clip-modal-header">
+            <h2>${esc(title)}</h2>
+            <button class="clip-modal-close" id="closeClipModalBtn">✕</button>
+          </div>
+          <div class="clip-modal-score">
+            <div>
+              <div class="modal-score-num">${score}</div>
+              <div class="modal-score-label">AI Score</div>
+            </div>
+            <div class="modal-score-breakdown">
+              <div class="modal-score-item"><small>🔥 Hook</small><b>${hook}%</b></div>
+              <div class="modal-score-item"><small>❤️ Viral</small><b>${viral}%</b></div>
+              <div class="modal-score-item"><small>📤 Share</small><b>${share}%</b></div>
+              <div class="modal-score-item"><small>⏱ Duration</small><b>${dur2}s</b></div>
+            </div>
+          </div>
+          <div>
+            <div class="meta" style="margin-bottom:10px">
+              <span>${esc(c.bestPlatform || 'TikTok')}</span>
+              <span>Style: ${esc(c.captionStyle || 'bold')}</span>
+              <span>${when(c.createdAt)}</span>
+            </div>
+            ${c.rationale ? `<p style="font-size:.83rem;line-height:1.6;color:var(--muted)">${esc(c.rationale)}</p>` : ''}
+          </div>
+          <div class="clip-modal-actions">
+            <a href="${esc(url)}" download="clip-${c.id}.mp4" class="button" style="text-align:center">⬇ Download</a>
+            <button class="ghost" data-copy="${encodeURIComponent(c.hook || title)}" onclick="showToast('Caption copied','ok',2000)">Copy caption</button>
+            <button class="ghost" data-open-clip="${c.id}" onclick="closeClipModal()">Full detail →</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  document.getElementById('clipModalOverlay')?.addEventListener('click', e => {
+    if (e.target === document.getElementById('clipModalOverlay')) closeClipModal();
+  });
+  document.getElementById('closeClipModalBtn')?.addEventListener('click', closeClipModal);
+  document.addEventListener('keydown', _modalEscHandler);
+}
+
+function _modalEscHandler(e) {
+  if (e.key === 'Escape') { closeClipModal(); document.removeEventListener('keydown', _modalEscHandler); }
+}
+
+function closeClipModal() {
+  const modal = document.getElementById('globalClipModal');
+  if (modal) {
+    const vid = document.getElementById('modalVideoEl');
+    if (vid) { vid.pause(); vid.src = ''; }
+    modal.innerHTML = '';
+  }
+}
 
 /* ── Nav (4 core items only) ─────────────────────────────────────── */
 const NAV = [
@@ -122,16 +236,18 @@ function renderNav() {
   if (user) {
     $('#userAvatar').textContent = (user.name||user.email||'U')[0].toUpperCase();
     $('#userName').textContent   = user.name || user.email;
-    $('#userPlan').textContent   = `${user.credits ?? 0} credits`;
-    // Credits bar in sidebar
+    const credits = user.credits ?? 0;
+    $('#userPlan').textContent   = credits >= 9999 ? '∞ credits' : `${credits} credits`;
     const creditsEl = $('#navCreditsBar');
     if (creditsEl) {
-      const credits = user.credits ?? 0;
-      const maxCredits = credits >= 9999 ? 9999 : 100;
-      const pct = credits >= 9999 ? 100 : Math.min(100, Math.round((credits / maxCredits) * 100));
+      const plan = state.library?.billingPlans?.find(p => p.id === (user.plan||'free').toLowerCase());
+      const max = plan?.creditsIncluded || 100;
+      const unlimited = max >= 99999 || credits >= 9999;
+      const pct = unlimited ? 100 : Math.min(100, Math.round((credits / max) * 100));
+      const fillClass = !unlimited && pct < 20 ? 'critical' : !unlimited && pct < 40 ? 'low' : '';
       creditsEl.innerHTML = `<div class="nav-credits">
-        <div class="nav-credits-bar"><div class="nav-credits-fill" style="width:${pct}%"></div></div>
-        <small>${credits >= 9999 ? 'Unlimited' : credits + ' credits left'}</small>
+        <div class="nav-credits-bar"><div class="nav-credits-fill ${fillClass}" style="width:${pct}%"></div></div>
+        <small>${unlimited ? 'Unlimited credits' : credits + ' / ' + max.toLocaleString() + ' credits'}</small>
       </div>`;
     }
   }
@@ -559,95 +675,249 @@ async function processSelected() {
 
 /* ── Clips ─────────────────────────────────────────────────────────── */
 function renderClips() {
-  const clips=(state.library.clips||[]).filter(c=>c.outputPath&&!c.demoMode);
-  const allJobs=state.library.jobs||[];
-  const activeJobs=allJobs.filter(j=>['queued','running'].includes(j.status));
-  const failedJobs=allJobs.filter(j=>j.status==='failed');
+  const allClips = (state.library.clips||[]).filter(c=>c.outputPath&&!c.demoMode);
+  const allJobs  = state.library.jobs||[];
+  const activeJobs = allJobs.filter(j=>['queued','running'].includes(j.status));
+  const failedJobs = allJobs.filter(j=>j.status==='failed');
+
+  // Filter + sort
+  const q = (state.clipsSearch||'').toLowerCase().trim();
+  const sortBy = state.clipsSort || 'newest';
+  let clips = q ? allClips.filter(c => (clipTitle(c)+' '+(c.bestPlatform||'')+' '+(c.captionStyle||'')).toLowerCase().includes(q)) : [...allClips];
+  if (sortBy==='oldest')   clips.sort((a,b)=>new Date(a.createdAt)-new Date(b.createdAt));
+  else if (sortBy==='score')    clips.sort((a,b)=>(b.score||0)-(a.score||0));
+  else if (sortBy==='longest')  clips.sort((a,b)=>((b.endSeconds||0)-(b.startSeconds||0))-((a.endSeconds||0)-(a.startSeconds||0)));
+  else if (sortBy==='shortest') clips.sort((a,b)=>((a.endSeconds||0)-(a.startSeconds||0))-((b.endSeconds||0)-(b.startSeconds||0)));
+  else clips.sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
+
+  const bulkCount = state.clipsBulkSelected.size;
 
   $('#clips').innerHTML = `
+    <!-- Sticky toolbar -->
+    <div class="clips-toolbar">
+      <div class="toolbar-search">
+        <span class="search-icon">⌕</span>
+        <input id="clipsSearchInput" type="text" placeholder="Search clips by title, platform, style…" value="${esc(state.clipsSearch||'')}">
+      </div>
+      <select id="clipsSortSelect">
+        <option value="newest"   ${sortBy==='newest'  ?'selected':''}>Newest first</option>
+        <option value="oldest"   ${sortBy==='oldest'  ?'selected':''}>Oldest first</option>
+        <option value="score"    ${sortBy==='score'   ?'selected':''}>Highest score</option>
+        <option value="longest"  ${sortBy==='longest' ?'selected':''}>Longest</option>
+        <option value="shortest" ${sortBy==='shortest'?'selected':''}>Shortest</option>
+      </select>
+      <button data-view="create" class="ghost" style="white-space:nowrap">+ New clip</button>
+      ${allClips.length ? `<button class="ghost danger-btn" id="clearAllClips" style="white-space:nowrap">Clear all</button>` : ''}
+    </div>
+
+    <!-- Bulk action bar -->
+    ${bulkCount ? `
+      <div class="bulk-bar">
+        <span class="bulk-bar-count">${bulkCount} clip${bulkCount!==1?'s':''} selected</span>
+        <button class="ghost" id="bulkDownload">⬇ Download</button>
+        <button class="ghost danger-btn" id="bulkDelete">Delete</button>
+        <button class="ghost" id="bulkClear">✕ Clear selection</button>
+      </div>` : ''}
+
+    <!-- Active jobs -->
     ${activeJobs.length ? `
-      <section class="panel processing-panel" style="margin-bottom:16px">
-        <div class="panel-head" style="margin-bottom:12px">
-          <div style="display:flex;align-items:center;gap:10px">
+      <div class="panel" style="margin-bottom:18px;border-color:rgba(245,158,11,.25)">
+        <div class="panel-head" style="margin-bottom:13px">
+          <div style="display:flex;align-items:center;gap:11px">
             <div class="processing-pulse"></div>
-            <h2>Processing ${activeJobs.length} job${activeJobs.length!==1?'s':''}…</h2>
+            <h2>Generating ${activeJobs.length} clip batch${activeJobs.length!==1?'es':''}…</h2>
           </div>
-          <small class="muted">Auto-refreshing</small>
+          <small class="muted">Auto-refreshing every 3s</small>
         </div>
         ${activeJobs.map(jobCard).join('')}
-      </section>` : ''}
+      </div>` : ''}
 
+    <!-- Failed jobs -->
     ${failedJobs.length ? `
-      <section class="panel" style="margin-bottom:16px;border-color:rgba(248,113,113,.25)">
-        <h2 style="margin-bottom:12px;color:var(--danger)">Failed (${failedJobs.length})</h2>
+      <div class="panel" style="margin-bottom:18px;border-color:rgba(248,113,113,.28)">
+        <h2 style="margin-bottom:13px;color:var(--danger)">Failed jobs (${failedJobs.length})</h2>
         ${failedJobs.map(jobCard).join('')}
-      </section>` : ''}
+      </div>` : ''}
 
+    <!-- Clip grid or empty state -->
     ${clips.length ? `
-      <div class="panel-head" style="margin-bottom:12px">
-        <h2>${clips.length} clip${clips.length!==1?'s':''} ready</h2>
-        <div style="display:flex;gap:8px">
-          <button data-view="create">+ New</button>
-          <button class="ghost danger-btn" id="clearAllClips">Clear all</button>
-        </div>
+      <div style="margin-bottom:12px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+        <span class="muted" style="font-size:.78rem;font-weight:600">${clips.length} clip${clips.length!==1?'s':''}</span>
       </div>
-      <div class="card-grid">${clips.map(clipCard).join('')}</div>`
-    : activeJobs.length ? `
-      <section class="panel empty-state">
-        <div class="empty-icon processing-pulse" style="display:inline-block;margin-bottom:12px"></div>
+      <div class="clip-grid">${clips.map(clipCard).join('')}</div>
+    ` : activeJobs.length ? `
+      <div class="empty-state" style="padding:60px 24px">
+        <div style="width:52px;height:52px;border-radius:50%;background:rgba(245,158,11,.12);display:flex;align-items:center;justify-content:center;margin-bottom:18px">
+          <div class="processing-pulse"></div>
+        </div>
         <h2>Generating your clips…</h2>
-        <p>This usually takes 2–5 minutes. You'll see them appear here when ready.</p>
-      </section>` : `
-      <section class="panel empty-state">
-        <div class="empty-icon">▶</div>
+        <p>AI is finding the best moments. Usually takes 2–5 minutes.</p>
+      </div>
+    ` : `
+      <div class="empty-state" style="padding:80px 24px">
+        <div style="font-size:3.5rem;margin-bottom:20px;opacity:.15">▶</div>
         <h2>No clips yet</h2>
-        <p>Create a project to generate your first viral clips.</p>
-        <button data-view="create" style="margin-top:20px">Start creating</button>
-      </section>`}`;
+        <p style="max-width:320px">Import a video and let AI find the most viral moments automatically.</p>
+        <button data-view="create" style="margin-top:26px;padding:13px 28px">Create your first clip →</button>
+      </div>`}`;
+
+  // Toolbar events
+  $('#clipsSearchInput')?.addEventListener('input', e => {
+    state.clipsSearch = e.target.value; renderClips();
+  });
+  $('#clipsSortSelect')?.addEventListener('change', e => {
+    state.clipsSort = e.target.value; renderClips();
+  });
+
+  // Bulk actions
+  $('#bulkClear')?.addEventListener('click', () => { state.clipsBulkSelected.clear(); renderClips(); });
+  $('#bulkDelete')?.addEventListener('click', () => {
+    if (!confirm(`Delete ${bulkCount} clip${bulkCount!==1?'s':''}? This cannot be undone.`)) return;
+    const ids = [...state.clipsBulkSelected];
+    Promise.all(ids.map(id => api('/api/clip',{method:'DELETE',body:JSON.stringify({clipId:id})}))).then(loadAll).then(() => {
+      state.clipsBulkSelected.clear(); renderClips();
+    });
+  });
+
+  // Clip card events (preview, bulk select, context menu)
+  $$('.clip-card[data-clip-id]').forEach(card => {
+    const id = card.dataset.clipId;
+    card.addEventListener('click', e => {
+      if (e.target.closest('.clip-action-primary') || e.target.closest('.clip-action-icon') || e.target.closest('.clip-context-menu')) return;
+      if (e.target.closest('.clip-select-check')) {
+        e.stopPropagation();
+        if (state.clipsBulkSelected.has(id)) state.clipsBulkSelected.delete(id);
+        else state.clipsBulkSelected.add(id);
+        renderClips(); return;
+      }
+      openClipModal(id);
+    });
+
+    card.querySelector('.clip-action-primary')?.addEventListener('click', e => {
+      e.stopPropagation(); openClipModal(id);
+    });
+
+    card.querySelector('[data-more-clip]')?.addEventListener('click', e => {
+      e.stopPropagation();
+      state.openMenuClipId = state.openMenuClipId === id ? null : id;
+      renderClips();
+    });
+
+    card.querySelector('[data-delete-clip-id]')?.addEventListener('click', e => {
+      e.stopPropagation();
+      if (!confirm('Delete this clip?')) return;
+      state.openMenuClipId = null;
+      api('/api/clip',{method:'DELETE',body:JSON.stringify({clipId:id})}).then(loadAll).then(renderClips);
+    });
+
+    card.querySelector('[data-open-clip-detail]')?.addEventListener('click', e => {
+      e.stopPropagation();
+      state.openMenuClipId = null;
+      const c = state.library.clips.find(x=>x.id===id);
+      if (c) { state.clip=c; state.hookTab='curiosity'; state.platformTab='tiktok'; setView('clipDetail'); }
+    });
+  });
+
+  // Close any open context menu when clicking elsewhere
+  document.addEventListener('click', function _closer(e) {
+    if (!e.target.closest('[data-more-clip]') && !e.target.closest('.clip-context-menu')) {
+      if (state.openMenuClipId) { state.openMenuClipId = null; renderClips(); }
+      document.removeEventListener('click', _closer);
+    }
+  });
 }
 
 function jobCard(j) {
-  const videos=state.library.videos||[];
-  const vid=videos.find(v=>v.id===j.videoId);
-  const steps=j.steps||[];
-  const isFailed=j.status==='failed';
-  const isActive=['queued','running'].includes(j.status);
-  const actions=isFailed
-    ? `<button data-retry-job="${j.id}">Retry</button><button class="ghost" data-delete-job="${j.id}">Delete</button>`
-    : isActive?`<button class="ghost" data-cancel-job="${j.id}">Cancel</button>`:'';
+  const videos = state.library.videos||[];
+  const vid = videos.find(v=>v.id===j.videoId);
+  const steps = j.steps||[];
+  const isFailed = j.status==='failed';
+  const isActive = ['queued','running'].includes(j.status);
+  const actions = isFailed
+    ? `<button data-retry-job="${j.id}" style="font-size:.78rem;padding:7px 14px">Retry</button><button class="ghost" data-delete-job="${j.id}" style="font-size:.78rem;padding:7px 12px">Delete</button>`
+    : isActive ? `<button class="ghost" data-cancel-job="${j.id}" style="font-size:.78rem;padding:7px 12px">Cancel</button>` : '';
   return `<div class="job-card ${isFailed?'failed':isActive?'active':''}">
     <div class="job-head">
       <div>
-        <b>${esc(vid?.title||'Video')}</b>
-        ${pill(j.stage||j.status, isFailed?'error':isActive?'warn':'ok')}
+        <b style="font-size:.9rem">${esc(vid?.title||'Video')}</b>
+        <span style="margin-left:8px">${pill(j.stage||j.status, isFailed?'error':isActive?'warn':'ok')}</span>
       </div>
       <div class="action-row">${actions}</div>
     </div>
     ${steps.length?`<div class="steps-row">${steps.map(s=>`<div class="step ${s.status}"><span></span><small>${esc(s.label)}</small></div>`).join('')}</div>`:''}
-    ${isActive?`<div class="progress" style="margin-top:8px"><span style="width:${j.progress||0}%"></span></div>`:''}
-    ${j.error?`<p class="error-text">${esc(j.error)}</p>`:''}
+    ${isActive?`<div class="progress" style="margin-top:9px"><span style="width:${j.progress||0}%"></span></div>`:''}
+    ${j.error?`<p class="error-text" style="margin-top:7px">${esc(j.error)}</p>`:''}
   </div>`;
 }
 
 function clipCard(c) {
-  const dur2=Math.round((c.endSeconds||0)-(c.startSeconds||0));
-  const mediaUrl=clipUrl(c.outputPath);
-  const preview=c.thumbnailPath
-    ?`<img src="${c.thumbnailPath}" alt="Clip thumbnail" loading="lazy">`
-    :`<video src="${mediaUrl}" muted playsinline preload="none"></video>`;
-  return `<article class="clip-card" data-open-clip="${c.id}">
-    <div class="clip-preview">${preview}<span class="pill ${scoreColor(c.score)}">${c.score}/100</span><span class="clip-dur">${dur2}s</span></div>
-    <div class="clip-body">
-      <h3>${esc(c.hook||c.title)}</h3>
-      <div class="meta"><span>${when(c.createdAt)}</span><span>${esc(c.bestPlatform||'TikTok')}</span><span>${esc(c.captionStyle||'bold')}</span></div>
-      <div class="score-bars">
-        ${c.hookStrength?`<div class="score-bar"><small>Hook</small><div class="bar"><span style="width:${c.hookStrength*10}%"></span></div></div>`:''}
-        ${c.shareability?`<div class="score-bar"><small>Share</small><div class="bar"><span style="width:${c.shareability*10}%"></span></div></div>`:''}
+  const dur2 = Math.round((c.endSeconds||0)-(c.startSeconds||0));
+  const mediaUrl = clipUrl(c.outputPath);
+  const score = Number(c.score || 0);
+  const hookPct = c.hookStrength ? Math.round(c.hookStrength*10) : score;
+  const viralPct = c.emotionalPunch ? Math.round(c.emotionalPunch*10) : Math.round(score*.9);
+  const sharePct = c.shareability ? Math.round(c.shareability*10) : Math.round(score*.85);
+  const title = clipTitle(c);
+  const isSelected = state.clipsBulkSelected.has(c.id);
+  const menuOpen = state.openMenuClipId === c.id;
+
+  const thumbEl = c.thumbnailPath
+    ? `<img class="clip-thumb-img" src="${esc(c.thumbnailPath)}" alt="${esc(title)}" loading="lazy">`
+    : `<div class="clip-thumb-skeleton skeleton" style="position:absolute;inset:0"></div>`;
+
+  return `<article class="clip-card${isSelected?' selected':''}" data-clip-id="${c.id}">
+    <div class="clip-thumb">
+      ${thumbEl}
+      <div class="clip-thumb-overlay"></div>
+      <div class="clip-thumb-tl">
+        <span class="clip-dur-badge">${dur2}s</span>
+        ${platformBadge(c.bestPlatform)}
       </div>
-      <div class="actions">
-        <button data-open-clip="${c.id}">View</button>
-        <a class="clip-dl-btn button ghost" href="${mediaUrl}" download="clip-${c.id}.mp4">↓ Download</a>
-        <button class="ghost danger-btn" data-delete-clip="${c.id}">Delete</button>
+      <div class="clip-thumb-tr">${scoreChip(score)}</div>
+      <div class="clip-thumb-play"><div class="play-circle">▶</div></div>
+      <div class="clip-select-check">${isSelected?'✓':''}</div>
+    </div>
+    <div class="clip-body">
+      <h3 class="clip-title">${esc(title)}</h3>
+      <div class="clip-analytics">
+        <div class="analytic-row">
+          <span class="analytic-label">🔥 Hook</span>
+          <div class="analytic-bar-wrap">
+            <div class="analytic-bar"><div class="analytic-fill" style="width:${hookPct}%"></div></div>
+            <span class="analytic-pct">${hookPct}%</span>
+          </div>
+        </div>
+        <div class="analytic-row">
+          <span class="analytic-label">❤️ Viral</span>
+          <div class="analytic-bar-wrap">
+            <div class="analytic-bar"><div class="analytic-fill pink" style="width:${viralPct}%"></div></div>
+            <span class="analytic-pct">${viralPct}%</span>
+          </div>
+        </div>
+        <div class="analytic-row">
+          <span class="analytic-label">📤 Share</span>
+          <div class="analytic-bar-wrap">
+            <div class="analytic-bar"><div class="analytic-fill green" style="width:${sharePct}%"></div></div>
+            <span class="analytic-pct">${sharePct}%</span>
+          </div>
+        </div>
+      </div>
+      <div class="clip-meta-row">
+        <span>${when(c.createdAt)}</span>
+        <span>${esc(c.captionStyle||'bold')}</span>
+      </div>
+      <div class="clip-actions" style="position:relative">
+        <button class="clip-action-primary">▶ Preview</button>
+        <a class="clip-action-icon" href="${esc(mediaUrl)}" download="clip-${c.id}.mp4" title="Download" onclick="event.stopPropagation()">⬇</a>
+        <button class="clip-action-icon" data-more-clip="${c.id}" title="More options">•••</button>
+        ${menuOpen ? `
+        <div class="clip-context-menu">
+          <button class="clip-menu-item" data-open-clip-detail="${c.id}"><span class="clip-menu-icon">◎</span>Full detail</button>
+          <button class="clip-menu-item" data-copy="${encodeURIComponent(title)}"><span class="clip-menu-icon">⎘</span>Copy caption</button>
+          <a class="clip-menu-item" href="${esc(mediaUrl)}" download="clip-${c.id}.mp4" onclick="event.stopPropagation()"><span class="clip-menu-icon">⬇</span>Download</a>
+          <div style="height:1px;background:var(--border);margin:5px 0"></div>
+          <button class="clip-menu-item danger" data-delete-clip-id="${c.id}"><span class="clip-menu-icon">✕</span>Delete</button>
+        </div>` : ''}
       </div>
     </div>
   </article>`;
@@ -1990,10 +2260,10 @@ document.addEventListener('click', e => {
   const jump=e.target.closest('[data-view],[data-view-jump]');
   if (jump) { e.preventDefault(); setView(jump.dataset.view||jump.dataset.viewJump); }
 
-  const openClip=e.target.closest('[data-open-clip]');
+  const openClip = e.target.closest('[data-open-clip]');
   if (openClip) {
-    const clip=state.library.clips.find(c=>c.id===openClip.dataset.openClip);
-    if (clip) { state.clip=clip; state.hookTab='curiosity'; state.platformTab='tiktok'; setView('clipDetail'); }
+    const clip = state.library.clips.find(c=>c.id===openClip.dataset.openClip);
+    if (clip) { closeClipModal(); state.clip=clip; state.hookTab='curiosity'; state.platformTab='tiktok'; setView('clipDetail'); }
   }
 
   const copy=e.target.closest('[data-copy]');
