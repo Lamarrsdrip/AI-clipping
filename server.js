@@ -1836,212 +1836,153 @@ async function trackFaces(mediaPath, start, end) {
 //   - maintains safe margins (never crops forehead/mouth)
 //   - applies sharpening for social media clarity
 // faceX: 0..1 relative face center X in source video (from face_track.py), 0.5 = center
-// ─── Auto-Reframe Engine v3 ───────────────────────────────────────
+// ─── Auto-Reframe Engine v4 ───────────────────────────────────────
 //
-// ARCHITECTURE: "Subject-Region Cropping"
+// ARCHITECTURE: "Virtual Camera Pull-Back with Blurred Fill"
 //
-// Instead of "scale to fill portrait height → crop", we:
-//   1. Compute a SUBJECT REGION in source pixels that contains all faces
-//      with generous safe margins (headroom, shoulders, context).
-//   2. Fit that subject region into the portrait canvas.
-//   3. Scale JUST enough to show it — never more.
+// The user wants:
+//   • Exported video ALWAYS fills the 9:16 canvas completely (no black bars)
+//   • The virtual camera "stands further back" — shows head, shoulders, body,
+//     hands, nearby people, and environment instead of just a tight face crop
+//   • For 1 person: crop ~38-42% of source width (moderate pull-back)
+//   • For 2 people: crop ~48-52% of source width (wider to include both)
+//   • For 3+ people: crop ~58-65% of source width (very wide)
 //
-// This means face size in the output is determined by how large faces
-// are in the SOURCE, not by how far we zoom. A wide shot stays wide.
-// A medium shot stays medium. We never artificially punch in.
+// When the crop window is wider than 9:16 allows at full height,
+// we fill the remaining top/bottom space with a BLURRED, darkened version
+// of the full source frame. This is the professional approach used by:
+// CapCut, Adobe Premiere Auto Reframe, Descript, OpusClip.
 //
-// Framing modes:
-//   'original' — pillarbox/letterbox, no zoom
-//   'wide'     — loose framing, lots of context
-//   'medium'   — balanced (default), good for 1–2 people
-//   'close'    — tighter framing for solo close-up content
-//   'dynamic'  — auto-picks based on face count and movement
+// Returns an OBJECT (not a plain string) so renderClip can build the
+// appropriate filter_complex (simple fill vs blurred overlay).
 //
-// faceData from face_track.py (v3) now provides:
-//   meanFaceX, meanFaceY, meanFaceW, meanFaceH — weighted average face
-//   faceCount — max simultaneous faces in any frame
-//   combinedBox — union bbox of all faces detected (x1,y1,x2,y2 in 0..1)
-//   rangeCX — horizontal movement range (>0.15 = lots of movement)
+// { type:'fill',    filter:'...' }          — simple, fills 9:16 exactly
+// { type:'blurred', bgFilter:'...', fgFilter:'...' }  — blurred overlay
 
-function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920, speakerSide='center', clipDuration=30, faceData=null, framingMode='medium') {
+function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920,
+                              speakerSide='center', clipDuration=30,
+                              faceData=null, framingMode='dynamic') {
 
-  // ── Portrait/square source: just scale+center-crop, no punch-in ──
+  // ── Portrait / square source: scale-to-fill + center-crop ────────
   if (srcH >= srcW) {
-    const scale = Math.max(outW / srcW, outH / srcH);
-    const sW = Math.ceil(srcW * scale / 2) * 2;
-    const sH = Math.ceil(srcH * scale / 2) * 2;
+    const sf = Math.max(outW / srcW, outH / srcH);
+    const sW = Math.ceil(srcW * sf / 2) * 2;
+    const sH = Math.ceil(srcH * sf / 2) * 2;
     const cx = Math.floor((sW - outW) / 2);
     const cy = Math.floor((sH - outH) / 2);
-    return [`scale=${sW}:${sH}:flags=lanczos`, `crop=${outW}:${outH}:${cx}:${cy}`, `setsar=1`].join(',');
+    return {
+      type: 'fill',
+      filter: [`scale=${sW}:${sH}:flags=lanczos`, `crop=${outW}:${outH}:${cx}:${cy}`, `setsar=1`].join(',')
+    };
   }
 
-  // ── Framing mode: 'original' → no crop, pure pillarbox ───────────
-  if (framingMode === 'original') {
-    const scale = outW / srcW;
-    const sH    = Math.round(srcH * scale / 2) * 2;
-    const padTop = Math.floor((outH - sH) / 2);
-    if (sH >= outH) {
-      return [`scale=${outW}:${outH}:flags=lanczos`, `setsar=1`].join(',');
-    }
-    return [`scale=${outW}:${sH}:flags=lanczos`, `pad=${outW}:${outH}:0:${padTop}:color=black`, `setsar=1`].join(',');
-  }
+  // ── Landscape → portrait ──────────────────────────────────────────
 
-  // ── Determine safe margins based on face data ─────────────────────
-  //
-  // We build a SUBJECT REGION in normalised 0..1 source coordinates.
-  // The subject region is what must appear in the output frame.
-  // Then we scale/crop exactly enough to show it.
+  const portAspect = outW / outH;  // 9/16 = 0.5625
 
-  const portAspect = outW / outH; // 0.5625 for 9:16
+  // tightFrac = the crop fraction that EXACTLY fills portrait height with no blur.
+  // For 1920×1080 → 1080×1920: tightFrac = 1080/3413 ≈ 0.3164
+  const tightFrac = portAspect * (srcH / srcW);
 
-  // Face data from the new face_track.py
-  const faceCount  = faceData?.faceCount  ?? 1;
-  const meanFaceW  = faceData?.meanFaceW  ?? 0;  // relative face width in source
-  const meanFaceH  = faceData?.meanFaceH  ?? 0;
-  const meanFaceX  = faceData?.meanFaceX  ?? (speakerSide === 'left' ? 0.35 : speakerSide === 'right' ? 0.65 : 0.5);
-  const meanFaceY  = faceData?.meanFaceY  ?? 0.38;
-  const rangeCX    = faceData?.rangeCX    ?? 0;
-  const cb         = faceData?.combinedBox ?? { x1: 0.15, y1: 0.05, x2: 0.85, y2: 0.90 };
+  // ── Face data ─────────────────────────────────────────────────────
+  const faceCount   = faceData?.faceCount   ?? 1;
+  const hasFaces    = (faceData?.totalDets  ?? 0) > 0;
+  const meanFaceX   = faceData?.meanFaceX   ?? (speakerSide === 'left' ? 0.35 : speakerSide === 'right' ? 0.65 : 0.5);
+  const rangeCX     = faceData?.rangeCX     ?? 0;
+  const combinedBox = faceData?.combinedBox ?? null;
 
-  // Has face detection actually found faces?
-  const hasFaces   = (faceData?.totalDets ?? 0) > 0 && meanFaceW > 0.01;
+  // ── Decide crop fraction based on framing mode + face count ──────
+  // cropFrac = what fraction of the source WIDTH to include in the crop.
+  // Larger = more context but needs more blurred fill at top/bottom.
+  let cropFrac;
 
-  // ── Safe margin multipliers (relative to face height) ────────────
-  // These are the key numbers: how much EXTRA space we add around faces.
-  // Higher values = more context = zoomed-out look.
-  let topMul, bottomMul, sideMul;
   if (framingMode === 'close') {
-    // Tight but still showing shoulders
-    topMul    = 0.35;  // 35% of face height above head
-    bottomMul = 1.8;   // 1.8× face heights below (shoulders)
-    sideMul   = 0.7;   // 0.7× face width on each side
+    // Tight — exactly the v2 "fill height" behavior, no blur needed
+    cropFrac = tightFrac;
+  } else if (framingMode === 'medium') {
+    // Slight pull-back for single speaker; more for multi-person
+    cropFrac = hasFaces && faceCount >= 2 ? 0.44 : 0.40;
   } else if (framingMode === 'wide') {
-    // Very open — lots of environment
-    topMul    = 1.2;
-    bottomMul = 4.5;
-    sideMul   = 2.5;
+    cropFrac = hasFaces && faceCount >= 2 ? 0.58 : 0.50;
+  } else if (framingMode === 'original') {
+    // Show full source width — heavy blur fill
+    cropFrac = 0.70;  // cap at 70% for practical blur strip size
   } else {
-    // 'medium' or 'dynamic' — default balanced framing
-    topMul    = 0.6;   // 60% of face height above head (headroom)
-    bottomMul = 3.0;   // 3× face heights below (shows torso/hands)
-    sideMul   = 1.5;   // 1.5× face width on each side
-  }
-
-  // ── Adapt margins for face count ('dynamic' mode auto-zooms out) ─
-  if (framingMode === 'dynamic' || !hasFaces) {
-    if (faceCount >= 3) {
-      topMul *= 1.5; bottomMul *= 1.5; sideMul *= 2.2;
+    // 'dynamic': auto-pick based on face count + movement
+    if (!hasFaces) {
+      cropFrac = 0.42;          // no faces: moderate pull-back
+    } else if (faceCount >= 3) {
+      cropFrac = 0.60;          // 3+ people: wide group shot
     } else if (faceCount === 2) {
-      topMul *= 1.2; bottomMul *= 1.3; sideMul *= 1.8;
+      cropFrac = 0.48;          // 2 people: show both comfortably
+    } else {
+      // Single speaker: base = 0.38 (moderate pull-back)
+      // — if speaker is moving a lot, give more horizontal room
+      cropFrac = rangeCX > 0.20 ? 0.44 : 0.38;
     }
-    // Lots of horizontal movement → zoom out for breathing room
-    if (rangeCX > 0.20) {
-      sideMul *= 1.4;
-    }
   }
 
-  // ── Build subject region in normalised coordinates ────────────────
-  let subX1, subY1, subX2, subY2;
+  // Never less than tightFrac (otherwise we'd be zooming IN beyond v2)
+  cropFrac = Math.max(tightFrac, cropFrac);
 
-  if (hasFaces) {
-    // Use the combined bounding box of ALL faces + safe margins.
-    // The combined box already spans multiple speakers.
-    const facePxW = meanFaceW;
-    const facePxH = meanFaceH;
+  // ── Compute crop window in source pixels ──────────────────────────
+  let cropW = Math.round(Math.min(srcW, cropFrac * srcW) / 2) * 2;
+  const cropH = srcH;  // always use full source height
 
-    subX1 = cb.x1 - sideMul   * facePxW;
-    subY1 = cb.y1 - topMul    * facePxH;
-    subX2 = cb.x2 + sideMul   * facePxW;
-    subY2 = cb.y2 + bottomMul * facePxH;
+  // ── Position crop X center ────────────────────────────────────────
+  // Prefer the combined bounding box center if we have multi-person data.
+  let faceCenterX;
+  if (hasFaces && combinedBox && faceCount >= 2) {
+    // Center between all detected faces
+    faceCenterX = ((combinedBox.x1 + combinedBox.x2) / 2) * srcW;
   } else {
-    // No faces: for landscape content with no speakers, use a generous crop.
-    // Default: show the central 80% of the frame, centered.
-    subX1 = 0.10;
-    subY1 = 0.0;
-    subX2 = 0.90;
-    subY2 = 1.0;
+    // Single speaker or no faces: follow meanFaceX
+    const clampedFX = Math.max(0.08, Math.min(0.92, meanFaceX));
+    faceCenterX = clampedFX * srcW;
   }
 
-  // Clamp to valid range but DON'T clamp too tightly — we handle overflow below
-  subX1 = Math.max(-0.1, subX1);
-  subY1 = Math.max(-0.05, subY1);
-  subX2 = Math.min( 1.1, subX2);
-  subY2 = Math.min( 1.05, subY2);
+  // Clamp so crop stays inside source
+  const halfW = cropW / 2;
+  faceCenterX = Math.max(halfW, Math.min(srcW - halfW, faceCenterX));
+  const cropX = Math.round(faceCenterX - halfW);
 
-  let subW = subX2 - subX1;
-  let subH = subY2 - subY1;
+  // ── Compute how tall the scaled foreground will be ────────────────
+  // Foreground is scaled so its WIDTH = outW (portrait width = 1080)
+  // sf_fg = outW / cropW
+  // scaledH = cropH * sf_fg = srcH * outW / cropW
+  const scaledH = Math.round(srcH * outW / cropW / 2) * 2;
 
-  // ── Match portrait aspect ratio ───────────────────────────────────
-  const subAspect = subW / subH;
-  if (subAspect > portAspect) {
-    // Subject region is wider than 9:16 → expand height to match
-    const targetH = subW / portAspect;
-    const extraH  = targetH - subH;
-    subY1 -= extraH * 0.35;  // bias: add 35% above (headroom), 65% below (body)
-    subY2 += extraH * 0.65;
-    subH   = subY2 - subY1;
-  } else {
-    // Subject region is narrower than 9:16 → expand width equally both sides
-    const targetW = subH * portAspect;
-    const extraW  = targetW - subW;
-    subX1 -= extraW / 2;
-    subX2 += extraW / 2;
-    subW   = subX2 - subX1;
+  // ── Simple fill case: scaledH fills or nearly fills portrait (±4px rounding) ──
+  if (scaledH >= outH - 4) {
+    // Standard crop+scale, forces exact portrait size (no black bars)
+    const finalCropH = Math.min(cropH, Math.round(outH * cropW / outW / 2) * 2);
+    return {
+      type: 'fill',
+      filter: [
+        `crop=${cropW}:${finalCropH}:${cropX}:0`,
+        `scale=${outW}:${outH}:flags=lanczos`,
+        `setsar=1`
+      ].join(',')
+    };
   }
 
-  // ── Convert to source pixels ──────────────────────────────────────
-  let cropX = Math.round(subX1 * srcW);
-  let cropY = Math.round(subY1 * srcH);
-  let cropW = Math.round(subW  * srcW);
-  let cropH = Math.round(subH  * srcH);
+  // ── Blurred fill case: scaledH < outH ────────────────────────────
+  // Background: full source scaled to fill portrait, heavily blurred + darkened
+  // Foreground: smart crop, scaled to portrait width, centered vertically
+  const bgFilter = [
+    `scale=${outW}:${outH}:force_original_aspect_ratio=increase:flags=lanczos`,
+    `crop=${outW}:${outH}`,
+    `gblur=sigma=30`,
+    `colorchannelmixer=aa=0.55`,  // 55% brightness — darker background
+  ].join(',');
 
-  // Enforce even dimensions (H.264 requirement)
-  cropW = Math.max(2, cropW - (cropW % 2));
-  cropH = Math.max(2, cropH - (cropH % 2));
+  const fgFilter = [
+    `crop=${cropW}:${cropH}:${cropX}:0`,
+    `scale=${outW}:${scaledH}:flags=lanczos`,
+    `setsar=1`,
+  ].join(',');
 
-  // Hard clamp to source bounds (we'll add padding if needed)
-  const needsPadL = cropX < 0 ? -cropX : 0;
-  const needsPadT = cropY < 0 ? -cropY : 0;
-  const needsPadR = cropX + cropW > srcW ? cropX + cropW - srcW : 0;
-  const needsPadB = cropY + cropH > srcH ? cropY + cropH - srcH : 0;
-
-  const hasPad = needsPadL > 0 || needsPadT > 0 || needsPadR > 0 || needsPadB > 0;
-
-  // Clamp crop to source
-  const clampedX  = Math.max(0, Math.min(srcW - cropW, cropX));
-  const clampedY  = Math.max(0, Math.min(srcH - cropH, cropY));
-  const clampedCW = Math.min(cropW, srcW  - clampedX);
-  const clampedCH = Math.min(cropH, srcH  - clampedY);
-
-  // Round to even
-  const finalCW = Math.max(2, clampedCW - (clampedCW % 2));
-  const finalCH = Math.max(2, clampedCH - (clampedCH % 2));
-  const finalX  = Math.max(0, Math.min(srcW - finalCW, clampedX));
-  const finalY  = Math.max(0, Math.min(srcH - finalCH, clampedY));
-
-  // ── Build FFmpeg filter chain ─────────────────────────────────────
-  const filters = [];
-
-  if (hasPad) {
-    // Pad the source first to add border, then crop the padded frame
-    const padL = Math.ceil(needsPadL / 2) * 2;
-    const padT = Math.ceil(needsPadT / 2) * 2;
-    const padR = Math.ceil(needsPadR / 2) * 2;
-    const padB = Math.ceil(needsPadB / 2) * 2;
-    const paddedW = srcW + padL + padR;
-    const paddedH = srcH + padT + padB;
-    const paddedCropX = Math.max(0, finalX + padL - needsPadL);
-    const paddedCropY = Math.max(0, finalY + padT - needsPadT);
-    filters.push(`pad=${paddedW}:${paddedH}:${padL}:${padT}:color=black`);
-    filters.push(`crop=${cropW}:${cropH}:${paddedCropX}:${paddedCropY}`);
-  } else {
-    filters.push(`crop=${finalCW}:${finalCH}:${finalX}:${finalY}`);
-  }
-
-  filters.push(`scale=${outW}:${outH}:flags=lanczos`);
-  filters.push(`setsar=1`);
-
-  return filters.join(',');
+  return { type: 'blurred', bgFilter, fgFilter, scaledH };
 }
 
 // ─── Pipeline Stage 5: Quality validator ─────────────────────────
@@ -2177,13 +2118,13 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   try { writeFileSync(assPath, assContent, 'utf8'); hasASS = true; } catch {}
 
   // ── Stage 6: Filter complex ───────────────────────────────────
-  // framingMode: default 'dynamic' lets the engine auto-pick based on face count.
-  // Callers can pass moment.framingMode to override (e.g., 'wide', 'close').
   const framingMode = moment.framingMode || 'dynamic';
-  const portraitF = buildPortraitFilter(srcW, srcH, RW, RH, speakerSide, clipDuration, faceData, framingMode);
-  const assF      = hasASS ? `,ass='${assPath}'` : '';
+  // pfObj.type === 'fill'    → pfObj.filter fills portrait completely, no blur needed
+  // pfObj.type === 'blurred' → pfObj.bgFilter + pfObj.fgFilter for blurred-bg overlay
+  const pfObj  = buildPortraitFilter(srcW, srcH, RW, RH, speakerSide, clipDuration, faceData, framingMode);
+  const assF   = hasASS ? `,ass='${assPath}'` : '';
   // loudnorm: broadcast-standard loudness (-14 LUFS), prevents clipping
-  const audioF    = 'acompressor=threshold=0.089:ratio=4:attack=5:release=50,loudnorm=I=-14:TP=-1.5:LRA=11';
+  const audioF = 'acompressor=threshold=0.089:ratio=4:attack=5:release=50,loudnorm=I=-14:TP=-1.5:LRA=11';
   const encodeArgs = [
     '-c:v', 'libx264', '-preset', 'fast',
     '-crf', String(renderCfg.crf), '-maxrate', renderCfg.maxrate, '-bufsize', renderCfg.bufsize,
@@ -2198,13 +2139,33 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
       `[0:a]atrim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`,
     ].join(';')).join(';');
     const cIn = edlSegs.map((_, i) => `[v${i}][a${i}]`).join('');
-    filterComplex =
-      `${trims};${cIn}concat=n=${edlSegs.length}:v=1:a=1[vcat][acat];` +
-      `[vcat]${portraitF}${assF}[vout];[acat]${audioF}[aout]`;
+    if (pfObj.type === 'fill') {
+      filterComplex =
+        `${trims};${cIn}concat=n=${edlSegs.length}:v=1:a=1[vcat][acat];` +
+        `[vcat]${pfObj.filter}${assF}[vout];[acat]${audioF}[aout]`;
+    } else {
+      // Blurred fill: split stream → bg (blurred full frame) + fg (smart crop), overlay centered
+      filterComplex =
+        `${trims};${cIn}concat=n=${edlSegs.length}:v=1:a=1[vcat][acat];` +
+        `[vcat]split[_vbg][_vfg];` +
+        `[_vbg]${pfObj.bgFilter}[_bg];` +
+        `[_vfg]${pfObj.fgFilter}[_fg];` +
+        `[_bg][_fg]overlay=x=(W-w)/2:y=(H-h)/2${assF}[vout];` +
+        `[acat]${audioF}[aout]`;
+    }
   } else {
-    filterComplex =
-      `[0:v]trim=start=${effectiveStart.toFixed(3)}:end=${moment.end.toFixed(3)},setpts=PTS-STARTPTS,${portraitF}${assF}[vout];` +
-      `[0:a]atrim=start=${effectiveStart.toFixed(3)}:end=${moment.end.toFixed(3)},asetpts=PTS-STARTPTS,${audioF}[aout]`;
+    if (pfObj.type === 'fill') {
+      filterComplex =
+        `[0:v]trim=start=${effectiveStart.toFixed(3)}:end=${moment.end.toFixed(3)},setpts=PTS-STARTPTS,${pfObj.filter}${assF}[vout];` +
+        `[0:a]atrim=start=${effectiveStart.toFixed(3)}:end=${moment.end.toFixed(3)},asetpts=PTS-STARTPTS,${audioF}[aout]`;
+    } else {
+      filterComplex =
+        `[0:v]trim=start=${effectiveStart.toFixed(3)}:end=${moment.end.toFixed(3)},setpts=PTS-STARTPTS,split[_vbg][_vfg];` +
+        `[_vbg]${pfObj.bgFilter}[_bg];` +
+        `[_vfg]${pfObj.fgFilter}[_fg];` +
+        `[_bg][_fg]overlay=x=(W-w)/2:y=(H-h)/2${assF}[vout];` +
+        `[0:a]atrim=start=${effectiveStart.toFixed(3)}:end=${moment.end.toFixed(3)},asetpts=PTS-STARTPTS,${audioF}[aout]`;
+    }
   }
   vMap = '[vout]'; aMap = '[aout]';
 
@@ -2215,19 +2176,29 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
       '-filter_complex', filterComplex,
       '-map', vMap, '-map', aMap,
       ...encodeArgs, output,
-    ], { jobId, label: 'render-v2', timeoutMs: PROCESS_TIMEOUT_MS });
+    ], { jobId, label: 'render-v4', timeoutMs: PROCESS_TIMEOUT_MS });
   } catch (renderErr) {
-    console.warn('[render:v3-fallback]', { clipId, err: String(renderErr.message||renderErr).slice(0,300) });
+    console.warn('[render:v4-fallback]', { clipId, err: String(renderErr.message||renderErr).slice(0,300) });
     try { if (existsSync(output)) unlinkSync(output); } catch {}
     // Fallback: single-pass with portrait + basic audio, no EDL/ASS
     const fallbackAssF = hasASS ? `,ass='${assPath}'` : '';
-    const fallbackPortrait = buildPortraitFilter(srcW, srcH, RW, RH, speakerSide, clipDuration, faceData, framingMode);
-    await run(FFMPEG, [
-      '-y', '-ss', String(effectiveStart), '-to', String(moment.end), '-i', mediaPath,
-      '-vf', `${fallbackPortrait}${fallbackAssF}`,
-      '-af', audioF,
-      ...encodeArgs, output,
-    ], { jobId, label: 'render-fallback', timeoutMs: PROCESS_TIMEOUT_MS });
+    const fallbackPf   = buildPortraitFilter(srcW, srcH, RW, RH, speakerSide, clipDuration, faceData, framingMode);
+    if (fallbackPf.type === 'fill') {
+      await run(FFMPEG, [
+        '-y', '-ss', String(effectiveStart), '-to', String(moment.end), '-i', mediaPath,
+        '-vf', `${fallbackPf.filter}${fallbackAssF}`,
+        '-af', audioF,
+        ...encodeArgs, output,
+      ], { jobId, label: 'render-fallback', timeoutMs: PROCESS_TIMEOUT_MS });
+    } else {
+      await run(FFMPEG, [
+        '-y', '-ss', String(effectiveStart), '-to', String(moment.end), '-i', mediaPath,
+        '-filter_complex',
+        `[0:v]split[_vbg][_vfg];[_vbg]${fallbackPf.bgFilter}[_bg];[_vfg]${fallbackPf.fgFilter}[_fg];[_bg][_fg]overlay=x=(W-w)/2:y=(H-h)/2${fallbackAssF}[vout];[0:a]${audioF}[aout]`,
+        '-map', '[vout]', '-map', '[aout]',
+        ...encodeArgs, output,
+      ], { jobId, label: 'render-fallback-blurred', timeoutMs: PROCESS_TIMEOUT_MS });
+    }
   } finally {
     try { if (existsSync(assPath)) unlinkSync(assPath); } catch {}
   }

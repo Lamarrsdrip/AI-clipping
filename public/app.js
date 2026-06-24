@@ -2110,13 +2110,40 @@ function renderAdmin() {
         </form>
       </section>
 
-      <!-- ── Users ── -->
+      <!-- ── Users + Credit Management ── -->
       <section class="panel" style="margin-top:16px">
-        <h2 style="margin-bottom:12px">Users</h2>
-        <div class="admin-table">
-          ${users.map(u=>`<div class="admin-row">
-            <div><b>${esc(u.name||u.email)}</b> <small class="muted">${esc(u.email)}</small></div>
-            <div class="meta">${pill(u.plan||'Free')}<span>${u.credits||0} credits</span>${pill(u.role||'user',u.role==='admin'?'ok':'')}</div>
+        <div class="panel-head" style="margin-bottom:14px">
+          <h2>Users</h2>
+          <span class="muted">${users.length} accounts</span>
+        </div>
+        <div class="admin-table" id="adminUsersTable">
+          ${users.map(u=>`<div class="admin-row" data-user-id="${u.id}">
+            <div>
+              <b>${esc(u.name||u.email)}</b>
+              <small class="muted" style="display:block;margin-top:2px">${esc(u.email)}</small>
+            </div>
+            <div class="meta" style="flex-wrap:wrap;gap:8px">
+              ${pill(u.plan||'Free')}
+              <span class="credits-badge" data-uid="${u.id}" style="font-weight:600;color:var(--primary2)">${u.credits||0} credits</span>
+              ${pill(u.role||'user',u.role==='admin'?'ok':'')}
+              ${u.suspended?'<span class="pill error">Suspended</span>':''}
+            </div>
+            <div class="admin-credit-controls" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px">
+              <input type="number" class="credit-amount-input" placeholder="Amount" min="1" max="99999"
+                style="width:100px;padding:6px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;color:var(--fg);font-size:.84rem">
+              <button class="ghost admin-add-credits" data-uid="${u.id}" style="padding:7px 14px;font-size:.82rem">+ Add</button>
+              <button class="ghost admin-remove-credits" data-uid="${u.id}" style="padding:7px 14px;font-size:.82rem;color:#ff6b6b;border-color:#ff6b6b33">− Remove</button>
+              <button class="ghost admin-set-credits" data-uid="${u.id}" style="padding:7px 14px;font-size:.82rem">Set</button>
+              <select class="admin-plan-select" data-uid="${u.id}"
+                style="padding:6px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;color:var(--fg);font-size:.82rem">
+                <option value="">Change plan…</option>
+                <option value="free">Free</option>
+                <option value="starter">Starter</option>
+                <option value="creator">Creator</option>
+                <option value="studio">Studio</option>
+              </select>
+              <span class="admin-user-msg" data-uid="${u.id}" style="font-size:.78rem;color:var(--primary2)"></span>
+            </div>
           </div>`).join('')}
         </div>
       </section>
@@ -2226,6 +2253,59 @@ function renderAdmin() {
       $('#mediaKeyResult').innerHTML='<div class="verify-ok">Saved ✓</div>';
       setTimeout(()=>{ $('#mediaKeyResult').innerHTML=''; },3000);
     } catch(err) { alert(err.message); }
+  });
+
+  // ── Admin credit / plan management ────────────────────────────
+  async function adminUserPatch(userId, payload, row) {
+    const msgEl = row?.querySelector(`.admin-user-msg[data-uid="${userId}"]`);
+    const credBadge = row?.querySelector(`.credits-badge[data-uid="${userId}"]`);
+    try {
+      const res = await api('/api/admin/users', { method:'PATCH', body:JSON.stringify({ userId, ...payload }) });
+      const updated = (res.users||[]).find(u => u.id === userId);
+      if (updated && credBadge) credBadge.textContent = `${updated.credits||0} credits`;
+      if (msgEl) { msgEl.textContent = '✓ Saved'; setTimeout(()=>{ msgEl.textContent=''; }, 2500); }
+      // Refresh local library
+      if (state.library?.users) {
+        const idx = state.library.users.findIndex(u => u.id === userId);
+        if (idx !== -1 && updated) state.library.users[idx] = { ...state.library.users[idx], ...updated };
+      }
+    } catch(err) {
+      if (msgEl) { msgEl.style.color='#ff6b6b'; msgEl.textContent = err.message; setTimeout(()=>{ msgEl.style.color=''; msgEl.textContent=''; }, 4000); }
+    }
+  }
+
+  $('#adminUsersTable')?.addEventListener('click', async e => {
+    const row = e.target.closest('[data-user-id]');
+    if (!row) return;
+    const userId = row.dataset.userId;
+    const amountInput = row.querySelector('.credit-amount-input');
+    const amount = parseInt(amountInput?.value || '0', 10);
+
+    if (e.target.closest('.admin-add-credits')) {
+      if (!amount || amount < 1) { amountInput?.focus(); return; }
+      await adminUserPatch(userId, { creditDelta: amount }, row);
+      if (amountInput) amountInput.value = '';
+    } else if (e.target.closest('.admin-remove-credits')) {
+      if (!amount || amount < 1) { amountInput?.focus(); return; }
+      await adminUserPatch(userId, { creditDelta: -amount }, row);
+      if (amountInput) amountInput.value = '';
+    } else if (e.target.closest('.admin-set-credits')) {
+      if (isNaN(amount)) { amountInput?.focus(); return; }
+      const current = state.library?.users?.find(u=>u.id===userId)?.credits || 0;
+      const delta = amount - current;
+      await adminUserPatch(userId, { creditDelta: delta }, row);
+      if (amountInput) amountInput.value = '';
+    }
+  });
+
+  $('#adminUsersTable')?.addEventListener('change', async e => {
+    const sel = e.target.closest('.admin-plan-select');
+    if (!sel || !sel.value) return;
+    const row = sel.closest('[data-user-id]');
+    const userId = row?.dataset?.userId;
+    if (!userId) return;
+    await adminUserPatch(userId, { plan: sel.value }, row);
+    sel.value = '';
   });
 }
 

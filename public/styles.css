@@ -1253,7 +1253,9 @@ label { font-size:.8rem; font-weight:600; color:var(--muted); display:block; mar
 .admin-stats { display:grid; grid-template-columns:repeat(4,1fr); gap:11px; }
 @media (max-width:600px) { .admin-stats { grid-template-columns:repeat(2,1fr); } }
 .admin-table { display:flex; flex-direction:column; gap:3px; }
-.admin-row { display:flex; align-items:center; justify-content:space-between; padding:10px 12px; background:rgba(255,255,255,.03); border-radius:9px; flex-wrap:wrap; gap:7px; }
+.admin-row { display:flex; align-items:flex-start; justify-content:space-between; padding:12px 14px; background:rgba(255,255,255,.03); border-radius:11px; border:1px solid transparent; flex-wrap:wrap; gap:8px; transition:border-color .15s; }
+.admin-row:hover { border-color:var(--border); }
+.admin-credit-controls { width:100%; padding-top:4px; border-top:1px solid var(--border); }
 .log-list { display:flex; flex-direction:column; gap:4px; }
 .log-row { display:flex; align-items:center; gap:9px; font-size:.8rem; padding:7px 0; border-bottom:1px solid var(--border); flex-wrap:wrap; }
 .log-row:last-child { border:none; }
