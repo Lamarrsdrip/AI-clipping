@@ -1595,35 +1595,64 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
   if (!cw.length) return header;
 
-  // Build caption events.
-  // Strategy: show the WHOLE PHRASE continuously from phrase[0].rs to phrase[-1].re.
-  // For each word in the phrase, emit one dialogue line:
-  //   • Start = this word's start time
-  //   • End   = next word's start time (seamless chain) OR phrase end for last word
-  //   • Text  = full phrase, with ONLY this word highlighted
-  // This gives true karaoke sync: the phrase is always on screen,
-  // the highlight hops word-by-word with NO gaps.
+  // Build caption events — karaoke-style word-by-word highlighting.
+  //
+  // Each PHRASE (group of SZ words) is shown as a continuous block.
+  // Within the block, one word is highlighted at a time.
+  // Key timing rules:
+  //   • Each word's highlight ends when the NEXT word starts (seamless hand-off)
+  //   • The last word's display is capped to its actual end time + 150ms max linger
+  //   • A 60ms gap is enforced between consecutive phrases (prevents bleed-through)
+  //   • Individual word highlight is capped at 650ms (prevents stuck words from bad Whisper ts)
+
+  const MAX_WORD_LINGER   = 0.15;  // seconds the last word can show after it ends
+  const MAX_WORD_HIGHLIGHT = 0.65; // hard cap on any single word's highlight window
+  const INTER_PHRASE_GAP  = 0.06; // minimum silence between consecutive phrases
+
+  // Build phrase groups
+  const phrases = [];
+  for (let i = 0; i < cw.length; i += SZ) {
+    phrases.push(cw.slice(i, i + SZ));
+  }
+
+  // Enforce inter-phrase gap: shorten current phrase end if it bleeds into the next
+  for (let pi = 0; pi < phrases.length - 1; pi++) {
+    const cur  = phrases[pi];
+    const nxt  = phrases[pi + 1];
+    const curLastWord = cur[cur.length - 1];
+    const nxtFirstWord = nxt[0];
+    const maxEnd = nxtFirstWord.rs - INTER_PHRASE_GAP;
+    if (curLastWord.re > maxEnd) {
+      curLastWord.re = Math.max(curLastWord.rs + 0.04, maxEnd);
+    }
+  }
 
   const events = [];
-  for (let i = 0; i < cw.length; i += SZ) {
-    const phrase   = cw.slice(i, i + SZ);
-    const phraseS  = phrase[0].rs;
-    const phraseE  = phrase[phrase.length - 1].re;
-    if (phraseE <= phraseS) continue;
+  for (let pi = 0; pi < phrases.length; pi++) {
+    const phrase  = phrases[pi];
+    const phraseS = phrase[0].rs;
+    // Cap phrase end: last word end + linger, but never past next phrase start
+    const lastW   = phrase[phrase.length - 1];
+    const phraseE = Math.min(
+      lastW.re + MAX_WORD_LINGER,
+      pi < phrases.length - 1 ? phrases[pi + 1][0].rs - INTER_PHRASE_GAP : lastW.re + MAX_WORD_LINGER
+    );
+    if (phraseE <= phraseS + 0.02) continue;
 
     for (let wi = 0; wi < phrase.length; wi++) {
       const w    = phrase[wi];
       const nxtW = phrase[wi + 1];
       if (w.rs < 0 || w.re <= w.rs) continue;
 
-      // Word display window: this word's start → next word's start (or phrase end).
-      // Clamp to phrase bounds so dialogue events never overlap across phrases.
       const lineStart = Math.max(phraseS, w.rs);
-      const lineEnd   = nxtW
+      // End: next word's start (seamless) or capped phrase end for last word
+      let lineEnd = nxtW
         ? Math.min(phraseE, Math.max(w.re, nxtW.rs))
         : phraseE;
+      // Hard cap: no single word shown longer than MAX_WORD_HIGHLIGHT
+      lineEnd = Math.min(lineEnd, lineStart + MAX_WORD_HIGHLIGHT);
 
-      if (lineEnd <= lineStart) continue;
+      if (lineEnd <= lineStart + 0.01) continue;
 
       const parts = phrase.map((pw, j) =>
         j === wi
@@ -1831,158 +1860,200 @@ async function trackFaces(mediaPath, start, end) {
   }
 }
 
-// Produces a landscape→portrait crop that:
-//   - uses face X position (from ML) or stereo side heuristic for horizontal tracking
-//   - maintains safe margins (never crops forehead/mouth)
-//   - applies sharpening for social media clarity
-// faceX: 0..1 relative face center X in source video (from face_track.py), 0.5 = center
-// ─── Auto-Reframe Engine v4 ───────────────────────────────────────
+// ─── Auto-Reframe Engine v5 ───────────────────────────────────────
 //
-// ARCHITECTURE: "Virtual Camera Pull-Back with Blurred Fill"
+// ARCHITECTURE: "Cinematic Virtual Camera with Smooth Temporal Tracking"
 //
-// The user wants:
-//   • Exported video ALWAYS fills the 9:16 canvas completely (no black bars)
-//   • The virtual camera "stands further back" — shows head, shoulders, body,
-//     hands, nearby people, and environment instead of just a tight face crop
-//   • For 1 person: crop ~38-42% of source width (moderate pull-back)
-//   • For 2 people: crop ~48-52% of source width (wider to include both)
-//   • For 3+ people: crop ~58-65% of source width (very wide)
+// Key improvements over v4:
+//   • Per-frame keyframe tracking: camera follows subjects smoothly
+//   • Scene-type-aware framing: interview/podcast/group get different rules
+//   • Dynamic crop X expression: smooth FFmpeg per-frame evaluation (non-EDL)
+//   • Per-segment crop positions for EDL (accurate even after silence removal)
+//   • Blurred background fill: NO black bars, always fills 9:16 completely
+//   • Motion prediction already applied by face_track.py (velocity-based leading)
 //
-// When the crop window is wider than 9:16 allows at full height,
-// we fill the remaining top/bottom space with a BLURRED, darkened version
-// of the full source frame. This is the professional approach used by:
-// CapCut, Adobe Premiere Auto Reframe, Descript, OpusClip.
-//
-// Returns an OBJECT (not a plain string) so renderClip can build the
-// appropriate filter_complex (simple fill vs blurred overlay).
-//
-// { type:'fill',    filter:'...' }          — simple, fills 9:16 exactly
-// { type:'blurred', bgFilter:'...', fgFilter:'...' }  — blurred overlay
+// buildPortraitFilter() returns an INFO OBJECT consumed by renderClip.
+// renderClip chooses between:
+//   EDL path:     per-segment static crop X (keyframe average per segment)
+//   non-EDL path: dynamic FFmpeg crop=...eval=frame expression (smooth tracking)
 
+// ── Helper: piecewise-linear FFmpeg expression for smooth crop X ──
+function buildCropXExpr(keyframes, cropW, srcW, timeOffset = 0) {
+  // keyframes: [{t (clip-relative seconds), cx (0..1), confidence}]
+  // timeOffset: subtract from t to shift into output timeline (for blackOffset)
+  // Returns an FFmpeg arithmetic expression for the x parameter of crop=
+  const defaultX = Math.max(0, Math.min(srcW - cropW, Math.round(0.5 * srcW - cropW / 2)));
+
+  if (!keyframes || keyframes.length === 0) return String(defaultX);
+
+  const pts = keyframes
+    .map(kf => ({
+      t: Math.max(0, kf.t - timeOffset),
+      x: Math.max(0, Math.min(srcW - cropW, Math.round(kf.cx * srcW - cropW / 2))),
+    }))
+    .filter(p => p.t >= -0.1)
+    .sort((a, b) => a.t - b.t);
+
+  if (pts.length === 0) return String(defaultX);
+  if (pts.length === 1) return String(pts[0].x);
+
+  // Build nested piecewise-linear if-expression (evaluated per frame by FFmpeg)
+  // Format: if(lt(t, T1), lerp(X0,X1,...), if(lt(t, T2), lerp(...), ... Xlast))
+  let expr = String(pts[pts.length - 1].x);
+  for (let i = pts.length - 2; i >= 0; i--) {
+    const { t: t0, x: x0 } = pts[i];
+    const { t: t1, x: x1 } = pts[i + 1];
+    const dt = Math.max(0.001, t1 - t0);
+    if (Math.abs(x1 - x0) < 4) {
+      // Negligible movement: use constant value
+      expr = `if(lt(t,${t1.toFixed(3)}),${x0},${expr})`;
+    } else {
+      const dx   = x1 - x0;
+      const lerp = `round(${x0}+${dx}*clamp((t-${t0.toFixed(3)})/${dt.toFixed(3)},0,1))`;
+      expr = `if(lt(t,${t1.toFixed(3)}),${lerp},${expr})`;
+    }
+  }
+  return expr;
+}
+
+// ── Helper: best static crop X for a time range (for EDL segments) ─
+function getSegmentCropX(keyframes, segStart, segEnd, momentStart, cropW, srcW) {
+  const defaultX = Math.max(0, Math.min(srcW - cropW, Math.round(0.5 * srcW - cropW / 2)));
+  if (!keyframes || keyframes.length === 0) return defaultX;
+
+  // Convert absolute segment times to clip-relative
+  const relStart = segStart - momentStart - 0.4;
+  const relEnd   = segEnd   - momentStart + 0.4;
+
+  const pool = keyframes.filter(kf => kf.t >= relStart && kf.t <= relEnd);
+  const src  = pool.length > 0 ? pool : keyframes;  // fall back to all keyframes
+
+  const totalConf = src.reduce((s, kf) => s + (kf.confidence || 0.7), 0) || 1;
+  const avgCx     = src.reduce((s, kf) => s + kf.cx * (kf.confidence || 0.7), 0) / totalConf;
+
+  return Math.max(0, Math.min(srcW - cropW, Math.round(avgCx * srcW - cropW / 2)));
+}
+
+// ── Main reframe analysis ────────────────────────────────────────────
+//
+// Returns info object consumed by renderClip. Does NOT return filter strings —
+// those are built in renderClip to allow EDL vs. non-EDL differentiation.
+//
+// Return type:
+// {
+//   type:         'fill' | 'blurred',  — blurred when cropFrac > tightFrac
+//   cropW:        number,              — crop width in source pixels
+//   cropH:        number,              — = srcH (always full source height)
+//   scaledH:      number,              — fg height after scale to outW
+//   bgFilter:     string,              — static blur-fill filter chain
+//   globalCropX:  number,              — best single crop X (global average)
+//   keyframes:    array,               — from face_track.py for dynamic tracking
+//   momentStart:  number,              — set by caller for EDL segment mapping
+//   srcW, srcH, outW, outH
+// }
 function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920,
                               speakerSide='center', clipDuration=30,
                               faceData=null, framingMode='dynamic') {
 
-  // ── Portrait / square source: scale-to-fill + center-crop ────────
+  // ── Portrait / square source: scale-to-fill + center-crop ─────────
   if (srcH >= srcW) {
     const sf = Math.max(outW / srcW, outH / srcH);
     const sW = Math.ceil(srcW * sf / 2) * 2;
     const sH = Math.ceil(srcH * sf / 2) * 2;
-    const cx = Math.floor((sW - outW) / 2);
-    const cy = Math.floor((sH - outH) / 2);
+    const gx = Math.floor((sW - outW) / 2);
+    const gy = Math.floor((sH - outH) / 2);
     return {
-      type: 'fill',
-      filter: [`scale=${sW}:${sH}:flags=lanczos`, `crop=${outW}:${outH}:${cx}:${cy}`, `setsar=1`].join(',')
+      type: 'fill', cropW: outW, cropH: outH, scaledH: outH,
+      bgFilter: '', globalCropX: 0, keyframes: [],
+      momentStart: 0, srcW, srcH, outW, outH,
+      portraitFill: `scale=${sW}:${sH}:flags=lanczos,crop=${outW}:${outH}:${gx}:${gy},setsar=1`,
     };
   }
 
-  // ── Landscape → portrait ──────────────────────────────────────────
+  // ── Landscape → portrait ───────────────────────────────────────────
 
-  const portAspect = outW / outH;  // 9/16 = 0.5625
+  const portAspect = outW / outH;               // 9/16 = 0.5625
+  const tightFrac  = portAspect * (srcH / srcW); // exact fill, ~0.3164 for 1920×1080
 
-  // tightFrac = the crop fraction that EXACTLY fills portrait height with no blur.
-  // For 1920×1080 → 1080×1920: tightFrac = 1080/3413 ≈ 0.3164
-  const tightFrac = portAspect * (srcH / srcW);
-
-  // ── Face data ─────────────────────────────────────────────────────
+  // ── Face data from face_track.py v5 ───────────────────────────────
+  const keyframes   = faceData?.keyframes   ?? [];
+  const sceneType   = faceData?.sceneType   ?? 'single_speaker';
   const faceCount   = faceData?.faceCount   ?? 1;
   const hasFaces    = (faceData?.totalDets  ?? 0) > 0;
-  const meanFaceX   = faceData?.meanFaceX   ?? (speakerSide === 'left' ? 0.35 : speakerSide === 'right' ? 0.65 : 0.5);
   const rangeCX     = faceData?.rangeCX     ?? 0;
-  const combinedBox = faceData?.combinedBox ?? null;
+  const meanFaceX   = faceData?.meanFaceX   ?? (speakerSide === 'left' ? 0.35 : speakerSide === 'right' ? 0.65 : 0.5);
 
-  // ── Decide crop fraction based on framing mode + face count ──────
-  // cropFrac = what fraction of the source WIDTH to include in the crop.
-  // Larger = more context but needs more blurred fill at top/bottom.
+  // Use globalCropFrac from face_track.py if available (scene-aware)
+  const suggestedFrac = faceData?.globalCropFrac ?? 0;
+
+  // ── Crop fraction ──────────────────────────────────────────────────
   let cropFrac;
-
   if (framingMode === 'close') {
-    // Tight — exactly the v2 "fill height" behavior, no blur needed
     cropFrac = tightFrac;
   } else if (framingMode === 'medium') {
-    // Slight pull-back for single speaker; more for multi-person
-    cropFrac = hasFaces && faceCount >= 2 ? 0.44 : 0.40;
+    cropFrac = sceneType === 'group' ? 0.50 : sceneType === 'interview' ? 0.46 : 0.40;
   } else if (framingMode === 'wide') {
-    cropFrac = hasFaces && faceCount >= 2 ? 0.58 : 0.50;
+    cropFrac = sceneType === 'group' ? 0.65 : sceneType === 'interview' ? 0.56 : 0.52;
   } else if (framingMode === 'original') {
-    // Show full source width — heavy blur fill
-    cropFrac = 0.70;  // cap at 70% for practical blur strip size
+    cropFrac = 0.70;
   } else {
-    // 'dynamic': auto-pick based on face count + movement
-    if (!hasFaces) {
-      cropFrac = 0.42;          // no faces: moderate pull-back
-    } else if (faceCount >= 3) {
-      cropFrac = 0.60;          // 3+ people: wide group shot
-    } else if (faceCount === 2) {
-      cropFrac = 0.48;          // 2 people: show both comfortably
+    // 'dynamic': use scene-type-aware suggestion from face tracking
+    if (suggestedFrac > 0.01) {
+      cropFrac = suggestedFrac;
+    } else if (!hasFaces) {
+      cropFrac = 0.42;
     } else {
-      // Single speaker: base = 0.38 (moderate pull-back)
-      // — if speaker is moving a lot, give more horizontal room
-      cropFrac = rangeCX > 0.20 ? 0.44 : 0.38;
+      switch (sceneType) {
+        case 'group':          cropFrac = 0.62; break;
+        case 'interview':      cropFrac = faceCount >= 2 ? 0.52 : 0.44; break;
+        case 'podcast':        cropFrac = faceCount >= 2 ? 0.48 : 0.42; break;
+        case 'reaction':       cropFrac = 0.52; break;
+        case 'wide_shot':      cropFrac = 0.40; break;
+        case 'close_up':       cropFrac = 0.44; break;
+        default:               cropFrac = rangeCX > 0.20 ? 0.44 : 0.38;
+      }
     }
   }
+  cropFrac = Math.max(tightFrac, Math.min(0.72, cropFrac));
 
-  // Never less than tightFrac (otherwise we'd be zooming IN beyond v2)
-  cropFrac = Math.max(tightFrac, cropFrac);
+  // ── Compute crop dimensions ────────────────────────────────────────
+  const cropW = Math.max(2, Math.round(Math.min(srcW, cropFrac * srcW) / 2) * 2);
+  const cropH = srcH;
 
-  // ── Compute crop window in source pixels ──────────────────────────
-  let cropW = Math.round(Math.min(srcW, cropFrac * srcW) / 2) * 2;
-  const cropH = srcH;  // always use full source height
-
-  // ── Position crop X center ────────────────────────────────────────
-  // Prefer the combined bounding box center if we have multi-person data.
-  let faceCenterX;
-  if (hasFaces && combinedBox && faceCount >= 2) {
-    // Center between all detected faces
-    faceCenterX = ((combinedBox.x1 + combinedBox.x2) / 2) * srcW;
+  // ── Global crop X (weighted average of all keyframe positions) ─────
+  let globalCx;
+  if (keyframes.length > 0) {
+    const totalConf = keyframes.reduce((s, kf) => s + (kf.confidence || 0.7), 0) || 1;
+    globalCx = keyframes.reduce((s, kf) => s + kf.cx * (kf.confidence || 0.7), 0) / totalConf;
   } else {
-    // Single speaker or no faces: follow meanFaceX
-    const clampedFX = Math.max(0.08, Math.min(0.92, meanFaceX));
-    faceCenterX = clampedFX * srcW;
+    globalCx = Math.max(0.08, Math.min(0.92, meanFaceX));
   }
+  const halfW       = cropW / 2;
+  const globalCropX = Math.max(0, Math.min(srcW - cropW, Math.round(globalCx * srcW - halfW)));
 
-  // Clamp so crop stays inside source
-  const halfW = cropW / 2;
-  faceCenterX = Math.max(halfW, Math.min(srcW - halfW, faceCenterX));
-  const cropX = Math.round(faceCenterX - halfW);
+  // ── Scaled foreground height ───────────────────────────────────────
+  const scaledH   = Math.round(srcH * outW / cropW / 2) * 2;
+  const needsBlur = scaledH < outH - 4;
 
-  // ── Compute how tall the scaled foreground will be ────────────────
-  // Foreground is scaled so its WIDTH = outW (portrait width = 1080)
-  // sf_fg = outW / cropW
-  // scaledH = cropH * sf_fg = srcH * outW / cropW
-  const scaledH = Math.round(srcH * outW / cropW / 2) * 2;
-
-  // ── Simple fill case: scaledH fills or nearly fills portrait (±4px rounding) ──
-  if (scaledH >= outH - 4) {
-    // Standard crop+scale, forces exact portrait size (no black bars)
-    const finalCropH = Math.min(cropH, Math.round(outH * cropW / outW / 2) * 2);
-    return {
-      type: 'fill',
-      filter: [
-        `crop=${cropW}:${finalCropH}:${cropX}:0`,
-        `scale=${outW}:${outH}:flags=lanczos`,
-        `setsar=1`
-      ].join(',')
-    };
-  }
-
-  // ── Blurred fill case: scaledH < outH ────────────────────────────
-  // Background: full source scaled to fill portrait, heavily blurred + darkened
-  // Foreground: smart crop, scaled to portrait width, centered vertically
+  // ── Background blur filter (static — same for every segment) ──────
   const bgFilter = [
     `scale=${outW}:${outH}:force_original_aspect_ratio=increase:flags=lanczos`,
     `crop=${outW}:${outH}`,
-    `gblur=sigma=30`,
-    `colorchannelmixer=aa=0.55`,  // 55% brightness — darker background
+    `gblur=sigma=32`,
+    `colorchannelmixer=aa=0.50`,  // 50% brightness (clearly secondary)
   ].join(',');
 
-  const fgFilter = [
-    `crop=${cropW}:${cropH}:${cropX}:0`,
-    `scale=${outW}:${scaledH}:flags=lanczos`,
-    `setsar=1`,
-  ].join(',');
-
-  return { type: 'blurred', bgFilter, fgFilter, scaledH };
+  return {
+    type:        needsBlur ? 'blurred' : 'fill',
+    cropW,
+    cropH:       needsBlur ? cropH : Math.min(cropH, Math.round(outH * cropW / outW / 2) * 2),
+    scaledH:     needsBlur ? scaledH : outH,
+    bgFilter,
+    globalCropX,
+    keyframes,
+    momentStart: 0,  // caller sets this before using getSegmentCropX
+    srcW, srcH, outW, outH,
+  };
 }
 
 // ─── Pipeline Stage 5: Quality validator ─────────────────────────
@@ -2121,8 +2192,10 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   const framingMode = moment.framingMode || 'dynamic';
   // pfObj.type === 'fill'    → pfObj.filter fills portrait completely, no blur needed
   // pfObj.type === 'blurred' → pfObj.bgFilter + pfObj.fgFilter for blurred-bg overlay
-  const pfObj  = buildPortraitFilter(srcW, srcH, RW, RH, speakerSide, clipDuration, faceData, framingMode);
-  const assF   = hasASS ? `,ass='${assPath}'` : '';
+  // pfObj holds crop dimensions, keyframes, bgFilter etc. from v5 engine
+  const pfObj = buildPortraitFilter(srcW, srcH, RW, RH, speakerSide, clipDuration, faceData, framingMode);
+  pfObj.momentStart = moment.start;  // needed by getSegmentCropX
+
   // loudnorm: broadcast-standard loudness (-14 LUFS), prevents clipping
   const audioF = 'acompressor=threshold=0.089:ratio=4:attack=5:release=50,loudnorm=I=-14:TP=-1.5:LRA=11';
   const encodeArgs = [
@@ -2132,42 +2205,100 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-movflags', '+faststart',
   ];
 
-  let filterComplex, vMap, aMap;
-  if (useEDL) {
-    const trims = edlSegs.map((s, i) => [
-      `[0:v]trim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},setpts=PTS-STARTPTS[v${i}]`,
-      `[0:a]atrim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`,
-    ].join(';')).join(';');
-    const cIn = edlSegs.map((_, i) => `[v${i}][a${i}]`).join('');
-    if (pfObj.type === 'fill') {
-      filterComplex =
-        `${trims};${cIn}concat=n=${edlSegs.length}:v=1:a=1[vcat][acat];` +
-        `[vcat]${pfObj.filter}${assF}[vout];[acat]${audioF}[aout]`;
-    } else {
-      // Blurred fill: split stream → bg (blurred full frame) + fg (smart crop), overlay centered
-      filterComplex =
-        `${trims};${cIn}concat=n=${edlSegs.length}:v=1:a=1[vcat][acat];` +
-        `[vcat]split[_vbg][_vfg];` +
-        `[_vbg]${pfObj.bgFilter}[_bg];` +
-        `[_vfg]${pfObj.fgFilter}[_fg];` +
-        `[_bg][_fg]overlay=x=(W-w)/2:y=(H-h)/2${assF}[vout];` +
-        `[acat]${audioF}[aout]`;
-    }
-  } else {
-    if (pfObj.type === 'fill') {
-      filterComplex =
-        `[0:v]trim=start=${effectiveStart.toFixed(3)}:end=${moment.end.toFixed(3)},setpts=PTS-STARTPTS,${pfObj.filter}${assF}[vout];` +
-        `[0:a]atrim=start=${effectiveStart.toFixed(3)}:end=${moment.end.toFixed(3)},asetpts=PTS-STARTPTS,${audioF}[aout]`;
-    } else {
-      filterComplex =
-        `[0:v]trim=start=${effectiveStart.toFixed(3)}:end=${moment.end.toFixed(3)},setpts=PTS-STARTPTS,split[_vbg][_vfg];` +
-        `[_vbg]${pfObj.bgFilter}[_bg];` +
-        `[_vfg]${pfObj.fgFilter}[_fg];` +
-        `[_bg][_fg]overlay=x=(W-w)/2:y=(H-h)/2${assF}[vout];` +
-        `[0:a]atrim=start=${effectiveStart.toFixed(3)}:end=${moment.end.toFixed(3)},asetpts=PTS-STARTPTS,${audioF}[aout]`;
-    }
+  // Helpers for building filter strings from pfObj
+  const assInject = hasASS ? `,ass='${assPath}'` : '';
+  const assSuffix = hasASS ? `;[_vout_pre]ass='${assPath}'[vout]` : '';
+
+  // Build a crop+scale filter for a specific static X (used in EDL segments)
+  function segFillFilter(cropX) {
+    return `crop=${pfObj.cropW}:${pfObj.cropH}:${cropX}:0,scale=${RW}:${RH}:flags=lanczos,setsar=1`;
   }
-  vMap = '[vout]'; aMap = '[aout]';
+  function segBlurFilter(cropX) {
+    return {
+      fg: `crop=${pfObj.cropW}:${pfObj.cropH}:${cropX}:0,scale=${RW}:${pfObj.scaledH}:flags=lanczos,setsar=1`,
+      bg: pfObj.bgFilter,
+    };
+  }
+
+  let filterComplex, vMap, aMap;
+
+  if (useEDL) {
+    // ── EDL path: each segment gets its own crop position ────────────
+    // After concat, [vcat] is already portrait-sized (1080×1920).
+    // We apply ASS subtitles once at the end.
+    const segParts = edlSegs.map((s, i) => {
+      const segX = pfObj.portraitFill
+        ? 0  // portrait source: no crop X needed
+        : getSegmentCropX(pfObj.keyframes, s.start, s.end, moment.start, pfObj.cropW, srcW);
+
+      if (pfObj.portraitFill) {
+        // portrait/square source — simple scale
+        return [
+          `[0:v]trim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},setpts=PTS-STARTPTS,${pfObj.portraitFill}[v${i}]`,
+          `[0:a]atrim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`,
+        ].join(';');
+      } else if (pfObj.type === 'fill') {
+        return [
+          `[0:v]trim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},setpts=PTS-STARTPTS,${segFillFilter(segX)}[v${i}]`,
+          `[0:a]atrim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`,
+        ].join(';');
+      } else {
+        // blurred — split → bg + fg → overlay → 1080×1920 per segment
+        const { fg, bg } = segBlurFilter(segX);
+        return [
+          `[0:v]trim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},setpts=PTS-STARTPTS,split[_s${i}a][_s${i}b]`,
+          `[_s${i}a]${bg}[_s${i}bg]`,
+          `[_s${i}b]${fg}[_s${i}fg]`,
+          `[_s${i}bg][_s${i}fg]overlay=x=0:y=(H-h)/2[v${i}]`,
+          `[0:a]atrim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`,
+        ].join(';');
+      }
+    });
+
+    const cIn = edlSegs.map((_, i) => `[v${i}][a${i}]`).join('');
+    // After concat: apply ASS (if any) then route to [vout]
+    const assChain = hasASS ? `[vcat]ass='${assPath}'[vout]` : '';
+    filterComplex =
+      `${segParts.join(';')};${cIn}concat=n=${edlSegs.length}:v=1:a=1[vcat][acat]` +
+      (hasASS ? `;${assChain}` : '') +
+      `;[acat]${audioF}[aout]`;
+    vMap = hasASS ? '[vout]' : '[vcat]';
+    aMap = '[aout]';
+
+  } else {
+    // ── Non-EDL path: dynamic per-frame crop expression ──────────────
+    // After setpts=PTS-STARTPTS, t=0 = clip start = matches keyframe times.
+    // blackOffset shifts the effective start, so we subtract it from keyframe times.
+    const xExpr = pfObj.portraitFill
+      ? '0'
+      : buildCropXExpr(pfObj.keyframes, pfObj.cropW, srcW, blackOffset);
+
+    const tS = effectiveStart.toFixed(3);
+    const tE = moment.end.toFixed(3);
+
+    if (pfObj.portraitFill) {
+      filterComplex =
+        `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,${pfObj.portraitFill}${assInject}[vout];` +
+        `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
+    } else if (pfObj.type === 'fill') {
+      // Dynamic: crop=CW:CH:x='EXPR':y=0:eval=frame,scale,setsar
+      filterComplex =
+        `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,` +
+        `crop=${pfObj.cropW}:${pfObj.cropH}:x='${xExpr}':y=0:eval=frame,` +
+        `scale=${RW}:${RH}:flags=lanczos,setsar=1${assInject}[vout];` +
+        `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
+    } else {
+      // Dynamic blurred: split → bg (static blur) + fg (dynamic crop) → overlay
+      filterComplex =
+        `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,split[_dvbg][_dvfg];` +
+        `[_dvbg]${pfObj.bgFilter}[_dbbg];` +
+        `[_dvfg]crop=${pfObj.cropW}:${pfObj.cropH}:x='${xExpr}':y=0:eval=frame,` +
+        `scale=${RW}:${pfObj.scaledH}:flags=lanczos,setsar=1[_dbfg];` +
+        `[_dbbg][_dbfg]overlay=x=0:y=(H-h)/2${assInject}[vout];` +
+        `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
+    }
+    vMap = '[vout]'; aMap = '[aout]';
+  }
 
   // ── Stage 7: Render ───────────────────────────────────────────
   try {
@@ -2176,29 +2307,24 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
       '-filter_complex', filterComplex,
       '-map', vMap, '-map', aMap,
       ...encodeArgs, output,
-    ], { jobId, label: 'render-v4', timeoutMs: PROCESS_TIMEOUT_MS });
+    ], { jobId, label: 'render-v5', timeoutMs: PROCESS_TIMEOUT_MS });
   } catch (renderErr) {
-    console.warn('[render:v4-fallback]', { clipId, err: String(renderErr.message||renderErr).slice(0,300) });
+    console.warn('[render:v5-fallback]', { clipId, err: String(renderErr.message||renderErr).slice(0,300) });
     try { if (existsSync(output)) unlinkSync(output); } catch {}
-    // Fallback: single-pass with portrait + basic audio, no EDL/ASS
+    // Fallback: single-pass, static global crop, no EDL, no ASS (most robust)
+    const staticX = pfObj.portraitFill ? 0 : pfObj.globalCropX;
+    const fallbackVF = pfObj.portraitFill
+      ? pfObj.portraitFill
+      : pfObj.type === 'fill'
+        ? segFillFilter(staticX)
+        : `${segBlurFilter(staticX).fg}`;  // just the fg scaled, no blur bg in fallback
     const fallbackAssF = hasASS ? `,ass='${assPath}'` : '';
-    const fallbackPf   = buildPortraitFilter(srcW, srcH, RW, RH, speakerSide, clipDuration, faceData, framingMode);
-    if (fallbackPf.type === 'fill') {
-      await run(FFMPEG, [
-        '-y', '-ss', String(effectiveStart), '-to', String(moment.end), '-i', mediaPath,
-        '-vf', `${fallbackPf.filter}${fallbackAssF}`,
-        '-af', audioF,
-        ...encodeArgs, output,
-      ], { jobId, label: 'render-fallback', timeoutMs: PROCESS_TIMEOUT_MS });
-    } else {
-      await run(FFMPEG, [
-        '-y', '-ss', String(effectiveStart), '-to', String(moment.end), '-i', mediaPath,
-        '-filter_complex',
-        `[0:v]split[_vbg][_vfg];[_vbg]${fallbackPf.bgFilter}[_bg];[_vfg]${fallbackPf.fgFilter}[_fg];[_bg][_fg]overlay=x=(W-w)/2:y=(H-h)/2${fallbackAssF}[vout];[0:a]${audioF}[aout]`,
-        '-map', '[vout]', '-map', '[aout]',
-        ...encodeArgs, output,
-      ], { jobId, label: 'render-fallback-blurred', timeoutMs: PROCESS_TIMEOUT_MS });
-    }
+    await run(FFMPEG, [
+      '-y', '-ss', String(effectiveStart), '-to', String(moment.end), '-i', mediaPath,
+      '-vf', `${fallbackVF}${fallbackAssF}`,
+      '-af', audioF,
+      ...encodeArgs, output,
+    ], { jobId, label: 'render-fallback', timeoutMs: PROCESS_TIMEOUT_MS });
   } finally {
     try { if (existsSync(assPath)) unlinkSync(assPath); } catch {}
   }
