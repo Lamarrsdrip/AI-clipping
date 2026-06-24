@@ -86,6 +86,8 @@ const state = {
   clipsSort: 'newest',
   clipsBulkSelected: new Set(),
   openMenuClipId: null,
+  // Framing mode for new clips
+  framingMode: 'dynamic',
 };
 
 /* ── Clip helpers ────────────────────────────────────────────────── */
@@ -550,6 +552,15 @@ function renderCreate() {
                 ${CAPTION_STYLES.map(s=>`<option value="${s}">${s.charAt(0).toUpperCase()+s.slice(1)}</option>`).join('')}
               </select>
             </div>
+            <div class="option-row"><label>Framing</label>
+              <select id="framingMode">
+                <option value="dynamic" ${state.framingMode==='dynamic'?'selected':''}>Dynamic (AI picks)</option>
+                <option value="medium"  ${state.framingMode==='medium' ?'selected':''}>Medium shot</option>
+                <option value="wide"    ${state.framingMode==='wide'   ?'selected':''}>Wide shot</option>
+                <option value="close"   ${state.framingMode==='close'  ?'selected':''}>Close-up</option>
+                <option value="original"${state.framingMode==='original'?'selected':''}>Original frame</option>
+              </select>
+            </div>
           </div>
 
           <label class="permission" style="margin-top:12px"><input id="rightsBulk" type="checkbox"> I own or have permission to use this content.</label>
@@ -656,13 +667,18 @@ async function processSelected() {
   const btn=$('#processSelected');
   const origLabel=btn.textContent;
   btn.disabled=true; btn.textContent='Processing…';
-  const clipCount=Number($('#clipCount')?.value||3);
-  const clipLength=Number($('#clipLength')?.value||15);
-  const captionStyle=$('#captionStyle')?.value||'bold';
-  state.importStatus={type:'loading',text:'Starting AI analysis. Check Clips page for progress.'};
+  const clipCount    = Number($('#clipCount')?.value  || 3);
+  const clipLength   = Number($('#clipLength')?.value || 15);
+  const captionStyle = $('#captionStyle')?.value  || 'bold';
+  const framingMode  = $('#framingMode')?.value   || 'dynamic';
+  state.framingMode  = framingMode;
+  state.importStatus = {type:'loading', text:'Starting AI analysis. Check Clips page for progress.'};
   renderCreate();
   try {
-    await Promise.all(selected.map(videoId=>api('/api/process',{method:'POST',body:JSON.stringify({videoId,rightsConfirmed:true,clipCount,clipLength,captionStyle})})));
+    await Promise.all(selected.map(videoId => api('/api/process', {
+      method:'POST',
+      body:JSON.stringify({videoId, rightsConfirmed:true, clipCount, clipLength, captionStyle, framingMode})
+    })));
     state.selected.clear(); await loadAll(); setView('clips');
   } catch(err) {
     state.importStatus={type:'error',text:err.message||'Could not start generation.'};
