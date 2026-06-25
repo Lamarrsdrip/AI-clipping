@@ -1197,6 +1197,11 @@ async function renderStudio() {
   if (state.studioTab==='aiVoice' && !state.ttsVoices.length) {
     try { const v=await api('/api/tts/voices'); state.ttsVoices=v.voices||[]; if (!state.ttsVoiceId && state.ttsVoices.length) state.ttsVoiceId=state.ttsVoices[0].id; } catch {}
   }
+  if (['aiVideoGen','aiImageGen','lipSync'].includes(state.studioTab) && !state.generations.length) {
+    try { const r=await api('/api/ai/generations'); state.generations=r.generations||[]; } catch {}
+    const hasPending = state.generations.some(g=>['queued','generating'].includes(g.status));
+    if (hasPending && !_genPollTimer) { clearTimeout(_genPollTimer); _genPollTimer=setTimeout(loadGenerations,5000); }
+  }
   const features=state.studioStatus?.features||{};
   const videos=state.library.videos||[];
 
@@ -1356,11 +1361,19 @@ function genCard(g) {
   </div>`;
 }
 
+let _genPollTimer = null;
+
 async function loadGenerations() {
   try {
     const res = await api('/api/ai/generations');
     state.generations = res.generations || [];
     renderStudio();
+    // auto-poll while any generation is still pending
+    const hasPending = state.generations.some(g => ['queued','generating'].includes(g.status));
+    if (hasPending) {
+      clearTimeout(_genPollTimer);
+      _genPollTimer = setTimeout(loadGenerations, 5000);
+    }
   } catch(e) { console.warn('loadGenerations', e.message); }
 }
 
@@ -1378,7 +1391,9 @@ async function runAiGenerator(e) {
     const res = await api('/api/ai/generate', { method:'POST', body: JSON.stringify({ model, prompt, negativePrompt, imageUrl }) });
     state.generatorResult = res;
     state.generatorRunning = false;
-    setTimeout(async () => { await loadGenerations(); }, 4000);
+    // start polling immediately — server runs generation async
+    clearTimeout(_genPollTimer);
+    _genPollTimer = setTimeout(loadGenerations, 5000);
     renderStudio();
   } catch(err) {
     state.generatorResult = { error: err.message };

@@ -2746,9 +2746,15 @@ function mimeFor(file) {
   if (file.endsWith('.js')) return 'application/javascript; charset=utf-8';
   if (file.endsWith('.svg')) return 'image/svg+xml';
   if (file.endsWith('.mp4')) return 'video/mp4';
+  if (file.endsWith('.webm')) return 'video/webm';
+  if (file.endsWith('.mov')) return 'video/quicktime';
+  if (file.endsWith('.mp3')) return 'audio/mpeg';
+  if (file.endsWith('.wav')) return 'audio/wav';
+  if (file.endsWith('.ogg')) return 'audio/ogg';
   if (file.endsWith('.jpg') || file.endsWith('.jpeg')) return 'image/jpeg';
   if (file.endsWith('.png')) return 'image/png';
   if (file.endsWith('.webp')) return 'image/webp';
+  if (file.endsWith('.gif')) return 'image/gif';
   return 'application/octet-stream';
 }
 
@@ -2880,7 +2886,7 @@ async function muapiPoll(apiKey, requestId, maxMs = 120000) {
   const deadline = Date.now() + maxMs;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 4000));
-    const res = await fetch(`${MUAPI_BASE}/predictions/${requestId}/result`, {
+    const res = await fetch(`${MUAPI_BASE}/predictions/${requestId}`, {
       headers: { 'x-api-key': apiKey },
       signal: AbortSignal.timeout(15000)
     });
@@ -2907,7 +2913,7 @@ async function higgsfieldPoll(apiKey, jobId, maxMs = 180000) {
   const deadline = Date.now() + maxMs;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 5000));
-    const res = await fetch(`${HIGGSFIELD_BASE}/status/${jobId}`, {
+    const res = await fetch(`${HIGGSFIELD_BASE}/generations/${jobId}`, {
       headers: { 'Authorization': `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(15000)
     });
@@ -2941,17 +2947,25 @@ async function runAiMediaGeneration(db, generation) {
 
     if (model.provider === 'muapi') {
       if (!muapiKey) throw new Error('MUAPI_API_KEY not configured. Add it in Admin → API Configuration.');
-      const payload = {
-        prompt: generation.prompt,
-        negative_prompt: generation.negativePrompt || '',
-        ...(generation.imageUrl ? { image_url: generation.imageUrl } : {}),
-        ...(model.extra || {})
-      };
+      let payload;
+      if (model.category === 'lipsync') {
+        // Wav2Lip expects video_url + audio_url, not prompt/image_url
+        payload = { video_url: generation.prompt, audio_url: generation.imageUrl };
+      } else {
+        payload = {
+          prompt: generation.prompt,
+          negative_prompt: generation.negativePrompt || '',
+          ...(generation.imageUrl ? { image_url: generation.imageUrl } : {}),
+          ...(model.extra || {})
+        };
+      }
       const submitted = await muapiSubmit(muapiKey, model.endpoint, payload);
       generation.externalId = submitted.request_id || submitted.id;
       saveDb(db);
       const result = await muapiPoll(muapiKey, generation.externalId);
-      outputUrl = result.output?.[0] || result.video_url || result.image_url || result.url || '';
+      // Muapi output can be array of strings or array of objects with .url
+      const raw = result.output?.[0];
+      outputUrl = (typeof raw === 'string' ? raw : raw?.url) || result.video_url || result.image_url || result.url || '';
     } else if (model.provider === 'higgsfield') {
       if (!higgsfieldKey) throw new Error('HIGGSFIELD_API_KEY not configured. Add it in Admin → API Configuration.');
       const submitted = await higgsfieldSubmit(higgsfieldKey, model.endpoint, {
@@ -2961,13 +2975,16 @@ async function runAiMediaGeneration(db, generation) {
       generation.externalId = submitted.id || submitted.job_id;
       saveDb(db);
       const result = await higgsfieldPoll(higgsfieldKey, generation.externalId);
-      outputUrl = result.output_url || result.video_url || result.url || '';
+      // Higgsfield can return output_url, output.url, or video_url
+      outputUrl = result.output_url || result.output?.url || result.video_url || result.url || '';
     }
 
     if (!outputUrl) throw new Error('No output URL in API response');
 
-    const ext = model.category === 't2i' ? 'jpg' : 'mp4';
-    const filename = `gen_${generation.id}.${ext}`;
+    // Derive extension from URL if possible, fall back to category default
+    const urlExt = outputUrl.split('?')[0].split('.').pop()?.toLowerCase();
+    const safeExt = ['mp4','webm','mov','jpg','jpeg','png','webp','gif'].includes(urlExt) ? urlExt : (model.category === 't2i' ? 'jpg' : 'mp4');
+    const filename = `gen_${generation.id}.${safeExt}`;
     const destPath = path.join(STORAGE_DIR, 'generations', filename);
     await downloadGeneratedMedia(outputUrl, destPath);
 
