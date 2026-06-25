@@ -94,6 +94,12 @@ const state = {
   openMenuClipId: null,
   // Framing mode for new clips
   framingMode: 'dynamic',
+  // TTS studio state
+  ttsText: '',
+  ttsVoiceId: '',
+  ttsVoices: [],
+  ttsLoading: false,
+  ttsResult: null,
 };
 
 /* ── Clip helpers ────────────────────────────────────────────────── */
@@ -1188,6 +1194,9 @@ async function renderStudio() {
   if (!state.studioModels.length) {
     try { const m=await api('/api/ai/models'); state.studioModels=m.models||[]; } catch {}
   }
+  if (state.studioTab==='aiVoice' && !state.ttsVoices.length) {
+    try { const v=await api('/api/tts/voices'); state.ttsVoices=v.voices||[]; if (!state.ttsVoiceId && state.ttsVoices.length) state.ttsVoiceId=state.ttsVoices[0].id; } catch {}
+  }
   const features=state.studioStatus?.features||{};
   const videos=state.library.videos||[];
 
@@ -1216,6 +1225,13 @@ async function renderStudio() {
   $('#facelessForm')?.addEventListener('submit', runFaceless);
   $('#brollForm')?.addEventListener('submit', runBroll);
   $('#aiGeneratorForm')?.addEventListener('submit', runAiGenerator);
+  $('#ttsForm')?.addEventListener('submit', runTts);
+  $('#ttsText')?.addEventListener('input', e => { const el=$('#ttsCharCount'); if(el) el.textContent=`${e.target.value.length}/5000 characters`; });
+  $('#ttsPreviewVoice')?.addEventListener('click', () => {
+    const vid = $('#ttsVoice')?.value;
+    const v = state.ttsVoices.find(x=>x.id===vid);
+    if (v?.preview) { new Audio(v.preview).play().catch(()=>{}); }
+  });
 }
 
 function renderStudioPanel(features, videos) {
@@ -1224,6 +1240,7 @@ function renderStudioPanel(features, videos) {
 
   if (state.studioTab==='facelessContent') return renderFacelessPanel(f);
   if (state.studioTab==='brollSuggestions') return renderBrollPanel(f, [], videos);
+  if (state.studioTab==='aiVoice') return renderVoicePanel(f);
   if (state.studioTab==='aiVideoGen' || state.studioTab==='aiImageGen' || state.studioTab==='lipSync') {
     return renderAiGeneratorPanel(f, state.studioTab);
   }
@@ -1695,6 +1712,84 @@ async function submitFaceless(e) {
   } finally {
     f.loading = false;
     renderFaceless();
+  }
+}
+
+function renderVoicePanel(f) {
+  const r = state.ttsResult;
+  const voices = state.ttsVoices;
+  return `<div class="studio-panel">
+    <div class="feature-header">
+      <div class="feature-badge ${f.available?'on':'off'}">${f.available?'Available':'Needs Setup'}</div>
+      <h2>AI Voiceover (TTS)</h2>
+      <p>${esc(f.description)}</p>
+    </div>
+    ${f.available ? `
+      <form id="ttsForm" class="stack" style="max-width:620px">
+        <div>
+          <label>Script / Text</label>
+          <textarea id="ttsText" rows="6" placeholder="Type or paste your voiceover script here…" style="width:100%;resize:vertical">${esc(state.ttsText)}</textarea>
+          <small class="muted" id="ttsCharCount">${state.ttsText.length}/5000 characters</small>
+        </div>
+        <div class="option-row">
+          <label>Voice</label>
+          <select id="ttsVoice">
+            ${voices.length
+              ? voices.map(v=>`<option value="${esc(v.id)}" ${state.ttsVoiceId===v.id?'selected':''}>${esc(v.name)}</option>`).join('')
+              : `<option value="">Loading voices…</option>`}
+          </select>
+          ${voices.length && voices[0].preview ? `<a class="muted" style="font-size:12px;cursor:pointer" id="ttsPreviewVoice">▶ Preview voice</a>` : ''}
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="primary" ${state.ttsLoading?'disabled':''}>
+            ${state.ttsLoading?'Generating…':'Generate Voiceover'}
+          </button>
+        </div>
+      </form>
+      ${r ? `
+        <div class="tts-result" style="margin-top:24px;padding:20px;background:var(--bg2);border-radius:16px;border:1px solid var(--border)">
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+            <div style="font-weight:700;font-size:15px">Voiceover ready</div>
+            <div class="feature-badge on" style="font-size:11px">${r.chars} chars</div>
+          </div>
+          <audio controls src="${esc(r.url)}" style="width:100%;border-radius:10px;accent-color:var(--accent)"></audio>
+          <div style="margin-top:12px;display:flex;gap:10px">
+            <a href="${esc(r.url)}" download="${esc(r.filename)}" class="btn-sm">Download MP3</a>
+          </div>
+        </div>
+      ` : ''}
+    ` : `
+      <div class="setup-required">
+        <h3>API Key Required</h3>
+        <p>Add your <b>ElevenLabs</b> key in Admin Settings to unlock TTS.<br>
+        Or if you already have <b>OpenAI</b> configured as your LLM provider, TTS is available automatically.</p>
+        ${state.session?.user?.role==='admin'
+          ? `<button data-view-jump="admin">Configure in Admin →</button>`
+          : `<small class="muted">Contact your administrator to enable this feature.</small>`}
+      </div>
+    `}
+  </div>`;
+}
+
+async function runTts(e) {
+  e.preventDefault();
+  const text = $('#ttsText')?.value?.trim() || '';
+  const voiceId = $('#ttsVoice')?.value || '';
+  if (!text) return toast('Enter some text first.');
+  state.ttsText = text;
+  state.ttsVoiceId = voiceId;
+  state.ttsLoading = true;
+  state.ttsResult = null;
+  renderStudio();
+  try {
+    const result = await api('/api/tts/generate', { method:'POST', body: JSON.stringify({ text, voiceId }) });
+    state.ttsResult = result;
+    toast('Voiceover generated!');
+  } catch(err) {
+    toast(err.message || 'TTS failed');
+  } finally {
+    state.ttsLoading = false;
+    renderStudio();
   }
 }
 

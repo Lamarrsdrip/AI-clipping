@@ -61,6 +61,7 @@ mkdirSync(path.join(STORAGE_DIR, 'thumbs'), { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'transcripts'), { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'thumbnails'), { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'generations'), { recursive: true });
+mkdirSync(path.join(STORAGE_DIR, 'audio'), { recursive: true });
 
 const seed = {
   users: [{
@@ -3858,6 +3859,65 @@ async function handleApi(req, res, pathname) {
       saveDb(db);
       return json(res, 200, { ok: true });
     }
+    if (pathname === '/api/tts/voices' && req.method === 'GET') {
+      const db = loadDb();
+      requireUser(req, db);
+      const elKey = settingValue(db, 'ELEVENLABS_API_KEY');
+      const useEL = !!elKey;
+      if (useEL) {
+        try {
+          const resp = await fetch('https://api.elevenlabs.io/v1/voices', { headers: { 'xi-api-key': elKey } });
+          if (resp.ok) {
+            const data = await resp.json();
+            const voices = (data.voices || []).map(v => ({ id: v.voice_id, name: v.name, preview: v.preview_url, provider: 'elevenlabs' }));
+            return json(res, 200, { provider: 'elevenlabs', voices });
+          }
+        } catch {}
+      }
+      return json(res, 200, { provider: 'openai', voices: [
+        { id: 'alloy',   name: 'Alloy — neutral, versatile',   provider: 'openai' },
+        { id: 'echo',    name: 'Echo — clear, male',            provider: 'openai' },
+        { id: 'fable',   name: 'Fable — warm, British',         provider: 'openai' },
+        { id: 'onyx',    name: 'Onyx — deep, authoritative',    provider: 'openai' },
+        { id: 'nova',    name: 'Nova — bright, female',         provider: 'openai' },
+        { id: 'shimmer', name: 'Shimmer — soft, female',        provider: 'openai' }
+      ]});
+    }
+    if (pathname === '/api/tts/generate' && req.method === 'POST') {
+      const body = await readJson(req);
+      const db = loadDb();
+      const user = requireUser(req, db);
+      const text = (body.text || '').trim();
+      if (!text) throw new Error('No text provided.');
+      if (text.length > 5000) throw new Error('Text too long (max 5000 chars).');
+      const elKey = settingValue(db, 'ELEVENLABS_API_KEY');
+      const llmKey = settingValue(db, 'LLM_API_KEY');
+      const llmProvider = settingValue(db, 'LLM_PROVIDER') || 'openai';
+      if (!elKey && !(llmProvider === 'openai' && llmKey)) throw new Error('No TTS API key configured. Add ElevenLabs or OpenAI key in Admin settings.');
+      const filename = `tts_${user.id}_${randomUUID()}.mp3`;
+      const outPath = path.join(STORAGE_DIR, 'audio', filename);
+      let audioBuffer;
+      if (elKey) {
+        const voiceId = body.voiceId || '21m00Tcm4TlvDq8ikWAM'; // Rachel (default)
+        const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+          method: 'POST',
+          headers: { 'xi-api-key': elKey, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
+          body: JSON.stringify({ text, model_id: 'eleven_monolingual_v1', voice_settings: { stability: 0.5, similarity_boost: 0.75 } })
+        });
+        if (!resp.ok) { const e = await resp.text(); throw new Error(`ElevenLabs error: ${e}`); }
+        audioBuffer = Buffer.from(await resp.arrayBuffer());
+      } else {
+        const resp = await fetch('https://api.openai.com/v1/audio/speech', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${llmKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: 'tts-1', voice: body.voiceId || 'nova', input: text, response_format: 'mp3' })
+        });
+        if (!resp.ok) { const e = await resp.text(); throw new Error(`OpenAI TTS error: ${e}`); }
+        audioBuffer = Buffer.from(await resp.arrayBuffer());
+      }
+      writeFileSync(outPath, audioBuffer);
+      return json(res, 200, { url: `/media/audio/${filename}`, filename, chars: text.length });
+    }
     if (pathname === '/api/studio/status') {
       const db = loadDb();
       const llmReady = settingReady(db, 'LLM_API_KEY');
@@ -3877,7 +3937,7 @@ async function handleApi(req, res, pathname) {
           aiImageGen:      { available: mediaReady, label: 'AI Image Generation',          description: 'FLUX 1.1 Pro, Ideogram 3.0, Higgsfield — text-to-image', setupKey: 'MUAPI_API_KEY' },
           aiVideoGen:      { available: mediaReady, label: 'AI Video / B-Roll Studio',     description: 'Kling 2.1, Seedance, Wan2.1, Higgsfield — text-to-video & image-to-video', setupKey: 'MUAPI_API_KEY' },
           lipSync:         { available: mediaReady, label: 'Lip Sync Studio',              description: 'Sync any voice-over to a video clip with Wav2Lip', setupKey: 'MUAPI_API_KEY' },
-          aiVoice:         { available: false,      label: 'AI Voiceover (TTS)',            description: 'Configure ElevenLabs or OpenAI TTS API key', setupKey: 'ELEVENLABS_API_KEY' },
+          aiVoice:         { available: !!(settingValue(db,'ELEVENLABS_API_KEY') || (settingValue(db,'LLM_PROVIDER')==='openai' && settingValue(db,'LLM_API_KEY'))), label: 'AI Voiceover (TTS)', description: 'ElevenLabs or OpenAI TTS — type text, pick a voice, get instant audio', setupKey: 'ELEVENLABS_API_KEY' },
           translation:     { available: llmReady,   label: 'Caption Translation',           description: 'Translate captions to 10+ languages via LLM' },
           socialPosting:   { available: false,      label: 'Direct Social Posting',         description: 'Configure TikTok/Instagram OAuth credentials', setupKey: 'TIKTOK_CLIENT_ID' }
         }
