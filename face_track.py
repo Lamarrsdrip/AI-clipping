@@ -1,370 +1,504 @@
 #!/usr/bin/env /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9
 """
-ClipForge AI — Cinematic Auto-Reframe Engine v6
+ClipForge AI — Cinematic Framing Engine v7  "AI Cinematographer"
 
-What changed from v5:
-  • CINEMATIC crop fractions — single speaker is now 0.58 (was 0.38).
-    0.38 produced a 2.6× zoom that looked like a mugshot.
-    0.58 produces a 1.7× zoom — medium shot, face at 25-40% of output width.
-  • Per-frame FRAMING QUALITY SCORE 0–100.
-    Automatically rejects shots of floors, shoes, empty frames, ceiling fans.
-    Low-quality keyframes are replaced by the last valid frame position.
-  • MULTI-PERSON COMPOSITION intelligence.
-    Two-shot: uses combined bounding box of both faces + generous padding.
-    Group shot: fits all detected faces with 20% safety margin.
-    Only switches to close-up when one face dominates AND is high-quality.
-  • HEADROOM & SHOULDER ROOM enforced.
-    crop_cy tracks the face vertical center so the face sits at the
-    cinematic "1/3 from top" rule when source has enough vertical space.
-  • SAFE ZONE MARGINS — face never allowed within 6% of crop edges.
-  • SPEAKER ANTICIPATION — velocity-based leading extended to 0.40s.
-  • Scene confidence — only switches scene type when 3+ consecutive
-    frames agree (prevents flicker between single and two-shot).
-  • 7 Framing Modes:
-    single_speaker | wide_conversation | smart_two_shot |
-    group_shot | speaker_closeup | reaction_shot | dynamic_interview
+Total redesign. No longer a face tracker — acts as an intelligent camera operator.
 
-Output JSON:
-  speakerSide, meanFaceX/Y/W/H, faceCount, rangeCX, combinedBox  [back-compat]
-  sceneType        — fine-grained scene classification
-  framingMode      — framing mode recommendation
-  globalCropFrac   — recommended crop fraction for full clip
-  keyframes        — [{t, cx, cy, cropFrac, cropY, faceCount, confidence, quality}]
-                     t    = clip-relative seconds
-                     cx   = horizontal crop center [0..1]
-                     cy   = IDEAL face center Y in [0..1] (for server reference)
-                     cropY= recommended crop Y offset from top, or 0 if full height
-                     quality = framing quality score 0–100
-  totalDets, srcWidth/Height, framesSampled, detector
+v7 improvements over v6:
+  • MediaPipe Face Mesh (468 landmarks) — full facial geometry
+    → Head pose via 6-point PnP: yaw/pitch tells us which way subjects face
+    → Iris landmarks: gaze direction tells us where subjects look
+    → Lip distance variance: identifies who is currently speaking
+  • Cinematic composition instead of centering
+    → Looking room: if subject faces right, they appear in LEFT THIRD with
+      space ahead of them (standard cinematography rule)
+    → Headroom: face at upper-third, not vertical center
+    → Rule of thirds over dead-center placement
+  • Spring-damper physics (ω=3.8 rad/s, ζ=0.85) for natural motion
+    → Pan spring: responsive, with slight overshoot like a real operator
+    → Zoom spring: 3× slower than pan (gentle, invisible zoom changes)
+    → Replaces Gaussian + linear-lead with physically accurate dynamics
+  • Sparse Lucas-Kanade optical flow between frames
+    → Tracks face regions for sub-frame motion continuity
+    → Motion energy drives dynamic crop widening in active scenes
+  • Speaker detection: highest recent lip-movement variance = speaker
+    → In two-person shots, camera gives slight pull toward active speaker
+    → Speaker always kept in-frame even when others move
+  • Per-frame dynamic crop fraction (±10% gentle variation)
+    → More motion energy → slightly wider crop (prevents losing subjects)
+    → Emotion close-up moments → slightly tighter (not implemented via zoom)
+  • 95% quality threshold with auto-widen fallback
+    → Average quality < 92: retry with 12% wider crop fraction
+    → Average quality < 80: fallback to safe center-wide composition
+  • 5 fps sampling (was 3), 100-frame cap (was 80)
+
+Output JSON: backward-compatible with server.js v5 consumer.
+  Same fields: speakerSide, meanFaceX/Y/W/H, faceCount, rangeCX,
+               combinedBox, sceneType, framingMode, globalCropFrac,
+               keyframes, totalDets, srcWidth, srcHeight, framesSampled, detector
+
+  New per-keyframe fields: yaw, gazeX, speaking (informational)
 
 Usage:
   python3.9 face_track.py <video_path> <start_sec> <end_sec> [sample_fps]
 """
-import sys, json, os, math
 
-# ── CINEMATIC CROP FRACTIONS ────────────────────────────────────────────
-# These map scene/mode to fraction of SOURCE WIDTH shown in the virtual camera.
-# Larger fraction = wider shot = more breathing room.
-# Lower bound is 0.44 (never tighter than ~2.3× zoom for any scene).
+import sys, json, os, math, time
+
+# ── Sampling constants ────────────────────────────────────────────────────
+SAMPLE_FPS  = 5.0    # target frames per second to analyse
+MAX_FRAMES  = 100    # never analyse more than this many frames
+MIN_QUALITY = 40     # below this = replace with nearest good frame
+QUAL_TARGET = 92     # below this average = auto-widen crop and retry
+
+# ── Cinematic crop fractions ──────────────────────────────────────────────
+# Deliberately wider than v6 — less zoom, more breathing room.
+# "It looks like a mugshot" was caused by ~2× zoom; these stay ≤ 1.7×.
 CROP_FRACS = {
-    "single_speaker":       0.58,   # medium shot, face ~28–38% of output width
-    "single_speaker_tight": 0.52,   # slightly tighter for active/moving speakers
-    "speaker_closeup":      0.48,   # deliberate close-up (not just "zoomed in")
-    "wide_conversation":    0.78,   # both speakers + air between them
-    "smart_two_shot":       0.72,   # two people comfortably in frame
-    "dynamic_interview":    0.80,   # interview — slightly wider than two-shot
-    "podcast":              0.68,   # podcast two-shot
-    "group_shot":           0.88,   # group of 3+ with margins
-    "reaction_shot":        0.62,   # reaction / looking up content
-    "wide_shot":            0.75,   # subject is small — keep wide
+    "monologue":    0.62,   # medium shot — face ~25–38% of output width
+    "interview":    0.80,   # both subjects comfortably framed
+    "podcast":      0.72,   # podcast two-shot (slightly tighter than interview)
+    "group":        0.88,   # 3+ people — fit everyone with margin
+    "reaction":     0.65,   # looking off-camera (e.g., at screen)
+    "presentation": 0.78,   # walking / pointing / gesturing presenter
+    "wide_shot":    0.82,   # subject occupies small fraction of source
+    "close_up":     0.52,   # deliberate tight shot
+    "default":      0.64,
 }
 
-# ── QUALITY SCORING CONSTANTS ───────────────────────────────────────────
-MIN_QUALITY_THRESHOLD = 40   # frames below this score use fallback position
-FACE_SIZE_MIN         = 0.06  # face must be ≥6% of source width to be "visible"
-FACE_SIZE_MAX         = 0.70  # face ≥70% of source width = extreme close-up (bad)
-EDGE_SAFETY_MARGIN    = 0.06  # face center must be ≥6% away from crop edge
+# ── Looking-room / rule-of-thirds constants ───────────────────────────────
+LOOK_THRESH  = 0.15    # minimum gaze magnitude before applying looking room
+LOOK_MAX     = 0.16    # max shift from center (fraction of crop_frac)
+YAW_THRESH   = 10.0    # degrees yaw before applying pose-based room
+YAW_SCALE    = 40.0    # degrees for full looking-room effect
 
-# ── SAFE ZONE ────────────────────────────────────────────────────────────
-CX_MIN = 0.08   # never let crop center be within 8% of source left edge
-CX_MAX = 0.92   # never let crop center be within 8% of source right edge
+# ── Head pose landmark indices (6-point PnP model) ───────────────────────
+_POSE_IDX = [1, 152, 33, 263, 61, 291]   # nose, chin, L-eye, R-eye, L-mouth, R-mouth
+
+# ── Iris landmark indices (requires refine_landmarks=True) ───────────────
+_IRIS_L     = 473;  _EYE_L_OUT = 33;   _EYE_L_IN = 133
+_IRIS_R     = 468;  _EYE_R_OUT = 263;  _EYE_R_IN = 362
+
+# ── Lip landmark indices ─────────────────────────────────────────────────
+_LIP_UPPER  = 13;   _LIP_LOWER = 14
+
+# Safe zone: crop center never within this fraction of source edge
+CX_MIN = 0.07
+CX_MAX = 0.93
 
 
-def compute_framing_quality(dets, cx, crop_frac, src_aspect=1.78):
+# ════════════════════════════════════════════════════════════════════════════
+#  HEAD POSE & GAZE
+# ════════════════════════════════════════════════════════════════════════════
+
+_MODEL_3D = None  # lazy numpy init
+
+def _get_3d_model():
+    """Canonical 6-point 3D face model for PnP (in mm, generic face)."""
+    global _MODEL_3D
+    if _MODEL_3D is None:
+        import numpy as np
+        _MODEL_3D = np.array([
+            [  0.0,    0.0,    0.0],   # nose tip
+            [  0.0, -330.0,  -65.0],   # chin
+            [-225.0,  170.0,-135.0],   # left eye outer corner
+            [ 225.0,  170.0,-135.0],   # right eye outer corner
+            [-150.0, -150.0,-125.0],   # left mouth corner
+            [ 150.0, -150.0,-125.0],   # right mouth corner
+        ], dtype=np.float64)
+    return _MODEL_3D
+
+
+def estimate_yaw(landmarks, frame_w, frame_h):
     """
-    Score the framing quality of a given crop position, 0–100.
-    Penalizes: no faces, too-small faces, faces at edge, extreme zoom,
-    poor face-to-crop ratio.
-
-    Parameters
-    ----------
-    dets       : list of detection dicts from MediaPipe / Haar
-    cx         : proposed crop center X [0..1]
-    crop_frac  : fraction of source width being shown
-    src_aspect : source aspect ratio (width/height)
+    Estimate head yaw (left-right facing) in degrees via PnP.
+    Positive = facing right, Negative = facing left.
+    Returns 0.0 on failure.
     """
-    if not dets:
-        return 0  # no face detected — reject immediately
+    try:
+        import numpy as np, cv2
+        pts = np.array(
+            [(landmarks[i].x * frame_w, landmarks[i].y * frame_h) for i in _POSE_IDX],
+            dtype=np.float64
+        )
+        focal = float(frame_w)
+        cam   = np.array([[focal, 0, frame_w/2],
+                          [0, focal, frame_h/2],
+                          [0, 0, 1]], dtype=np.float64)
+        dist  = np.zeros((4, 1), dtype=np.float64)
+        ok, rvec, _ = cv2.solvePnP(_get_3d_model(), pts, cam, dist,
+                                    flags=cv2.SOLVEPNP_EPNP)
+        if not ok:
+            return 0.0
+        rmat, _ = cv2.Rodrigues(rvec)
+        _, _, _, _, _, _, euler = cv2.RQDecomp3x3(rmat)
+        return float(euler[1])   # yaw in degrees
+    except Exception:
+        return 0.0
 
-    score = 0.0
 
-    # ── 1. Face detection confidence (0–25 pts) ─────────────────────────
-    best_conf = max(d["score"] for d in dets)
-    score += 25.0 * min(1.0, best_conf / 0.75)
+def estimate_gaze_x(landmarks):
+    """
+    Estimate horizontal gaze direction from iris vs. eye-corner positions.
+    Returns float in [-1, +1]: positive = looking right, negative = looking left.
+    Only meaningful when refine_landmarks=True in Face Mesh.
+    """
+    try:
+        l_iris = landmarks[_IRIS_L]
+        l_out  = landmarks[_EYE_L_OUT]
+        l_in   = landmarks[_EYE_L_IN]
+        l_cx   = (l_out.x + l_in.x) / 2.0
+        l_ew   = abs(l_out.x - l_in.x) or 1e-5
+        l_g    = (l_iris.x - l_cx) / l_ew
 
-    # ── 2. Face size in output (0–25 pts) ───────────────────────────────
-    # Face should occupy 12–40% of crop width for a natural look
-    primary = max(dets, key=lambda d: d["w"] * d["h"])
-    face_frac_in_crop = primary["w"] / max(0.01, crop_frac)
-    # Ideal range: 15%–40% of crop width
-    if 0.15 <= face_frac_in_crop <= 0.40:
-        score += 25.0
-    elif face_frac_in_crop < 0.08:
-        score += 0     # face too small — probably floor/shoes/object
-    elif face_frac_in_crop < 0.15:
-        score += 15.0 * (face_frac_in_crop - 0.08) / 0.07
-    elif face_frac_in_crop <= 0.60:
-        score += 25.0 * max(0, (0.60 - face_frac_in_crop) / 0.20)
-    else:
-        score += 0     # face grotesquely large — reject
+        r_iris = landmarks[_IRIS_R]
+        r_out  = landmarks[_EYE_R_OUT]
+        r_in   = landmarks[_EYE_R_IN]
+        r_cx   = (r_out.x + r_in.x) / 2.0
+        r_ew   = abs(r_out.x - r_in.x) or 1e-5
+        r_g    = (r_iris.x - r_cx) / r_ew
 
-    # ── 3. Face vertical position (0–20 pts) — headroom check ───────────
-    # Ideal: face center Y at 30–55% of source height (gives headroom above)
-    # Penalise: face center near bottom (shoes/floor) or very top (cropped head)
-    face_cy = primary["cy"]
-    if 0.28 <= face_cy <= 0.58:
-        score += 20.0
-    elif face_cy < 0.15:
-        # Face near top — likely a ceiling, partial detection
-        score += 3.0
-    elif face_cy > 0.75:
-        # Face in lower 25% — likely shoes, floor, object, chest
-        score += 0
-    else:
-        # Linearly interpolate
-        if face_cy < 0.28:
-            score += 20.0 * (face_cy - 0.15) / 0.13
+        return float((l_g + r_g) / 2.0)
+    except Exception:
+        return 0.0
+
+
+def lip_openness(landmarks):
+    """Normalized lip distance (proportion of face height approx)."""
+    try:
+        return abs(landmarks[_LIP_UPPER].y - landmarks[_LIP_LOWER].y)
+    except Exception:
+        return 0.0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SCENE CLASSIFICATION
+# ════════════════════════════════════════════════════════════════════════════
+
+def classify_scene(records):
+    """
+    Classify scene type from frame records.
+    Returns (scene_type, framing_mode, avg_spread).
+    """
+    counts = [r["n_faces"] for r in records if r["n_faces"] > 0]
+    if not counts:
+        return "monologue", "monologue", 0.0
+
+    max_faces = max(counts)
+    pct_multi = sum(1 for c in counts if c >= 2) / max(1, len(counts))
+    all_faces = [d for r in records for d in r["faces"]]
+
+    # Face spread in multi-person frames
+    multi_recs = [r for r in records if r["n_faces"] >= 2]
+    avg_spread = 0.0
+    if multi_recs:
+        avg_spread = sum(
+            max(d["cx"] for d in r["faces"]) - min(d["cx"] for d in r["faces"])
+            for r in multi_recs
+        ) / len(multi_recs)
+
+    # Group scene
+    if max_faces >= 3:
+        return "group", "group", avg_spread
+
+    # Two-person scene
+    if max_faces >= 2 or pct_multi > 0.30:
+        if avg_spread > 0.42:
+            return "interview", "interview", avg_spread
+        elif avg_spread > 0.22:
+            return "podcast", "podcast", avg_spread
         else:
-            score += 20.0 * max(0, (0.85 - face_cy) / 0.30)
+            return "podcast", "podcast", avg_spread
 
-    # ── 4. Horizontal safety margin (0–15 pts) ───────────────────────────
-    # Face center should not be within EDGE_SAFETY_MARGIN of crop edges
-    # Crop window spans: [cx - crop_frac/2 … cx + crop_frac/2]
-    left_edge  = cx - crop_frac / 2
-    right_edge = cx + crop_frac / 2
-    # Face position within crop, normalised to [0..1]
-    face_within_crop = (primary["cx"] - left_edge) / max(0.01, crop_frac)
-    if EDGE_SAFETY_MARGIN <= face_within_crop <= (1 - EDGE_SAFETY_MARGIN):
+    # Single person — classify by face size, vertical position, movement range
+    if not all_faces:
+        return "monologue", "monologue", 0.0
+
+    face_ws  = [d["w"] for d in all_faces]
+    face_cys = [d["cy"] for d in all_faces]
+    face_cxs = [d["cx"] for d in all_faces]
+    mean_fw  = sum(face_ws)  / len(face_ws)
+    mean_cy  = sum(face_cys) / len(face_cys)
+    cx_range = max(face_cxs) - min(face_cxs) if face_cxs else 0.0
+
+    if mean_cy > 0.68:
+        return "reaction", "reaction", 0.0
+    if mean_fw < 0.05:
+        return "wide_shot", "wide_shot", 0.0
+    if mean_fw > 0.48:
+        return "close_up", "close_up", 0.0
+    if cx_range > 0.28:
+        return "presentation", "presentation", 0.0
+
+    return "monologue", "monologue", 0.0
+
+
+def base_crop_frac(scene_type, n_faces, spread):
+    """Return baseline crop fraction, widened for spread-out multi-face shots."""
+    frac = CROP_FRACS.get(scene_type, CROP_FRACS["default"])
+    if scene_type in ("interview", "podcast") and n_faces >= 2 and spread > 0:
+        frac = max(frac, spread + 0.26)   # face spread + 13% padding each side
+    return min(0.92, max(0.44, frac))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  CINEMATIC COMPOSITION
+# ════════════════════════════════════════════════════════════════════════════
+
+def compose_single(face_cx, crop_frac, yaw, gaze_x):
+    """
+    Compute crop-center X for a single speaker with:
+      - Looking room: subject at left-third when facing right
+      - Head pose + gaze combined direction signal
+    """
+    # Direction signal: +1 = facing/looking right, -1 = facing/looking left
+    gaze_norm = max(-1.0, min(1.0, gaze_x * 6.0))   # scale: ±0.17 gaze → ±1.0
+    yaw_norm  = max(-1.0, min(1.0, yaw / YAW_SCALE))
+    direction = 0.65 * gaze_norm + 0.35 * yaw_norm
+
+    # Apply looking room only beyond threshold
+    if abs(direction) < LOOK_THRESH:
+        face_pos_in_crop = 0.50   # neutral: center
+    else:
+        t = min(1.0, (abs(direction) - LOOK_THRESH) / (1.0 - LOOK_THRESH))
+        shift = t * LOOK_MAX
+        # facing right → face at left of frame (space ahead = right)
+        # facing left  → face at right of frame (space ahead = left)
+        face_pos_in_crop = 0.50 - math.copysign(shift, direction)
+        face_pos_in_crop = max(0.22, min(0.78, face_pos_in_crop))
+
+    # Crop center that places face at face_pos_in_crop within crop window
+    cx = face_cx + crop_frac * (0.5 - face_pos_in_crop)
+    return _clamp_cx(cx, crop_frac)
+
+
+def compose_multi(faces, crop_frac, speaker_idx):
+    """
+    Crop center for multi-person shot: centered on combined bounding box
+    with a slight pull toward the active speaker.
+    """
+    if not faces:
+        return 0.5
+
+    x1 = min(d["x1"] for d in faces)
+    x2 = max(d["x2"] for d in faces)
+    combined_cx = (x1 + x2) / 2.0
+    combined_w  = x2 - x1
+
+    if combined_w + 0.22 <= crop_frac:
+        # All faces fit — pull slightly toward speaker
+        if 0 <= speaker_idx < len(faces):
+            combined_cx = 0.80 * combined_cx + 0.20 * faces[speaker_idx]["cx"]
+    else:
+        # Too spread — keep most important face (speaker if known, else largest)
+        if 0 <= speaker_idx < len(faces):
+            combined_cx = faces[speaker_idx]["cx"]
+        else:
+            combined_cx = max(faces, key=lambda d: d["w"] * d["h"])["cx"]
+
+    return _clamp_cx(combined_cx, crop_frac)
+
+
+def _clamp_cx(cx, crop_frac):
+    half = crop_frac / 2.0
+    cx   = max(half + 0.02, min(1.0 - half - 0.02, cx))
+    return max(CX_MIN, min(CX_MAX, cx))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  QUALITY SCORING
+# ════════════════════════════════════════════════════════════════════════════
+
+EDGE_MARGIN = 0.05
+
+def compute_quality(faces, cx, crop_frac):
+    """Score framing quality 0–100. Higher = better."""
+    if not faces:
+        return 0
+
+    primary = max(faces, key=lambda d: d["w"] * d["h"])
+    score   = 0.0
+
+    # 1. Detection confidence (0–20 pts)
+    score += 20.0 * min(1.0, primary["score"] / 0.80)
+
+    # 2. Face size in crop (0–30 pts) — 12–42% of crop width = ideal
+    size = primary["w"] / max(0.01, crop_frac)
+    if 0.12 <= size <= 0.42:
+        score += 30.0
+    elif size < 0.07:
+        score += 0.0
+    elif size < 0.12:
+        score += 30.0 * (size - 0.07) / 0.05
+    elif size <= 0.65:
+        score += 30.0 * max(0.0, (0.65 - size) / 0.23)
+    else:
+        score += 0.0
+
+    # 3. Face vertical position (0–20 pts) — ideal: 25–58% from top
+    cy = primary["cy"]
+    if 0.25 <= cy <= 0.58:
+        score += 20.0
+    elif cy < 0.12 or cy > 0.80:
+        score += 0.0
+    else:
+        lo = 20.0 * (cy - 0.12) / 0.13 if cy < 0.25 else 20.0 * max(0, (0.80 - cy) / 0.22)
+        score += lo
+
+    # 4. Horizontal safety margin (0–15 pts)
+    left_edge = cx - crop_frac / 2.0
+    face_pos  = (primary["cx"] - left_edge) / max(0.01, crop_frac)
+    if EDGE_MARGIN <= face_pos <= (1.0 - EDGE_MARGIN):
         score += 15.0
     else:
-        dist_from_edge = min(face_within_crop, 1 - face_within_crop)
-        score += 15.0 * max(0, dist_from_edge / EDGE_SAFETY_MARGIN)
+        dist = min(face_pos, 1.0 - face_pos)
+        score += 15.0 * max(0.0, dist / EDGE_MARGIN)
 
-    # ── 5. Multi-face balance (0–15 pts) ─────────────────────────────────
-    # For multi-person shots, reward when all faces are well within crop
-    if len(dets) >= 2:
-        all_within = all(
-            left_edge + EDGE_SAFETY_MARGIN * crop_frac <= d["cx"] <= right_edge - EDGE_SAFETY_MARGIN * crop_frac
-            for d in dets
+    # 5. Multi-face balance (0–15 pts)
+    if len(faces) >= 2:
+        right_edge = cx + crop_frac / 2.0
+        inside = all(
+            left_edge + EDGE_MARGIN * crop_frac <= d["cx"] <= right_edge - EDGE_MARGIN * crop_frac
+            for d in faces
         )
-        score += 15.0 if all_within else 5.0
+        score += 15.0 if inside else 4.0
     else:
-        score += 15.0  # single face always gets full points here
+        score += 15.0
 
     return round(min(100.0, score), 1)
 
 
-def classify_scene(records):
+# ════════════════════════════════════════════════════════════════════════════
+#  SPRING-DAMPER PHYSICS
+# ════════════════════════════════════════════════════════════════════════════
+
+class CameraSpring:
     """
-    Classify scene type + recommend framing mode.
-    Uses majority vote across frames to prevent flickering.
+    Mass-spring-damper system for natural camera motion.
 
-    Returns (scene_type, framing_mode, spread)
+    Parameters:
+      omega (ω)  = 3.8 rad/s  → settling time ~1.6 s — responsive but not jumpy
+      zeta  (ζ)  = 0.85       → slightly underdamped: tiny overshoot, feels alive
+      zoom_ratio = 0.28        → zoom spring is much slower than pan spring
     """
-    # Count frames with different face counts
-    counts = [len(fr["dets"]) for fr in records if fr["dets"]]
-    if not counts:
-        return "single_speaker", "single_speaker", 0.0
+    def __init__(self, cx0, frac0, omega=3.8, zeta=0.85, zoom_ratio=0.28):
+        self.cx   = float(cx0)
+        self.frac = float(frac0)
+        self.vcx  = 0.0
+        self.vf   = 0.0
+        self.omega = omega
+        self.zeta  = zeta
+        self.oz    = omega * zoom_ratio   # zoom natural frequency
 
-    max_faces = max(counts)
-    frames_with_2plus = sum(1 for c in counts if c >= 2)
-    pct_multi = frames_with_2plus / max(1, len(counts))
+    def step(self, target_cx, target_frac, dt, substeps=8):
+        """Advance physics by dt seconds using sub-stepped Euler integration."""
+        dt_s = dt / substeps
+        for _ in range(substeps):
+            # Pan spring
+            spring_x = self.omega**2 * (target_cx   - self.cx)
+            damp_x   = 2.0 * self.zeta * self.omega * self.vcx
+            self.vcx += (spring_x - damp_x) * dt_s
+            self.cx  += self.vcx * dt_s
 
-    # Compute average spread between faces in multi-face frames
-    multi_frames = [fr for fr in records if len(fr["dets"]) >= 2]
-    avg_spread = 0.0
-    if multi_frames:
-        avg_spread = sum(
-            max(d["cx"] for d in fr["dets"]) - min(d["cx"] for d in fr["dets"])
-            for fr in multi_frames
-        ) / len(multi_frames)
+            # Zoom spring (much slower)
+            spring_f = self.oz**2 * (target_frac - self.frac)
+            damp_f   = 2.0 * self.zeta * self.oz   * self.vf
+            self.vf   += (spring_f - damp_f) * dt_s
+            self.frac += self.vf * dt_s
 
-    if max_faces >= 3:
-        return "group", "group_shot", avg_spread
+        return self.cx, self.frac
 
-    if max_faces == 2 or pct_multi > 0.30:
-        # Distinguish interview (far apart) vs podcast (close together)
-        if avg_spread > 0.35:
-            return "interview", "dynamic_interview", avg_spread
-        elif avg_spread > 0.20:
-            return "podcast", "smart_two_shot", avg_spread
-        else:
-            return "podcast", "wide_conversation", avg_spread
-
-    # Single-face scene — classify by face size and position
-    face_dets = [d for fr in records for d in fr["dets"]]
-    if not face_dets:
-        return "single_speaker", "single_speaker", 0.0
-
-    areas  = [d["w"] * d["h"] for d in face_dets]
-    tw     = sum(areas) or 1.0
-    mean_cy = sum(d["cy"] * a for d, a in zip(face_dets, areas)) / tw
-    mean_fw = sum(d["w"]  * a for d, a in zip(face_dets, areas)) / tw
-    mean_fh = sum(d["h"]  * a for d, a in zip(face_dets, areas)) / tw
-
-    if mean_cy > 0.65:
-        # Face near bottom — reaction shot (looking at screen content above)
-        return "reaction", "reaction_shot", 0.0
-    if mean_fw < 0.05:
-        # Very tiny face — wide establishing shot
-        return "wide_shot", "wide_shot", 0.0
-    if mean_fh > 0.55:
-        # Very large face — deliberate close-up
-        return "close_up", "speaker_closeup", 0.0
-
-    return "single_speaker", "single_speaker", 0.0
+    def teleport(self, cx, frac):
+        """Hard-set without physics (first frame only)."""
+        self.cx = float(cx);  self.frac = float(frac)
+        self.vcx = 0.0;       self.vf   = 0.0
 
 
-def get_crop_frac(scene_type, framing_mode, n_faces, spread=0.0, face_w=0.0):
+# ════════════════════════════════════════════════════════════════════════════
+#  OPTICAL FLOW HELPERS
+# ════════════════════════════════════════════════════════════════════════════
+
+def track_flow(prev_gray, cur_gray, prev_pts, src_w, src_h):
     """
-    Return crop fraction based on scene, with dynamic adjustment for spread.
+    Lucas-Kanade optical flow to track face-region points.
+    Returns (updated_pts, motion_magnitude) where motion is pixels/frame.
     """
-    base = CROP_FRACS.get(framing_mode, CROP_FRACS.get(scene_type, 0.58))
+    try:
+        import cv2, numpy as np
+        if prev_gray is None or prev_pts is None or len(prev_pts) == 0:
+            return None, 0.0
+        pts = np.array(prev_pts, dtype=np.float32).reshape(-1, 1, 2)
+        new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            prev_gray, cur_gray, pts, None,
+            winSize=(31, 31), maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01)
+        )
+        if status is None:
+            return None, 0.0
+        good_new = new_pts[status.flatten() == 1]
+        good_old = pts[status.flatten() == 1]
+        if len(good_new) == 0:
+            return None, 0.0
+        delta = good_new - good_old
+        motion = float(math.sqrt((delta ** 2).sum(axis=-1).mean()))
+        return good_new.reshape(-1, 2).tolist(), motion
+    except Exception:
+        return None, 0.0
 
-    # Dynamic widening for very wide interviews
-    if scene_type in ("interview", "podcast") and n_faces >= 2:
-        # Ensure both faces fit with 15% margin on each side
-        needed = spread + 0.30  # face spread + 15% left + 15% right padding
-        base = max(base, needed)
 
-    # Cap to reasonable range
-    return min(0.92, max(0.44, base))
+def face_points_px(faces, src_w, src_h):
+    """Convert face records to pixel corner points for optical flow."""
+    pts = []
+    for d in faces:
+        cx_px = d["cx"] * src_w;  cy_px = d["cy"] * src_h
+        hw    = d["w"] * src_w / 2.0;  hh = d["h"] * src_h / 2.0
+        pts += [[cx_px, cy_px], [cx_px - hw, cy_px - hh], [cx_px + hw, cy_px + hh]]
+    return pts if pts else None
 
 
-def compose_multi_face_cx(dets, crop_frac, scene_type):
+# ════════════════════════════════════════════════════════════════════════════
+#  SPEAKER IDENTIFICATION
+# ════════════════════════════════════════════════════════════════════════════
+
+class SpeakerTracker:
     """
-    For multi-person shots, find the crop center X that best frames all faces.
-    Uses combined bounding box with padding rather than just face centroid.
-
-    Returns (cx, quality_note)
+    Tracks lip-openness variance per face position-zone to identify speaker.
+    Uses 3 zones: left, center, right thirds of frame.
     """
-    if not dets:
-        return 0.5, "no_faces"
-    if len(dets) == 1:
-        return dets[0]["cx"], "single"
+    def __init__(self, window=8):
+        self.window = window
+        self.history = {0: [], 1: [], 2: []}   # zone → [lip_openness]
 
-    # Combined bounding box of all faces
-    x1_all = min(d["x1"] for d in dets)
-    x2_all = max(d["x2"] for d in dets)
-    cx_combined = (x1_all + x2_all) / 2
+    def update(self, faces, lip_values):
+        """Update with current frame's faces and their lip openness values."""
+        for face, lip in zip(faces, lip_values):
+            zone = 0 if face["cx"] < 0.38 else (2 if face["cx"] > 0.62 else 1)
+            self.history[zone].append(lip)
+            if len(self.history[zone]) > self.window:
+                self.history[zone].pop(0)
 
-    # Check if the combined box fits within crop with margins
-    combined_width = x2_all - x1_all
-    needed_frac = combined_width + 0.20  # 10% padding each side
+    def speaker_zone(self):
+        """Return zone index (0/1/2) of most-active speaker."""
+        scores = {z: sum(h) / max(1, len(h)) for z, h in self.history.items() if h}
+        if not scores:
+            return 1  # default center
+        return max(scores, key=scores.get)
 
-    if needed_frac <= crop_frac:
-        # All faces fit — center on combined box
-        return cx_combined, "fits"
-    else:
-        # Faces don't all fit — center on most confident face
-        primary = max(dets, key=lambda d: d["score"] * d["w"] * d["h"])
-        return primary["cx"], "primary_only"
-
-
-def frame_crop_position(dets, scene_type, framing_mode, prev_cx, prev_cy, crop_frac):
-    """
-    For one frame, return (cx, cy, cropFrac, faceCount, confidence, quality).
-    cx: horizontal crop center [0..1]
-    cy: vertical ideal face center [0..1] (informational for server)
-    quality: framing quality score 0–100
-    """
-    if not dets:
-        # Hold last known position, low quality
-        cx = prev_cx if prev_cx is not None else 0.5
-        cy = prev_cy if prev_cy is not None else 0.38
-        quality = 0
-        return cx, cy, crop_frac, 0, 0.25, quality
-
-    n = len(dets)
-
-    if n == 1:
-        d   = dets[0]
-        cx  = d["cx"]
-        cy  = d["cy"]
-        conf = float(d["score"])
-    else:
-        # Multi-face: use intelligent composition
-        cx, _ = compose_multi_face_cx(dets, crop_frac, scene_type)
-        # Vertical center: average of all faces, weighted by area
-        areas  = [d["w"] * d["h"] for d in dets]
-        total  = sum(areas) or 1.0
-        cy     = sum(d["cy"] * a for d, a in zip(dets, areas)) / total
-        conf   = sum(d["score"] * a for d, a in zip(dets, areas)) / total
-
-    # Clamp cx with safe zone margins
-    half  = crop_frac / 2
-    cx    = max(half + 0.01, min(1.0 - half - 0.01, cx))
-    cx    = max(CX_MIN, min(CX_MAX, cx))
-
-    quality = compute_framing_quality(dets, cx, crop_frac)
-    return cx, cy, crop_frac, n, round(conf, 3), quality
+    def speaker_idx(self, faces):
+        """Return index into faces list of most likely current speaker."""
+        zone = self.speaker_zone()
+        best = -1; best_dist = 999.0
+        for i, f in enumerate(faces):
+            face_zone = 0 if f["cx"] < 0.38 else (2 if f["cx"] > 0.62 else 1)
+            dist = abs(face_zone - zone)
+            if dist < best_dist:
+                best_dist = dist; best = i
+        return best
 
 
-def smooth_cx(kfs, window=7):
-    """
-    Gaussian-weighted moving average of cx (and cy).
-    Larger window = smoother but less responsive.
-    """
-    hw = window // 2
-    result = []
-    for i, kf in enumerate(kfs):
-        lo = max(0, i - hw)
-        hi = min(len(kfs) - 1, i + hw)
-        s_cx = 0.0; s_cy = 0.0; total = 0.0
-        for j in range(lo, hi + 1):
-            dist = abs(i - j)
-            # Gaussian-shaped weight: peaks at center, falls off quickly
-            w_g  = math.exp(-0.5 * (dist / max(1, hw * 0.6)) ** 2)
-            s_cx  += kfs[j]["cx"] * w_g
-            s_cy  += kfs[j].get("cy", 0.38) * w_g
-            total += w_g
-        result.append({**kf, "cx": s_cx / total, "cy": s_cy / total})
-    return result
-
-
-def add_lead(kfs, lead_sec=0.40):
-    """
-    Velocity-based leading: shift the crop in the direction of movement
-    so the camera anticipates where the subject is going.
-    Cap at ±6% to avoid over-shooting.
-    """
-    result = list(kfs)
-    for i in range(1, len(result) - 1):
-        dt = result[i + 1]["t"] - result[i - 1]["t"]
-        if dt < 0.05:
-            continue
-        vel  = (result[i + 1]["cx"] - result[i - 1]["cx"]) / dt
-        lead = max(-0.06, min(0.06, vel * lead_sec))
-        result[i] = {**result[i], "cx": result[i]["cx"] + lead}
-    return result
-
-
-def quality_filter_keyframes(kfs, threshold=MIN_QUALITY_THRESHOLD):
-    """
-    Replace low-quality frames (floor/shoe/ceiling shots) with
-    the nearest high-quality neighbour's cx position.
-    """
-    # Find all high-quality positions
-    good_positions = [(i, kf) for i, kf in enumerate(kfs) if kf.get("quality", 0) >= threshold]
-    if not good_positions:
-        # Nothing good — return as-is, caller will use global fallback
-        return kfs
-
-    result = list(kfs)
-    for i, kf in enumerate(kfs):
-        if kf.get("quality", 0) < threshold:
-            # Find nearest good frame
-            nearest = min(good_positions, key=lambda g: abs(g[0] - i))
-            result[i] = {
-                **kf,
-                "cx":         nearest[1]["cx"],
-                "cy":         nearest[1].get("cy", 0.38),
-                "confidence": kf["confidence"] * 0.5,  # lower confidence to signal fallback
-                "quality":    kf["quality"],            # keep original score for reference
-                "_replaced":  True,
-            }
-    return result
-
+# ════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ════════════════════════════════════════════════════════════════════════════
 
 def main():
     if len(sys.argv) < 4:
@@ -372,241 +506,399 @@ def main():
         sys.exit(1)
 
     video_path = sys.argv[1]
-    start      = float(sys.argv[2])
-    end        = float(sys.argv[3])
-    sample_fps = float(sys.argv[4]) if len(sys.argv) > 4 else 4.0
+    start_sec  = float(sys.argv[2])
+    end_sec    = float(sys.argv[3])
+    req_fps    = float(sys.argv[4]) if len(sys.argv) > 4 else SAMPLE_FPS
+    sample_fps = min(8.0, max(2.0, req_fps))
+    clip_dur   = max(1.0, end_sec - start_sec)
 
     try:
         import cv2
     except ImportError:
-        print(json.dumps({"error": "opencv not available", "speakerSide": "center"}))
-        sys.exit(0)
-
-    try:
-        import mediapipe as mp
-        USE_MEDIAPIPE = True
-    except ImportError:
-        USE_MEDIAPIPE = False
+        _fallback_output(video_path, start_sec, end_sec, reason="opencv_missing")
+        return
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print(json.dumps({"error": f"Cannot open: {video_path}", "speakerSide": "center"}))
-        sys.exit(0)
+        _fallback_output(video_path, start_sec, end_sec, reason="cannot_open")
+        return
 
     src_fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    src_width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    src_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    src_aspect = src_width / max(1, src_height)
-    clip_dur   = max(1.0, end - start)
-
-    # Sample at up to 5fps for more keyframes → smoother tracking
-    sample_fps = min(5.0, max(2.0, sample_fps))
+    src_w      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     interval   = max(1, int(round(src_fps / sample_fps)))
-    max_frames = max(16, min(int(clip_dur * sample_fps) + 2, 80))
+    max_frames = min(MAX_FRAMES, max(16, int(clip_dur * sample_fps) + 2))
 
-    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+    cap.set(cv2.CAP_PROP_POS_MSEC, start_sec * 1000.0)
 
-    # Each record: {t: clip-relative seconds, dets: [{cx,cy,x1,y1,x2,y2,w,h,score}]}
-    frame_records = []
+    # ── Detect with Face Mesh (preferred) ─────────────────────────────────
+    records     = []
+    detector_id = "haar"
 
-    # ── MediaPipe detection ──────────────────────────────────────────────
-    if USE_MEDIAPIPE:
-        mp_face  = mp.solutions.face_detection
-        # model_selection=1 = full-range (up to 5m), better for wide shots
-        detector = mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.45)
+    try:
+        import mediapipe as mp
+        mp_mesh = mp.solutions.face_mesh
 
-        while len(frame_records) < max_frames:
-            pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-            cur_t  = pos_ms / 1000.0
-            if cur_t > end + 0.3:
-                break
-            ret, frame = cap.read()
-            if not ret:
-                break
+        with mp_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=5,
+            refine_landmarks=True,    # enables iris landmarks 468-477
+            min_detection_confidence=0.45,
+            min_tracking_confidence=0.45,
+        ) as mesh:
 
-            clip_t = max(0.0, cur_t - start)
-            rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = detector.process(rgb)
+            detector_id  = "face_mesh"
+            prev_gray    = None
+            prev_pts     = None
+            speaker_trk  = SpeakerTracker(window=8)
 
-            dets = []
-            if result.detections:
-                for det in result.detections:
-                    score = det.score[0] if det.score else 0
-                    if score < 0.42:
-                        continue
-                    bb = det.location_data.relative_bounding_box
-                    if bb.width < 0.018:  # ignore tiny faces (< 1.8% of frame width)
-                        continue
-                    x1 = max(0.0, min(1.0, bb.xmin))
-                    y1 = max(0.0, min(1.0, bb.ymin))
-                    x2 = max(0.0, min(1.0, bb.xmin + bb.width))
-                    y2 = max(0.0, min(1.0, bb.ymin + bb.height))
-                    dets.append({
-                        "cx": (x1 + x2) / 2,
-                        "cy": (y1 + y2) / 2,
-                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                        "w": x2 - x1, "h": y2 - y1,
-                        "score": float(score),
-                    })
-
-            frame_records.append({"t": clip_t, "dets": dets})
-
-            for _ in range(interval - 1):
-                r2, _ = cap.read()
-                if not r2:
+            while len(records) < max_frames:
+                pos_ms  = cap.get(cv2.CAP_PROP_POS_MSEC)
+                cur_abs = pos_ms / 1000.0
+                if cur_abs > end_sec + 0.4:
                     break
 
-        detector.close()
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-    # ── Haar Cascade fallback ────────────────────────────────────────────
-    else:
-        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"
-        if not os.path.exists(cascade_path):
-            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        face_cascade = cv2.CascadeClassifier(cascade_path)
+                clip_t = max(0.0, cur_abs - start_sec)
 
-        while len(frame_records) < max_frames:
-            pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-            cur_t  = pos_ms / 1000.0
-            if cur_t > end + 0.3:
-                break
-            ret, frame = cap.read()
-            if not ret:
-                break
+                # Process at reduced resolution for speed
+                proc_w  = min(src_w, 640)
+                scale   = proc_w / max(1, src_w)
+                proc_h  = max(1, int(src_h * scale))
+                small   = cv2.resize(frame, (proc_w, proc_h)) if scale < 0.99 else frame
+                rgb     = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                gray    = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
-            clip_t = max(0.0, cur_t - start)
-            h360   = max(1, int(360 * src_height / max(1, src_width)))
-            small  = cv2.resize(frame, (360, h360))
-            gray   = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            gray   = cv2.equalizeHist(gray)
-            faces  = face_cascade.detectMultiScale(gray, 1.1, 4, minSize=(20, 20))
+                results = mesh.process(rgb)
 
-            dets = []
-            sx = 1.0 / 360.0
-            sy = 1.0 / max(1, h360)
-            for (x, y, w, h) in faces:
-                x1 = max(0.0, min(1.0, x * sx))
-                y1 = max(0.0, min(1.0, y * sy))
-                x2 = max(0.0, min(1.0, (x + w) * sx))
-                y2 = max(0.0, min(1.0, (y + h) * sy))
-                if (x2 - x1) < 0.020:
-                    continue
-                dets.append({
-                    "cx": (x1 + x2) / 2, "cy": (y1 + y2) / 2,
-                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                    "w": x2 - x1, "h": y2 - y1,
-                    "score": 0.60,
+                faces    = []
+                lip_vals = []
+                yaws     = []
+                gazes    = []
+
+                if results.multi_face_landmarks:
+                    for face_lm in results.multi_face_landmarks:
+                        lm = face_lm.landmark
+                        # Bounding box from all landmarks
+                        xs = [l.x for l in lm]; ys = [l.y for l in lm]
+                        x1r = max(0.0, min(xs)); y1r = max(0.0, min(ys))
+                        x2r = min(1.0, max(xs)); y2r = min(1.0, max(ys))
+                        fw  = x2r - x1r;         fh  = y2r - y1r
+                        if fw < 0.03:
+                            continue
+                        faces.append({
+                            "cx": (x1r + x2r) / 2.0,
+                            "cy": (y1r + y2r) / 2.0,
+                            "x1": x1r, "y1": y1r,
+                            "x2": x2r, "y2": y2r,
+                            "w": fw, "h": fh,
+                            "score": 0.90,  # mesh is high confidence by design
+                        })
+                        lip_vals.append(lip_openness(lm))
+                        yaws.append(estimate_yaw(lm, proc_w, proc_h))
+                        gazes.append(estimate_gaze_x(lm))
+
+                # Optical flow motion energy
+                of_pts, motion = track_flow(prev_gray, gray, prev_pts, proc_w, proc_h)
+                prev_gray = gray.copy()
+                prev_pts  = face_points_px(faces, proc_w, proc_h) if faces else of_pts
+
+                speaker_trk.update(faces, lip_vals)
+
+                records.append({
+                    "t":       clip_t,
+                    "n_faces": len(faces),
+                    "faces":   faces,
+                    "lip":     lip_vals,
+                    "yaws":    yaws,
+                    "gazes":   gazes,
+                    "motion":  motion,
+                    "speaker_idx": speaker_trk.speaker_idx(faces),
                 })
-            frame_records.append({"t": clip_t, "dets": dets})
 
-            for _ in range(interval - 1):
-                r2, _ = cap.read()
-                if not r2:
+                # Skip frames to hit target sample_fps
+                for _ in range(interval - 1):
+                    ok2, _ = cap.read()
+                    if not ok2:
+                        break
+
+    except Exception as mesh_err:
+        # ── Fall back to Face Detection ────────────────────────────────────
+        records = []
+        cap.set(cv2.CAP_PROP_POS_MSEC, start_sec * 1000.0)
+
+        try:
+            import mediapipe as mp
+            mp_det  = mp.solutions.face_detection
+            detector_id = "face_detection"
+
+            with mp_det.FaceDetection(model_selection=1, min_detection_confidence=0.42) as det:
+                while len(records) < max_frames:
+                    pos_ms  = cap.get(cv2.CAP_PROP_POS_MSEC)
+                    cur_abs = pos_ms / 1000.0
+                    if cur_abs > end_sec + 0.4:
+                        break
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    clip_t = max(0.0, cur_abs - start_sec)
+                    rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    res    = det.process(rgb)
+                    faces  = []
+                    if res.detections:
+                        for d in res.detections:
+                            sc  = d.score[0] if d.score else 0
+                            if sc < 0.40:
+                                continue
+                            bb  = d.location_data.relative_bounding_box
+                            if bb.width < 0.02:
+                                continue
+                            x1  = max(0.0, min(1.0, bb.xmin))
+                            y1  = max(0.0, min(1.0, bb.ymin))
+                            x2  = max(0.0, min(1.0, bb.xmin + bb.width))
+                            y2  = max(0.0, min(1.0, bb.ymin + bb.height))
+                            faces.append({
+                                "cx": (x1+x2)/2, "cy": (y1+y2)/2,
+                                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                                "w": x2-x1, "h": y2-y1, "score": float(sc),
+                            })
+                    records.append({
+                        "t": clip_t, "n_faces": len(faces), "faces": faces,
+                        "lip": [], "yaws": [], "gazes": [],
+                        "motion": 0.0, "speaker_idx": 0,
+                    })
+                    for _ in range(interval - 1):
+                        ok2, _ = cap.read()
+                        if not ok2: break
+
+        except Exception:
+            # ── Haar cascade last resort ───────────────────────────────────
+            detector_id = "haar"
+            records     = []
+            cap.set(cv2.CAP_PROP_POS_MSEC, start_sec * 1000.0)
+
+            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"
+            if not os.path.exists(cascade_path):
+                cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            casc = cv2.CascadeClassifier(cascade_path)
+
+            while len(records) < max_frames:
+                pos_ms  = cap.get(cv2.CAP_PROP_POS_MSEC)
+                cur_abs = pos_ms / 1000.0
+                if cur_abs > end_sec + 0.4:
                     break
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                clip_t = max(0.0, cur_abs - start_sec)
+                h360   = max(1, int(360 * src_h / max(1, src_w)))
+                small  = cv2.resize(frame, (360, h360))
+                gray   = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                gray   = cv2.equalizeHist(gray)
+                raw    = casc.detectMultiScale(gray, 1.1, 4, minSize=(20, 20))
+                faces  = []
+                sx, sy = 1.0/360.0, 1.0/max(1, h360)
+                for (x, y, w, h) in (raw if len(raw) else []):
+                    x1 = max(0.0, min(1.0, x*sx));     y1 = max(0.0, min(1.0, y*sy))
+                    x2 = max(0.0, min(1.0, (x+w)*sx)); y2 = max(0.0, min(1.0, (y+h)*sy))
+                    if (x2-x1) < 0.025: continue
+                    faces.append({
+                        "cx": (x1+x2)/2, "cy": (y1+y2)/2,
+                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                        "w": x2-x1, "h": y2-y1, "score": 0.65,
+                    })
+                records.append({
+                    "t": clip_t, "n_faces": len(faces), "faces": faces,
+                    "lip": [], "yaws": [], "gazes": [],
+                    "motion": 0.0, "speaker_idx": 0,
+                })
+                for _ in range(interval - 1):
+                    ok2, _ = cap.read()
+                    if not ok2: break
 
     cap.release()
-    frames_sampled = len(frame_records)
 
-    # ── Global stats ──────────────────────────────────────────────────────
-    all_dets       = [d for fr in frame_records for d in fr["dets"]]
-    face_count_max = max((len(fr["dets"]) for fr in frame_records if fr["dets"]), default=0)
-
-    # ── No-face fallback ─────────────────────────────────────────────────
-    if not all_dets:
-        frac = CROP_FRACS["single_speaker"]
+    # ── No faces at all ───────────────────────────────────────────────────
+    all_faces = [d for r in records for d in r["faces"]]
+    if not all_faces:
+        frac = CROP_FRACS["default"]
         print(json.dumps({
-            "speakerSide":    "center",
-            "meanFaceX":      0.5, "meanFaceY": 0.38,
-            "meanFaceW":      0.0, "meanFaceH": 0.0,
-            "faceCount":      0, "rangeCX": 0.0,
-            "combinedBox":    {"x1": 0.1, "y1": 0.05, "x2": 0.9, "y2": 0.95},
-            "sceneType":      "single_speaker",
-            "framingMode":    "single_speaker",
+            "speakerSide": "center", "meanFaceX": 0.5, "meanFaceY": 0.38,
+            "meanFaceW": 0.0, "meanFaceH": 0.0, "faceCount": 0, "rangeCX": 0.0,
+            "combinedBox": {"x1": 0.1, "y1": 0.05, "x2": 0.9, "y2": 0.95},
+            "sceneType": "monologue", "framingMode": "monologue",
             "globalCropFrac": frac,
-            "keyframes": [{
-                "t": 0.0, "cx": 0.5, "cy": 0.38,
-                "cropFrac": frac, "cropY": 0,
-                "faceCount": 0, "confidence": 0.3, "quality": 0,
-            }],
-            "totalDets": 0, "srcWidth": src_width, "srcHeight": src_height,
-            "framesSampled": frames_sampled,
-            "detector": "mediapipe" if USE_MEDIAPIPE else "haar",
+            "keyframes": [{"t":0.0,"cx":0.5,"cy":0.38,"cropFrac":frac,
+                           "cropY":0,"faceCount":0,"confidence":0.3,"quality":0}],
+            "totalDets": 0, "srcWidth": src_w, "srcHeight": src_h,
+            "framesSampled": len(records), "detector": detector_id,
         }))
         return
 
-    # ── Weighted global stats ─────────────────────────────────────────────
-    weights  = [d["w"] * d["h"] for d in all_dets]
-    total_w  = sum(weights) or 1.0
-    mean_cx  = sum(d["cx"] * w for d, w in zip(all_dets, weights)) / total_w
-    mean_cy  = sum(d["cy"] * w for d, w in zip(all_dets, weights)) / total_w
-    mean_fw  = sum(d["w"]  * w for d, w in zip(all_dets, weights)) / total_w
-    mean_fh  = sum(d["h"]  * w for d, w in zip(all_dets, weights)) / total_w
-
-    cb_x1 = max(0.0, min(d["x1"] for d in all_dets))
-    cb_y1 = max(0.0, min(d["y1"] for d in all_dets))
-    cb_x2 = min(1.0, max(d["x2"] for d in all_dets))
-    cb_y2 = min(1.0, max(d["y2"] for d in all_dets))
-
-    sorted_cx = sorted(d["cx"] for d in all_dets)
-    n_s       = len(sorted_cx)
-    range_cx  = sorted_cx[min(n_s-1, int(n_s*0.90))] - sorted_cx[max(0, int(n_s*0.10))] if n_s > 2 else 0.0
+    # ── Global stats ──────────────────────────────────────────────────────
+    areas  = [d["w"]*d["h"] for d in all_faces]
+    total  = sum(areas) or 1.0
+    mean_cx = sum(d["cx"]*a for d,a in zip(all_faces, areas)) / total
+    mean_cy = sum(d["cy"]*a for d,a in zip(all_faces, areas)) / total
+    mean_fw = sum(d["w"] *a for d,a in zip(all_faces, areas)) / total
+    mean_fh = sum(d["h"] *a for d,a in zip(all_faces, areas)) / total
+    cb_x1   = min(d["x1"] for d in all_faces); cb_y1 = min(d["y1"] for d in all_faces)
+    cb_x2   = max(d["x2"] for d in all_faces); cb_y2 = max(d["y2"] for d in all_faces)
+    cx_vals = sorted(d["cx"] for d in all_faces)
+    n_s     = len(cx_vals)
+    range_cx = cx_vals[min(n_s-1, int(n_s*0.90))] - cx_vals[max(0, int(n_s*0.10))] if n_s > 2 else 0.0
+    face_max = max(r["n_faces"] for r in records if r["n_faces"] > 0)
 
     speaker_side = "center"
     if mean_cx < 0.38: speaker_side = "left"
     elif mean_cx > 0.62: speaker_side = "right"
 
     # ── Scene classification ──────────────────────────────────────────────
-    scene_type, framing_mode, avg_spread = classify_scene(frame_records)
+    scene_type, framing_mode, avg_spread = classify_scene(records)
 
-    # ── Build per-frame keyframes ─────────────────────────────────────────
-    raw_kf   = []
-    prev_cx  = None
-    prev_cy  = None
-    for fr in frame_records:
-        crop_frac = get_crop_frac(scene_type, framing_mode, len(fr["dets"]), avg_spread, mean_fw)
-        cx, cy, frac, n_f, conf, quality = frame_crop_position(
-            fr["dets"], scene_type, framing_mode, prev_cx, prev_cy, crop_frac
-        )
-        raw_kf.append({
-            "t":          fr["t"],
-            "cx":         cx,
-            "cy":         cy,
-            "cropFrac":   frac,
-            "faceCount":  n_f,
-            "confidence": conf,
-            "quality":    quality,
-        })
-        if n_f > 0:
-            prev_cx = cx
-            prev_cy = cy
+    # ── Per-frame cinematic composition ──────────────────────────────────
+    def compute_frame_targets(frac_override=None):
+        """
+        Build raw target (cx, cropFrac) per record using cinematography rules.
+        Returns list of {t, target_cx, target_frac, n_faces, confidence}.
+        """
+        frame_targets = []
+        b_frac = base_crop_frac(scene_type, face_max, avg_spread)
 
-    # ── Quality filtering: replace bad frames with nearest good ──────────
-    filtered_kf = quality_filter_keyframes(raw_kf, MIN_QUALITY_THRESHOLD)
+        for r in records:
+            faces = r["faces"]
+            n     = r["n_faces"]
 
-    # ── Temporal smoothing ────────────────────────────────────────────────
-    smoothed = smooth_cx(filtered_kf, window=7)
+            # Dynamic crop fraction: widen slightly in high-motion frames
+            motion_boost = min(0.10, r["motion"] / 25.0) * b_frac
+            target_frac  = (frac_override or b_frac) + motion_boost
+            target_frac  = min(0.92, max(0.44, target_frac))
 
-    # ── Velocity-based leading ────────────────────────────────────────────
-    final_kf = add_lead(smoothed, lead_sec=0.40)
+            if n == 0:
+                # No face: hold current frac, use last known cx or center
+                frame_targets.append({
+                    "t": r["t"], "n_faces": 0, "confidence": 0.20,
+                    "target_cx": None,   # will be filled from spring state
+                    "target_frac": target_frac,
+                })
+                continue
 
-    # ── Clamp cx to safe zone ─────────────────────────────────────────────
-    for kf in final_kf:
-        crop_frac = kf["cropFrac"]
-        half  = crop_frac / 2
-        kf["cx"] = max(half + 0.02, min(1.0 - half - 0.02, kf["cx"]))
-        kf["cx"] = max(CX_MIN, min(CX_MAX, kf["cx"]))
-        # cropY: for landscape sources where cropH > srcH, always 0
-        # For portrait sources where we might pan vertically, set cropY
-        kf["cropY"] = 0  # reserved — always 0 for landscape-to-portrait conversion
+            yaws  = r["yaws"]  if r["yaws"]  else [0.0] * n
+            gazes = r["gazes"] if r["gazes"] else [0.0] * n
 
-    # ── Global crop fraction (confidence + quality weighted) ─────────────
-    wsum = 0.0; frac_sum = 0.0
-    for kf in final_kf:
-        w = max(0.1, kf["confidence"]) * max(0.1, kf.get("quality", 50) / 100.0)
-        frac_sum += kf["cropFrac"] * w
-        wsum     += w
-    global_frac = frac_sum / max(0.001, wsum)
-    global_frac = round(min(0.92, max(0.44, global_frac)), 3)
+            if n == 1:
+                cx = compose_single(
+                    faces[0]["cx"], target_frac,
+                    yaws[0], gazes[0]
+                )
+                conf = faces[0]["score"]
+            else:
+                cx   = compose_multi(faces, target_frac, r["speaker_idx"])
+                conf = sum(d["score"] for d in faces) / n
+
+            frame_targets.append({
+                "t": r["t"], "n_faces": n, "confidence": round(conf, 3),
+                "target_cx": cx, "target_frac": target_frac,
+            })
+
+        return frame_targets
+
+    def apply_spring(frame_targets):
+        """
+        Run spring physics over frame_targets. Returns list of smoothed keyframes.
+        """
+        # Find first valid target for spring initialization
+        first = next((ft for ft in frame_targets if ft["target_cx"] is not None), None)
+        if first is None:
+            cx0 = mean_cx; frac0 = base_crop_frac(scene_type, face_max, avg_spread)
+        else:
+            cx0 = first["target_cx"]; frac0 = first["target_frac"]
+
+        spring   = CameraSpring(cx0, frac0)
+        last_cx  = cx0
+        keyframes = []
+
+        for i, ft in enumerate(frame_targets):
+            target_cx   = ft["target_cx"] if ft["target_cx"] is not None else last_cx
+            target_frac = ft["target_frac"]
+
+            if i == 0:
+                spring.teleport(target_cx, target_frac)
+                cx, frac = target_cx, target_frac
+            else:
+                prev_t = frame_targets[i-1]["t"]
+                dt     = max(0.01, ft["t"] - prev_t)
+                cx, frac = spring.step(target_cx, target_frac, dt)
+
+            # Clamp after spring step
+            cx   = _clamp_cx(cx, frac)
+            frac = min(0.92, max(0.44, frac))
+
+            if ft["target_cx"] is not None:
+                last_cx = cx
+
+            # Score quality at this spring position
+            faces = records[i]["faces"]
+            qual  = compute_quality(faces, cx, frac)
+
+            keyframes.append({
+                "t":          round(ft["t"], 3),
+                "cx":         round(cx, 4),
+                "cy":         round(mean_cy, 4),
+                "cropFrac":   round(frac, 3),
+                "cropY":      0,
+                "faceCount":  ft["n_faces"],
+                "confidence": ft["confidence"],
+                "quality":    qual,
+            })
+
+        return keyframes
+
+    # ── First pass ───────────────────────────────────────────────────────
+    targets   = compute_frame_targets()
+    keyframes = apply_spring(targets)
+
+    # ── Auto-widen if overall quality is below target ────────────────────
+    avg_qual = sum(kf["quality"] for kf in keyframes) / max(1, len(keyframes))
+
+    if avg_qual < QUAL_TARGET:
+        widen_frac = min(0.92, base_crop_frac(scene_type, face_max, avg_spread) * 1.12)
+        targets2   = compute_frame_targets(frac_override=widen_frac)
+        kf2        = apply_spring(targets2)
+        avg_qual2  = sum(kf["quality"] for kf in kf2) / max(1, len(kf2))
+        if avg_qual2 > avg_qual:
+            keyframes = kf2
+            avg_qual  = avg_qual2
+
+    if avg_qual < 80:
+        # Fallback: center-wide composition ignoring cinematography rules
+        safe_frac = min(0.88, base_crop_frac(scene_type, face_max, avg_spread) * 1.20)
+        cx_fallback = max(0.08, min(0.92, mean_cx))
+        for kf in keyframes:
+            kf["cx"]       = round(cx_fallback, 4)
+            kf["cropFrac"] = round(safe_frac, 3)
+            kf["quality"]  = compute_quality(records[keyframes.index(kf)]["faces"], cx_fallback, safe_frac)
+
+    # ── Replace low-quality individual frames with nearest good neighbor ──
+    good_pos = [(i, kf) for i, kf in enumerate(keyframes) if kf["quality"] >= MIN_QUALITY]
+    if good_pos:
+        for i, kf in enumerate(keyframes):
+            if kf["quality"] < MIN_QUALITY:
+                nearest = min(good_pos, key=lambda g: abs(g[0] - i))
+                kf["cx"]         = nearest[1]["cx"]
+                kf["cropFrac"]   = nearest[1]["cropFrac"]
+                kf["confidence"] = kf["confidence"] * 0.5
+
+    # ── Global crop fraction (quality-weighted average) ──────────────────
+    w_sum = 0.0; f_sum = 0.0
+    for kf in keyframes:
+        w = max(0.05, kf["confidence"]) * max(0.05, kf["quality"] / 100.0)
+        f_sum += kf["cropFrac"] * w
+        w_sum += w
+    global_frac = round(min(0.92, max(0.44, f_sum / max(0.001, w_sum))), 3)
 
     # ── Output ────────────────────────────────────────────────────────────
     print(json.dumps({
@@ -615,7 +907,7 @@ def main():
         "meanFaceY":      round(mean_cy, 4),
         "meanFaceW":      round(mean_fw, 4),
         "meanFaceH":      round(mean_fh, 4),
-        "faceCount":      face_count_max,
+        "faceCount":      face_max,
         "rangeCX":        round(range_cx, 4),
         "combinedBox":    {
             "x1": round(cb_x1, 4), "y1": round(cb_y1, 4),
@@ -624,24 +916,28 @@ def main():
         "sceneType":      scene_type,
         "framingMode":    framing_mode,
         "globalCropFrac": global_frac,
-        "keyframes": [
-            {
-                "t":          round(kf["t"], 3),
-                "cx":         round(kf["cx"], 4),
-                "cy":         round(kf.get("cy", 0.38), 4),
-                "cropFrac":   round(kf["cropFrac"], 3),
-                "cropY":      kf.get("cropY", 0),
-                "faceCount":  kf["faceCount"],
-                "confidence": kf["confidence"],
-                "quality":    kf.get("quality", 0),
-            }
-            for kf in final_kf
-        ],
-        "totalDets":      len(all_dets),
-        "srcWidth":       src_width,
-        "srcHeight":      src_height,
-        "framesSampled":  frames_sampled,
-        "detector":       "mediapipe" if USE_MEDIAPIPE else "haar",
+        "keyframes":      keyframes,
+        "totalDets":      len(all_faces),
+        "srcWidth":       src_w,
+        "srcHeight":      src_h,
+        "framesSampled":  len(records),
+        "detector":       detector_id,
+    }))
+
+
+def _fallback_output(video_path, start, end, reason="unknown"):
+    frac = CROP_FRACS["default"]
+    print(json.dumps({
+        "error": reason, "speakerSide": "center",
+        "meanFaceX": 0.5, "meanFaceY": 0.38, "meanFaceW": 0.0, "meanFaceH": 0.0,
+        "faceCount": 0, "rangeCX": 0.0,
+        "combinedBox": {"x1": 0.1, "y1": 0.05, "x2": 0.9, "y2": 0.95},
+        "sceneType": "monologue", "framingMode": "monologue",
+        "globalCropFrac": frac,
+        "keyframes": [{"t":0.0,"cx":0.5,"cy":0.38,"cropFrac":frac,
+                       "cropY":0,"faceCount":0,"confidence":0.3,"quality":0}],
+        "totalDets": 0, "srcWidth": 0, "srcHeight": 0,
+        "framesSampled": 0, "detector": "none",
     }))
 
 

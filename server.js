@@ -1899,7 +1899,7 @@ async function trackFaces(mediaPath, start, end) {
     if (!await faceTrackAvailable()) return null;
     const py = existsSync(PYTHON3) ? PYTHON3 : 'python3';
     const { stdout } = await new Promise((resolve, reject) => {
-      const p = spawn(py, [FACE_TRACK_SCRIPT, mediaPath, String(start), String(end), '3'], {
+      const p = spawn(py, [FACE_TRACK_SCRIPT, mediaPath, String(start), String(end), '5'], {
         stdio: ['pipe', 'pipe', 'pipe']
       });
       let out = '', err = '';
@@ -1909,7 +1909,7 @@ async function trackFaces(mediaPath, start, end) {
         if (code === 0) resolve({ stdout: out });
         else reject(new Error(`face_track exit ${code}: ${err.slice(0,200)}`));
       });
-      setTimeout(() => p.kill(), 20000);
+      setTimeout(() => p.kill(), 60000);
     });
     return JSON.parse(stdout.trim());
   } catch (e) {
@@ -1935,48 +1935,64 @@ async function trackFaces(mediaPath, start, end) {
 //   EDL path:     per-segment static crop X (keyframe average per segment)
 //   non-EDL path: dynamic FFmpeg crop=...eval=frame expression (smooth tracking)
 
-// ── Helper: piecewise-linear FFmpeg expression for smooth crop X ──
-function buildCropXExpr(keyframes, cropW, srcW, timeOffset = 0) {
-  // keyframes: [{t, cx, confidence, quality?}]  — quality field from face_track v6
-  // timeOffset: subtract from t to shift into output timeline (for blackOffset)
-  const defaultX = Math.max(0, Math.min(srcW - cropW, Math.round(0.5 * srcW - cropW / 2)));
+// ── Helper: piecewise-linear FFmpeg expressions for smooth crop X + W ─
+// Returns { xExpr, wExpr } — both evaluated per-frame by FFmpeg.
+// wExpr enables gentle dynamic zoom when v7 keyframes carry per-frame cropFrac.
+function buildCropExprs(keyframes, globalCropW, srcW, timeOffset = 0) {
+  const defaultX = Math.max(0, Math.min(srcW - globalCropW, Math.round(0.5 * srcW - globalCropW / 2)));
 
-  if (!keyframes || keyframes.length === 0) return String(defaultX);
+  if (!keyframes || keyframes.length === 0) {
+    return { xExpr: String(defaultX), wExpr: String(globalCropW) };
+  }
 
-  // Drop frames where v6 quality score signals a bad shot (floor/shoes/empty).
-  // If all frames are bad, keep all (prevents blank output).
   const hasQuality = keyframes.some(kf => kf.quality != null);
   const goodKfs    = hasQuality ? keyframes.filter(kf => (kf.quality ?? 50) >= 35) : keyframes;
   const useKfs     = goodKfs.length >= 2 ? goodKfs : keyframes;
 
   const pts = useKfs
-    .map(kf => ({
-      t: Math.max(0, kf.t - timeOffset),
-      x: Math.max(0, Math.min(srcW - cropW, Math.round(kf.cx * srcW - cropW / 2))),
-    }))
+    .map(kf => {
+      const w = Math.max(2, Math.round(Math.min(srcW, (kf.cropFrac ?? (globalCropW / srcW)) * srcW) / 2) * 2);
+      return {
+        t: Math.max(0, kf.t - timeOffset),
+        w: w,
+        x: Math.max(0, Math.min(srcW - w, Math.round(kf.cx * srcW - w / 2))),
+      };
+    })
     .filter(p => p.t >= -0.1)
     .sort((a, b) => a.t - b.t);
 
-  if (pts.length === 0) return String(defaultX);
-  if (pts.length === 1) return String(pts[0].x);
+  if (pts.length === 0) return { xExpr: String(defaultX), wExpr: String(globalCropW) };
+  if (pts.length === 1) return { xExpr: String(pts[0].x), wExpr: String(pts[0].w) };
 
-  // Build nested piecewise-linear if-expression (evaluated per frame by FFmpeg)
-  // Format: if(lt(t, T1), lerp(X0,X1,...), if(lt(t, T2), lerp(...), ... Xlast))
-  let expr = String(pts[pts.length - 1].x);
-  for (let i = pts.length - 2; i >= 0; i--) {
-    const { t: t0, x: x0 } = pts[i];
-    const { t: t1, x: x1 } = pts[i + 1];
-    const dt = Math.max(0.001, t1 - t0);
-    if (Math.abs(x1 - x0) < 4) {
-      // Negligible movement: use constant value
-      expr = `if(lt(t,${t1.toFixed(3)}),${x0},${expr})`;
-    } else {
-      const dx   = x1 - x0;
-      const lerp = `round(${x0}+${dx}*clamp((t-${t0.toFixed(3)})/${dt.toFixed(3)},0,1))`;
-      expr = `if(lt(t,${t1.toFixed(3)}),${lerp},${expr})`;
+  function buildPwl(vals, key) {
+    let expr = String(vals[vals.length - 1][key]);
+    for (let i = vals.length - 2; i >= 0; i--) {
+      const v0 = vals[i][key], v1 = vals[i+1][key];
+      const t0 = vals[i].t,  t1 = vals[i+1].t;
+      const dt = Math.max(0.001, t1 - t0);
+      if (Math.abs(v1 - v0) < 4) {
+        expr = `if(lt(t,${t1.toFixed(3)}),${v0},${expr})`;
+      } else {
+        const dv   = v1 - v0;
+        const lerp = `round(${v0}+${dv}*clamp((t-${t0.toFixed(3)})/${dt.toFixed(3)},0,1))`;
+        expr = `if(lt(t,${t1.toFixed(3)}),${lerp},${expr})`;
+      }
     }
+    return expr;
   }
-  return expr;
+
+  // Only emit a dynamic W expression when there is meaningful zoom variation (>8px)
+  const wMin = Math.min(...pts.map(p => p.w));
+  const wMax = Math.max(...pts.map(p => p.w));
+  const wExpr = (wMax - wMin) > 8 ? buildPwl(pts, 'w') : String(pts[Math.floor(pts.length/2)].w);
+  const xExpr = buildPwl(pts, 'x');
+
+  return { xExpr, wExpr };
+}
+
+// Keep the old single-value helper for callers that only need X
+function buildCropXExpr(keyframes, cropW, srcW, timeOffset = 0) {
+  return buildCropExprs(keyframes, cropW, srcW, timeOffset).xExpr;
 }
 
 // ── Helper: best static crop X for a time range (for EDL segments) ─
@@ -2354,9 +2370,9 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     // ── Non-EDL path: dynamic per-frame crop expression ──────────────
     // After setpts=PTS-STARTPTS, t=0 = clip start = matches keyframe times.
     // blackOffset shifts the effective start, so we subtract it from keyframe times.
-    const xExpr = pfObj.portraitFill
-      ? '0'
-      : buildCropXExpr(pfObj.keyframes, pfObj.cropW, srcW, blackOffset);
+    const { xExpr, wExpr } = pfObj.portraitFill
+      ? { xExpr: '0', wExpr: String(pfObj.cropW) }
+      : buildCropExprs(pfObj.keyframes, pfObj.cropW, srcW, blackOffset);
 
     const tS = effectiveStart.toFixed(3);
     const tE = moment.end.toFixed(3);
@@ -2368,14 +2384,14 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     } else if (pfObj.type === 'fill') {
       filterComplex =
         `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,` +
-        `crop=${pfObj.cropW}:${pfObj.cropH}:x='${xExpr}':y=0:eval=frame,` +
+        `crop=w='${wExpr}':h=${pfObj.cropH}:x='${xExpr}':y=0:eval=frame,` +
         `scale=${RW}:${RH}:flags=lanczos,setsar=1${qualityF}${assInject}[vout];` +
         `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
     } else {
       filterComplex =
         `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,split[_dvbg][_dvfg];` +
         `[_dvbg]${pfObj.bgFilter}[_dbbg];` +
-        `[_dvfg]crop=${pfObj.cropW}:${pfObj.cropH}:x='${xExpr}':y=0:eval=frame,` +
+        `[_dvfg]crop=w='${wExpr}':h=${pfObj.cropH}:x='${xExpr}':y=0:eval=frame,` +
         `scale=${RW}:${pfObj.scaledH}:flags=lanczos,setsar=1${qualityF}[_dbfg];` +
         `[_dbbg][_dbfg]overlay=x=0:y=(H-h)/2${assInject}[vout];` +
         `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
