@@ -94,6 +94,7 @@ const state = {
   openMenuClipId: null,
   // Framing mode for new clips
   framingMode: 'dynamic',
+  clipLength: 60,
   // TTS studio state
   ttsText: '',
   ttsVoiceId: '',
@@ -594,10 +595,12 @@ function renderCreate() {
             </div>
             <div class="option-row"><label>Length</label>
               <select id="clipLength">
-                <option value="15">15 s</option>
-                <option value="30">30 s</option>
-                <option value="45">45 s</option>
-                <option value="60">60 s</option>
+                <option value="60"  ${state.clipLength===60 ?'selected':''}>1 min</option>
+                <option value="90"  ${state.clipLength===90 ?'selected':''}>90 s</option>
+                <option value="120" ${state.clipLength===120?'selected':''}>2 min</option>
+                <option value="180" ${state.clipLength===180?'selected':''}>3 min</option>
+                <option value="300" ${state.clipLength===300?'selected':''}>5 min</option>
+                <option value="600" ${state.clipLength===600?'selected':''}>10 min</option>
               </select>
             </div>
             <div class="option-row"><label>Captions</label>
@@ -722,10 +725,11 @@ async function processSelected() {
   const origLabel=btn.textContent;
   btn.disabled=true; btn.textContent='Processing…';
   const clipCount    = Number($('#clipCount')?.value  || 3);
-  const clipLength   = Number($('#clipLength')?.value || 15);
+  const clipLength   = Number($('#clipLength')?.value || 60);
   const captionStyle = $('#captionStyle')?.value  || 'bold';
   const framingMode  = $('#framingMode')?.value   || 'dynamic';
   state.framingMode  = framingMode;
+  state.clipLength   = clipLength;
   state.importStatus = {type:'loading', text:'Starting AI analysis. Check Clips page for progress.'};
   renderCreate();
   try {

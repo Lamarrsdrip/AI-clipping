@@ -2526,10 +2526,10 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
 function fallbackMomentsForVideo(video, options = {}) {
   const duration = Math.max(5, Number(video.durationSeconds || 30));
   const wantedCount = Math.max(1, Math.min(10, Number(options.clipCount || 3)));
-  const wantedLength = Math.max(5, Math.min(60, Number(options.clipLength || 15)));
+  const wantedLength = Math.max(60, Math.min(600, Number(options.clipLength || 60)));
   const count = duration < wantedLength ? 1 : Math.min(wantedCount, Math.max(1, Math.floor(duration / wantedLength)));
   return Array.from({ length: count }).map((_, index) => {
-    const segmentLength = Math.min(wantedLength, Math.min(60, Math.max(5, Math.floor(duration / count))));
+    const segmentLength = Math.min(wantedLength, Math.min(600, Math.max(60, Math.floor(duration / count))));
     const start = Math.min(Math.max(0, index * segmentLength), Math.max(0, duration - 5));
     const end = Math.min(duration, Math.max(start + 5, start + segmentLength));
     return {
@@ -2668,8 +2668,8 @@ async function processVideo(payload) {
   const { videoId, rightsConfirmed, fairUseMode, transformationNote } = payload;
   const clipOptions = {
     clipCount:   Math.max(1, Math.min(10, Number(payload.clipCount || 3))),
-    clipLength:  Math.max(5, Math.min(60, Number(payload.clipLength || 15))),
-    framingMode: ['original','wide','medium','close','dynamic'].includes(payload.framingMode)
+    clipLength:  Math.max(60, Math.min(600, Number(payload.clipLength || 60))),
+    framingMode: ['tight','original','wide','medium','close','dynamic'].includes(payload.framingMode)
                    ? payload.framingMode : 'dynamic',
   };
   if (!rightsConfirmed) throw new Error('Confirm that you own this video or have permission to reuse it before processing.');
@@ -3185,7 +3185,7 @@ async function testAiConnection(db) {
 }
 
 async function detectViralMoments(db, video, segments, options = {}) {
-  const desiredLength = Math.max(5, Math.min(60, Number(options.clipLength || 15)));
+  const desiredLength = Math.max(60, Math.min(600, Number(options.clipLength || 60)));
   const desiredCount = Math.max(1, Math.min(10, Number(options.clipCount || 3)));
   const framingMode = options.framingMode || 'dynamic';
   const fallbackMoments = scoreMoments(segments, video.durationSeconds)
@@ -3201,7 +3201,7 @@ async function detectViralMoments(db, video, segments, options = {}) {
 
 Video: "${video.title}"
 Total duration: ${video.durationSeconds || 0}s
-Target clip length: ${desiredLength}s (absolute max: 62s)
+Target clip length: ${desiredLength}s (min: 60s, max: 600s)
 
 SELECTION RULES:
 1. Opening line MUST hook within 3 seconds — pattern interrupt, shocking fact, strong opinion, or story setup
@@ -3236,7 +3236,7 @@ Return exactly this JSON (no extra fields, no markdown):
     const moments = (parsed?.moments || [])
       .map(item => {
         const start = Math.max(0, Number(item.start || 0));
-        const end = Math.min(Number(video.durationSeconds || start + 60), Number(item.end || start + desiredLength));
+        const end = Math.min(Number(video.durationSeconds || start + desiredLength), Number(item.end || start + desiredLength));
         const text = segments.filter(seg => seg.end >= start && seg.start <= end).map(seg => seg.text).join(' ');
         const hooks = item.hooks || {};
         const primaryHook = hooks.curiosity || hooks.shock || hooks.value || buildCaptionText(text);
