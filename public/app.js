@@ -2253,6 +2253,12 @@ function renderBilling() {
 
 /* ── Settings ─────────────────────────────────────────────────────── */
 function renderSettings() {
+  try { _renderSettings(); } catch(e) {
+    $('#settings').innerHTML = `<div class="panel" style="margin:20px;border-color:red"><b style="color:red">Settings render error:</b><pre style="font-size:11px;overflow:auto">${esc(String(e))}</pre></div>`;
+    console.error('renderSettings error:', e);
+  }
+}
+function _renderSettings() {
   const user=state.session?.user||{};
   const tools=state.session?.tools||{};
   const setup=state.session?.setup||[];

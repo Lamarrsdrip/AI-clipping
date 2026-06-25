@@ -4792,7 +4792,11 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     return res.end(readFileSync(fallback));
   }
-  res.writeHead(200, { 'content-type': mimeFor(file) });
+  const isJs = file.endsWith('.js') || file.endsWith('.css');
+  res.writeHead(200, {
+    'content-type': mimeFor(file),
+    'cache-control': isJs ? 'no-store, must-revalidate' : 'public, max-age=86400',
+  });
   res.end(readFileSync(file));
 });
 
