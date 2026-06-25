@@ -2695,3 +2695,31 @@ input:focus, textarea:focus, select:focus {
   background: linear-gradient(180deg, #09091a 0%, var(--bg1) 100%);
   box-shadow: -12px 0 40px rgba(0,0,0,.6);
 }
+
+/* ── Brand Kit / Logo UI ── */
+.btn-sm {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-radius: 6px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn-sm:hover { background: var(--surface3); }
+.btn-danger { border-color: rgba(255,80,80,.4); color: #ff6060; }
+.btn-danger:hover { background: rgba(255,60,60,.12); }
+.btn-secondary { background: var(--surface2); border-color: var(--border); }
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+  font-size: inherit;
+}
+.toggle-label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.toggle-label input[type=checkbox] { width: 16px; height: 16px; }
+.brand-kit-row:last-child { border-bottom: none; }

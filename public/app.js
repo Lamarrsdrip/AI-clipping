@@ -549,6 +549,47 @@ function activeVideos() {
   return active.length ? active : videos;
 }
 
+function renderLogoQuickSetup() {
+  const selectedId = state.activeBrandKitId;
+  const kits = state.brandKits || [];
+  const selected = kits.find(bk => bk.id === selectedId);
+
+  if (!kits.length) {
+    // No brand kits at all — show a callout directing user to Settings
+    return `
+      <div style="margin-top:10px;padding:12px 14px;background:var(--surface2);border-radius:10px;border:1px solid var(--border)">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-size:22px">🏷</span>
+          <div style="flex:1">
+            <b style="font-size:14px">Add your logo</b>
+            <div class="muted" style="font-size:12px;margin-top:2px">Upload your channel or brand logo in Settings → Brand Kits, then select it here to watermark every clip automatically.</div>
+          </div>
+          <button id="goToLogoSettings" class="btn-sm" style="white-space:nowrap">Set up logo →</button>
+        </div>
+      </div>`;
+  }
+
+  if (selected?.logoUrl) {
+    // Kit selected and has a logo — show preview
+    return `
+      <div style="margin-top:10px;padding:10px 14px;background:var(--surface2);border-radius:10px;border:1px solid var(--accent);display:flex;align-items:center;gap:10px">
+        <img src="${esc(selected.logoUrl)}" style="height:32px;max-width:64px;object-fit:contain;border-radius:4px;background:#111">
+        <div style="flex:1">
+          <b style="font-size:13px">${esc(selected.name)}</b>
+          <div class="muted" style="font-size:11px">${esc(selected.logoPosition||'top-left')} · ${esc(selected.logoSize||'medium')} · ${Math.round((selected.logoOpacity??0.9)*100)}% opacity</div>
+        </div>
+        <span style="font-size:11px;color:var(--accent)">✓ Will appear on clips</span>
+      </div>`;
+  }
+
+  // Kits exist but none selected or selected has no logo
+  return `
+    <div style="margin-top:10px;padding:10px 14px;background:var(--surface2);border-radius:10px;border:1px dashed var(--border);display:flex;align-items:center;gap:10px">
+      <span style="font-size:18px;opacity:.5">🏷</span>
+      <div class="muted" style="font-size:12px;flex:1">${selectedId ? 'Selected kit has no logo yet — ' : 'No logo selected — '}<button id="goToLogoSettings" class="link-btn" style="font-size:12px">upload one in Settings →</button></div>
+    </div>`;
+}
+
 function renderCreate() {
   const allVideos = state.library?.videos || [];
   const videos = activeVideos();
@@ -625,13 +666,16 @@ function renderCreate() {
                 <option value="original"${state.framingMode==='original'?'selected':''}>Original frame</option>
               </select>
             </div>
-            <div class="option-row"><label>Brand kit</label>
+            <div class="option-row"><label>Logo / Watermark</label>
               <select id="brandKitSelect">
-                <option value="">None (no watermark)</option>
-                ${state.brandKits.map(bk=>`<option value="${esc(bk.id)}" ${state.activeBrandKitId===bk.id?'selected':''}>${esc(bk.name)}${bk.logoUrl?'  ✓':''}</option>`).join('')}
+                <option value="">No logo</option>
+                ${state.brandKits.map(bk=>`<option value="${esc(bk.id)}" ${state.activeBrandKitId===bk.id?'selected':''}>${esc(bk.name)}${bk.logoUrl?' (logo ready)':' (no logo yet)'}</option>`).join('')}
               </select>
             </div>
           </div>
+
+          <!-- Logo quick-setup -->
+          ${renderLogoQuickSetup()}
 
           <label class="permission" style="margin-top:12px"><input id="rightsBulk" type="checkbox"> I own or have permission to use this content.</label>
           <button id="processSelected" style="margin-top:12px;width:100%" ${state.selected.size?'':'disabled'}>
@@ -645,6 +689,8 @@ function renderCreate() {
       </section>
     </div>`;
 
+  // Go-to-settings shortcut from the logo quick-setup card
+  $('#goToLogoSettings')?.addEventListener('click', () => setView('settings'));
   $('#importForm').addEventListener('submit', importSource);
   $('#uploadVideo').addEventListener('change', e => { if (e.target.files?.[0]) uploadSource(e); });
   $$('#create [data-select-video]').forEach(b => b.addEventListener('click', () => {
@@ -2229,17 +2275,13 @@ function renderSettings() {
           <button type="submit">Save profile</button>
         </form>
       </section>
-      <section class="panel" style="margin-top:16px">
-        <h2>Caption style preview</h2>
-        <p style="margin-bottom:12px">These are the caption styles available when generating clips. Each style is tuned for a different platform and content type.</p>
-        <div class="style-swatches">
-          ${CAPTION_STYLES.map(s=>`<div class="swatch ${s}" data-style="${s}" title="${CAPTION_STYLE_LABELS[s]||s}"><small>${CAPTION_STYLE_LABELS[s]||s}</small></div>`).join('')}
-        </div>
-      </section>
       <section class="panel" style="margin-top:16px" id="brandKitSection">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
-          <h2 style="margin:0">Brand Kits</h2>
-          <button id="newBrandKitBtn" class="btn-sm">+ New kit</button>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+          <div>
+            <h2 style="margin:0">Logo &amp; Brand Kit</h2>
+            <p class="muted" style="font-size:12px;margin:2px 0 10px">Upload your logo here — it will appear as a watermark on every clip you generate.</p>
+          </div>
+          <button id="newBrandKitBtn" class="btn-sm">+ Upload logo</button>
         </div>
         ${state.brandKits.length === 0
           ? `<p class="muted">No brand kits yet. Create one to add your logo and brand settings to every exported clip.</p>`
@@ -2256,6 +2298,13 @@ function renderSettings() {
               <button class="btn-sm btn-danger delete-kit-btn" data-kit-id="${esc(bk.id)}">Delete</button>
             </div>`).join('')}
         ${state.editingBrandKit ? renderBrandKitForm() : ''}
+      </section>
+      <section class="panel" style="margin-top:16px">
+        <h2>Caption style preview</h2>
+        <p style="margin-bottom:12px">These are the caption styles available when generating clips. Each style is tuned for a different platform and content type.</p>
+        <div class="style-swatches">
+          ${CAPTION_STYLES.map(s=>`<div class="swatch ${s}" data-style="${s}" title="${CAPTION_STYLE_LABELS[s]||s}"><small>${CAPTION_STYLE_LABELS[s]||s}</small></div>`).join('')}
+        </div>
       </section>
     </div>`;
 
