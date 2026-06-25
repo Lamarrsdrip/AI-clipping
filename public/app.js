@@ -608,6 +608,7 @@ function renderCreate() {
             <div class="option-row"><label>Framing</label>
               <select id="framingMode">
                 <option value="dynamic" ${state.framingMode==='dynamic'?'selected':''}>Dynamic (AI picks)</option>
+                <option value="tight"   ${state.framingMode==='tight'  ?'selected':''}>Tight — fills frame, no bars</option>
                 <option value="medium"  ${state.framingMode==='medium' ?'selected':''}>Medium shot</option>
                 <option value="wide"    ${state.framingMode==='wide'   ?'selected':''}>Wide shot</option>
                 <option value="close"   ${state.framingMode==='close'  ?'selected':''}>Close-up</option>

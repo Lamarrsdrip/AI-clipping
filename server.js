@@ -2074,12 +2074,18 @@ function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920,
   const framingModeAI  = faceData?.framingMode    ?? '';
 
   // ── Crop fraction ──────────────────────────────────────────────────
-  // "close"/"medium"/"wide" are user overrides; "dynamic" = trust face_track v6.
-  // v6 cinematic defaults (more breathing room, less zoom):
-  //   single_speaker: 0.58  podcast: 0.68  interview: 0.78  group: 0.88
+  // framingMode values:
+  //   'tight'   — fills 9:16 completely with NO blur bars, guaranteed
+  //   'close'   — slight crop, nearly fills without bars
+  //   'medium'  — moderate zoom
+  //   'wide'    — generous breathing room (may have blur fill)
+  //   'original'— shows ~85% of source width
+  //   'dynamic' — trust face_track v7 suggestion (default)
   let cropFrac;
-  if (framingMode === 'close') {
-    cropFrac = tightFrac * 1.25;           // tight but not mugshot (was tightFrac)
+  if (framingMode === 'tight') {
+    cropFrac = tightFrac;                  // exact fill: scaledH === outH, no bars ever
+  } else if (framingMode === 'close') {
+    cropFrac = tightFrac * 1.25;           // slight breathing room, usually no bars
   } else if (framingMode === 'medium') {
     cropFrac = sceneType === 'group' ? 0.65 : sceneType === 'interview' ? 0.62 : 0.52;
   } else if (framingMode === 'wide') {
@@ -2131,26 +2137,49 @@ function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920,
   const globalCropX = Math.max(0, Math.min(srcW - cropW, Math.round(globalCx * srcW - halfW)));
 
   // ── Scaled foreground height ───────────────────────────────────────
-  const scaledH   = Math.round(srcH * outW / cropW / 2) * 2;
-  const needsBlur = scaledH < outH - 4;
+  const scaledH = Math.round(srcH * outW / cropW / 2) * 2;
 
-  // ── Background blur filter (static — same for every segment) ──────
-  const bgFilter = [
-    `scale=${outW}:${outH}:force_original_aspect_ratio=increase:flags=lanczos`,
-    `crop=${outW}:${outH}`,
-    `gblur=sigma=32`,
-    `colorchannelmixer=aa=0.50`,  // 50% brightness (clearly secondary)
-  ].join(',');
+  // Fill scenario: if fg almost fills output height (within 8%), scale up to fill fully.
+  // This happens when cropFrac is close to tightFrac — just a tiny extra zoom, no bars.
+  const nearFill  = scaledH >= outH * 0.92;
+  const needsBlur = !nearFill && scaledH < outH - 4;
+
+  // ── Background filter factory ──────────────────────────────────────
+  // CRITICAL CHANGE from v5: background is now built from the SAME CROP as
+  // the foreground (not the whole source frame).
+  // This means the blurred background shows the same content as the fg (just
+  // blurred/desaturated) — no distracting faces/objects outside the framing,
+  // and the bg feels intentional rather than "AI cropped."
+  //
+  // bgFilterFor(cropX, cropW_): returns FFmpeg filter chain for a STATIC crop.
+  // Used in EDL segments where each segment has a fixed cropX.
+  const bgFilterFor = (cropX, cropW_) =>
+    `crop=${cropW_ ?? cropW}:${cropH}:${cropX}:0,` +
+    `scale=${outW}:${outH}:force_original_aspect_ratio=increase:flags=lanczos,` +
+    `crop=${outW}:${outH},` +
+    `gblur=sigma=55,` +
+    `eq=saturation=0.55:brightness=-0.06`;
+
+  // bgFilterDynamic(xExpr, wExpr): FFmpeg filter for per-frame evaluated crop.
+  // Used in non-EDL path where crop position changes every frame.
+  const bgFilterDynamic = (xExpr, wExpr) =>
+    `crop=w='${wExpr}':h=${cropH}:x='${xExpr}':y=0:eval=frame,` +
+    `scale=${outW}:${outH}:force_original_aspect_ratio=increase:flags=lanczos,` +
+    `crop=${outW}:${outH},` +
+    `gblur=sigma=55,` +
+    `eq=saturation=0.55:brightness=-0.06`;
 
   return {
-    type:        needsBlur ? 'blurred' : 'fill',
+    type:          needsBlur ? 'blurred' : 'fill',
     cropW,
-    cropH:       needsBlur ? cropH : Math.min(cropH, Math.round(outH * cropW / outW / 2) * 2),
-    scaledH:     needsBlur ? scaledH : outH,
-    bgFilter,
+    cropH,
+    scaledH:       nearFill ? outH : (needsBlur ? scaledH : outH),
+    bgFilterFor,
+    bgFilterDynamic,
+    bgFilter:      bgFilterFor(globalCropX),  // kept for fallback path compat
     globalCropX,
     keyframes,
-    momentStart: 0,  // caller sets this before using getSegmentCropX
+    momentStart: 0,
     srcW, srcH, outW, outH,
   };
 }
@@ -2317,7 +2346,10 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   function segBlurFilter(cropX) {
     return {
       fg: `crop=${pfObj.cropW}:${pfObj.cropH}:${cropX}:0,scale=${RW}:${pfObj.scaledH}:flags=lanczos,setsar=1${qualityF}`,
-      bg: pfObj.bgFilter,
+      // Background: same crop as foreground, scaled to fill, heavily blurred.
+      // This is much cleaner than blurring the whole source frame — no distracting
+      // content outside the framing zone, and the bg feels visually intentional.
+      bg: pfObj.bgFilterFor(cropX, pfObj.cropW),
     };
   }
 
@@ -2388,9 +2420,10 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
         `scale=${RW}:${RH}:flags=lanczos,setsar=1${qualityF}${assInject}[vout];` +
         `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
     } else {
+      const dynBgF = pfObj.bgFilterDynamic(xExpr, wExpr);
       filterComplex =
         `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,split[_dvbg][_dvfg];` +
-        `[_dvbg]${pfObj.bgFilter}[_dbbg];` +
+        `[_dvbg]${dynBgF}[_dbbg];` +
         `[_dvfg]crop=w='${wExpr}':h=${pfObj.cropH}:x='${xExpr}':y=0:eval=frame,` +
         `scale=${RW}:${pfObj.scaledH}:flags=lanczos,setsar=1${qualityF}[_dbfg];` +
         `[_dbbg][_dbfg]overlay=x=0:y=(H-h)/2${assInject}[vout];` +
