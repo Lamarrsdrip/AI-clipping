@@ -210,15 +210,15 @@ const NAV = [
   { id:'home',      icon:'⌂', label:'Home'     },
   { id:'create',    icon:'✦', label:'Create'   },
   { id:'clips',     icon:'▶', label:'Clips'    },
-  { id:'scheduler', icon:'◷', label:'Schedule' }
+  { id:'faceless',  icon:'◈', label:'Faceless' }
 ];
 
 const MENU_ITEMS = [
-  { id:'faceless',   icon:'◈', label:'Faceless Content', desc:'AI scripts for faceless videos' },
-  { id:'studio',     icon:'⚡', label:'AI Studio',        desc:'B-roll, thumbnails, AI video' },
-  { id:'transcript', icon:'◑', label:'Transcripts',       desc:'Full video transcripts' },
-  { id:'billing',    icon:'◇', label:'Credits & Billing', desc:'Plans and usage' },
-  { id:'settings',   icon:'⚙', label:'Settings',          desc:'Profile and preferences' }
+  { id:'scheduler',  icon:'◷', label:'Schedule',          desc:'Plan and post your content' },
+  { id:'studio',     icon:'⚡', label:'AI Studio',          desc:'B-roll, thumbnails, AI video' },
+  { id:'transcript', icon:'◑', label:'Transcripts',         desc:'Full video transcripts' },
+  { id:'billing',    icon:'◇', label:'Credits & Billing',   desc:'Plans and usage' },
+  { id:'settings',   icon:'⚙', label:'Settings',            desc:'Profile and preferences' }
 ];
 const MENU_ITEMS_ADMIN = [
   { id:'admin', icon:'◈', label:'Admin panel', desc:'Users, logs, API keys' }
@@ -285,10 +285,6 @@ function openMenu() {
         </a>`).join('')}
     </nav>
     <div class="drawer-footer">
-      <a class="drawer-item" href="https://console.x.ai" target="_blank" rel="noopener">
-        <span class="drawer-icon">🔑</span>
-        <div><b>Get Grok API key</b><small>console.x.ai — free tier</small></div>
-      </a>
       <button class="drawer-item danger" id="drawerLogout">
         <span class="drawer-icon">↩</span>
         <div><b>Sign out</b><small>${esc(user?.email||'')}</small></div>
@@ -2226,9 +2222,9 @@ function renderAdmin() {
                 style="padding:6px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;color:var(--fg);font-size:.82rem">
                 <option value="">Change plan…</option>
                 <option value="free">Free</option>
-                <option value="starter">Starter</option>
-                <option value="creator">Creator</option>
-                <option value="studio">Studio</option>
+                <option value="pro">Pro ($19)</option>
+                <option value="creator">Creator ($49)</option>
+                <option value="agency">Agency ($149)</option>
               </select>
               <span class="admin-user-msg" data-uid="${u.id}" style="font-size:.78rem;color:var(--primary2)"></span>
             </div>
