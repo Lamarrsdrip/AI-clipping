@@ -3709,15 +3709,19 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/transcript' && req.method === 'GET') {
       const videoId = new URL(req.url, `http://${req.headers.host}`).searchParams.get('videoId');
       const db = loadDb();
+      const user = requireUser(req, db);
       if (!Array.isArray(db.transcriptions)) db.transcriptions = [];
+      const video = db.videos.find(v => v.id === videoId && v.userId === user.id);
+      if (!video) return json(res, 200, { segments: [], fullText: '', wordCount: 0 });
       const t = db.transcriptions.find(r => r.videoId === videoId);
       return json(res, 200, t || { segments: [], fullText: '', wordCount: 0 });
     }
     if (pathname === '/api/hooks/generate' && req.method === 'POST') {
       const body = await readJson(req);
       const db = loadDb();
-      const clip = db.clips.find(c => c.id === body.clipId);
-      const video = clip ? db.videos.find(v => v.id === clip.videoId) : null;
+      const user = requireUser(req, db);
+      const clip = db.clips.find(c => c.id === body.clipId && c.userId === user.id);
+      const video = clip ? db.videos.find(v => v.id === clip.videoId && v.userId === user.id) : null;
       if (!clip || !video) throw new Error('Clip not found.');
       const result = await generateMultipleHooks(db, video, clip);
       clip.hooks = result.hooks;
@@ -3727,8 +3731,9 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/social/generate' && req.method === 'POST') {
       const body = await readJson(req);
       const db = loadDb();
-      const clip = db.clips.find(c => c.id === body.clipId);
-      const video = clip ? db.videos.find(v => v.id === clip.videoId) : null;
+      const user = requireUser(req, db);
+      const clip = db.clips.find(c => c.id === body.clipId && c.userId === user.id);
+      const video = clip ? db.videos.find(v => v.id === clip.videoId && v.userId === user.id) : null;
       if (!clip || !video) throw new Error('Clip not found.');
       const result = await generateAllPlatformContent(db, video, clip);
       clip.platformContent = result;
@@ -3738,7 +3743,8 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/thumbnail/generate' && req.method === 'POST') {
       const body = await readJson(req);
       const db = loadDb();
-      const clip = db.clips.find(c => c.id === body.clipId);
+      const user = requireUser(req, db);
+      const clip = db.clips.find(c => c.id === body.clipId && c.userId === user.id);
       if (!clip) throw new Error('Clip not found.');
       const clipPath = path.join(STORAGE_DIR, 'clips', path.basename(clip.outputPath));
       const canDraw = await drawtextSupported();
@@ -3750,7 +3756,8 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/broll/suggest' && req.method === 'POST') {
       const body = await readJson(req);
       const db = loadDb();
-      const video = db.videos.find(v => v.id === body.videoId);
+      const user = requireUser(req, db);
+      const video = db.videos.find(v => v.id === body.videoId && v.userId === user.id);
       if (!video) throw new Error('Video not found.');
       const transcription = db.transcriptions?.find(t => t.videoId === body.videoId);
       const segments = transcription?.segments || [];
@@ -4070,16 +4077,19 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/clip' && req.method === 'DELETE') {
       const body = await readJson(req);
       const db = loadDb();
+      const user = requireUser(req, db);
       if (body.all) {
-        for (const clip of db.clips) {
+        const userClips = db.clips.filter(c => c.userId === user.id);
+        for (const clip of userClips) {
           if (clip.outputPath) unlinkQuiet(path.join(STORAGE_DIR, 'clips', path.basename(clip.outputPath)));
           if (clip.thumbnailPath) unlinkQuiet(path.join(STORAGE_DIR, 'thumbs', path.basename(clip.thumbnailPath)));
         }
-        db.clips = [];
+        const deleted = userClips.length;
+        db.clips = db.clips.filter(c => c.userId !== user.id);
         saveDb(db);
-        return json(res, 200, { deleted: true, count: db.clips.length });
+        return json(res, 200, { deleted: true, count: deleted });
       }
-      const clip = db.clips.find(c => c.id === body.clipId);
+      const clip = db.clips.find(c => c.id === body.clipId && c.userId === user.id);
       if (!clip) throw new Error('Clip not found.');
       if (clip.outputPath) unlinkQuiet(path.join(STORAGE_DIR, 'clips', path.basename(clip.outputPath)));
       if (clip.thumbnailPath) unlinkQuiet(path.join(STORAGE_DIR, 'thumbs', path.basename(clip.thumbnailPath)));
@@ -4090,7 +4100,8 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/clip' && req.method === 'PATCH') {
       const body = await readJson(req);
       const db = loadDb();
-      const clip = db.clips.find(item => item.id === body.id);
+      const user = requireUser(req, db);
+      const clip = db.clips.find(item => item.id === body.id && item.userId === user.id);
       if (!clip) throw new Error('Clip not found.');
       Object.assign(clip, {
         title: body.title ?? clip.title,
@@ -4108,6 +4119,7 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/schedule' && req.method === 'POST') {
       const body = await readJson(req);
       const db = loadDb();
+      requireUser(req, db);
       const clip = db.clips.find(item => item.id === body.clipId);
       if (!clip) throw new Error('Clip not found.');
       const platform = String(body.platform || '').trim();
