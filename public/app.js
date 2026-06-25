@@ -1492,17 +1492,29 @@ function renderFaceless() {
           </button>
         </form>
 
-        <div class="fl-coming">
-          <div class="fl-coming-title">Coming soon</div>
-          <div class="fl-coming-grid">
-            <div class="fl-coming-item">🎙 AI Voiceover</div>
-            <div class="fl-coming-item">💋 Lip Sync</div>
-            <div class="fl-coming-item">🎨 AI Images</div>
-            <div class="fl-coming-item">🎬 AI Video</div>
-            <div class="fl-coming-item">🎞 B-roll Auto</div>
-            <div class="fl-coming-item">🌐 Caption Translation</div>
-            <div class="fl-coming-item">📲 Social Posting</div>
-            <div class="fl-coming-item">📊 A/B Testing</div>
+        <div class="fl-next-steps">
+          <div class="fl-next-title">After generating your script:</div>
+          <div class="fl-next-grid">
+            <div class="fl-next-item" data-view="studio">
+              <div class="fl-next-icon">🎬</div>
+              <div><b>AI Video Studio</b><small>Generate AI video from scene prompts</small></div>
+              <span class="fl-next-badge">→</span>
+            </div>
+            <div class="fl-next-item" data-view="studio">
+              <div class="fl-next-icon">🎙</div>
+              <div><b>AI Voiceover</b><small>ElevenLabs TTS from your script</small></div>
+              <span class="fl-next-badge">→</span>
+            </div>
+            <div class="fl-next-item" data-view="studio">
+              <div class="fl-next-icon">🎨</div>
+              <div><b>AI Image Studio</b><small>Generate FLUX / Ideogram scene images</small></div>
+              <span class="fl-next-badge">→</span>
+            </div>
+            <div class="fl-next-item" data-view="create">
+              <div class="fl-next-icon">✂</div>
+              <div><b>Clip &amp; Caption</b><small>Upload your recorded video to clip it</small></div>
+              <span class="fl-next-badge">→</span>
+            </div>
           </div>
         </div>
       </div>
@@ -1893,14 +1905,24 @@ function renderScheduler() {
         </div>
 
         <div class="platform-connect-panel panel" style="margin-top:16px">
-          <h3>Connect your accounts</h3>
-          <p style="margin-top:4px">Direct posting requires OAuth setup in Admin → API Configuration.</p>
+          <h3 style="margin-bottom:6px">Platform posting guide</h3>
+          <p style="color:var(--muted);font-size:.83rem;margin-bottom:14px">Download your clip, then follow these steps for each platform:</p>
           <div class="platform-connect-list">
-            ${['TikTok','YouTube','Instagram','X / Twitter','LinkedIn'].map(p=>`
-              <div class="platform-connect-item">
-                <span>${p}</span>
-                <span class="pill">Coming soon</span>
-              </div>`).join('')}
+            ${[
+              {p:'TikTok', steps:['Open TikTok → +', 'Upload your clip', 'Paste caption + hashtags', 'Set "For you" audience', 'Post']},
+              {p:'YouTube Shorts', steps:['YouTube Studio → Create', 'Upload → mark as Short', 'Add title & description', 'Set to Public', 'Publish']},
+              {p:'Instagram Reels', steps:['Instagram → +', 'Select Reel', 'Upload clip', 'Add cover + caption', 'Share']},
+              {p:'X / Twitter', steps:['New Post → Media', 'Attach clip', 'Add hook as tweet text', 'Add hashtags', 'Post']},
+              {p:'LinkedIn', steps:['New Post → Video', 'Upload clip', 'Write hook caption', 'Add hashtags', 'Publish']}
+            ].map(({p,steps})=>`
+              <details class="platform-guide-item">
+                <summary><span class="platform-guide-name">${p}</span><span class="platform-guide-steps">${steps.length} steps</span></summary>
+                <ol class="platform-guide-ol">${steps.map(s=>`<li>${s}</li>`).join('')}</ol>
+              </details>`).join('')}
+          </div>
+          <div class="scheduler-tip">
+            <b>Pro tip:</b> Generate captions and hooks for your clips first — they're already optimized per platform.
+            <button data-view="clips" class="ghost" style="margin-top:10px;width:100%">Open my clips →</button>
           </div>
         </div>
       `}
@@ -2390,6 +2412,7 @@ $('#authForm').addEventListener('submit', async e => {
     const data=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
     if (data.error) throw new Error(data.error);
     localStorage.setItem('clipforge:userId',data.user.id);
+    hideAuth();
     await boot();
   } catch(e2) {
     $('#authMessage').textContent=e2.message;
@@ -2415,6 +2438,13 @@ $('#forgotPassword')?.addEventListener('click', () => {
 
 /* ── Event delegation ─────────────────────────────────────────────── */
 document.addEventListener('click', e => {
+  // Landing page auth triggers
+  const authTrigger = e.target.closest('[data-auth-mode]');
+  if (authTrigger) { e.preventDefault(); showAuth(authTrigger.dataset.authMode); return; }
+
+  // Auth modal overlay close
+  if (e.target.id === 'authModalOverlay') { hideAuth(); return; }
+
   // More / drawer buttons
   if (e.target.closest('#sideMoreBtn') || e.target.closest('#topMoreBtn')) { openMenu(); return; }
   if (e.target.closest('[data-close-drawer]')) closeMenu();
@@ -2503,27 +2533,52 @@ function scheduleRefresh() {
   }
 }
 
+/* ── Landing / Auth helpers ───────────────────────────────────────── */
+function showAuth(mode) {
+  state.authMode = mode === 'signup' ? 'signup' : 'login';
+  const isSignup = state.authMode === 'signup';
+  if ($('#authTitle')) $('#authTitle').textContent = isSignup ? 'Create account' : 'Welcome back';
+  if ($('#authSub')) $('#authSub').textContent = isSignup ? 'Start creating viral content today' : 'Sign in to your account';
+  if ($('#authSubmit')) $('#authSubmit').textContent = isSignup ? 'Create account' : 'Sign in';
+  if ($('#toggleAuth')) $('#toggleAuth').textContent = isSignup ? 'Already have an account?' : 'Create account';
+  if ($('#authNameRow')) $('#authNameRow').classList.toggle('hidden', !isSignup);
+  if ($('#authMessage')) $('#authMessage').textContent = '';
+  $('#authShell').classList.remove('hidden');
+  $('#authModalOverlay').classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+  setTimeout(() => $('#authEmail')?.focus(), 80);
+}
+
+function hideAuth() {
+  $('#authShell').classList.add('hidden');
+  $('#authModalOverlay').classList.add('hidden');
+  document.body.style.overflow = '';
+}
+
 /* ── Boot ─────────────────────────────────────────────────────────── */
 async function boot() {
   if (!uid()) {
-    $('#authShell').classList.remove('hidden');
+    $('#landingShell').classList.remove('hidden');
+    $('#authShell').classList.add('hidden');
     $('#appShell').classList.add('hidden');
     return;
   }
   await loadAll();
   const user = state.session?.user;
   if (!user) {
-    // Only clear localStorage if the server explicitly returned {user: null} (invalid/expired userId)
-    // If state.session is still null it means the request failed (network/server error) — don't log out
     if (state.session !== null) {
       localStorage.removeItem('clipforge:userId');
     }
-    $('#authShell').classList.remove('hidden');
+    $('#landingShell').classList.remove('hidden');
+    $('#authShell').classList.add('hidden');
     $('#appShell').classList.add('hidden');
     return;
   }
   try {
+    $('#landingShell').classList.add('hidden');
     $('#authShell').classList.add('hidden');
+    $('#authModalOverlay').classList.add('hidden');
+    document.body.style.overflow = '';
     $('#appShell').classList.remove('hidden');
     renderNav();
     setView('home');

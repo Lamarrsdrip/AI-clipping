@@ -261,10 +261,10 @@ function hashPassword(password = '') {
 
 function defaultPlans() {
   return [
-    { id: 'free', name: 'Free', monthlyPrice: 0, creditsIncluded: 20, maxVideoLength: 20, maxClipsPerVideo: 3, autoWatchAllowed: false, autoPostAllowed: false },
-    { id: 'starter', name: 'Starter', monthlyPrice: 5, creditsIncluded: 80, maxVideoLength: 60, maxClipsPerVideo: 5, autoWatchAllowed: true, autoPostAllowed: false },
-    { id: 'creator', name: 'Creator', monthlyPrice: 9, creditsIncluded: 180, maxVideoLength: 120, maxClipsPerVideo: 8, autoWatchAllowed: true, autoPostAllowed: false },
-    { id: 'studio', name: 'Studio', monthlyPrice: 10, creditsIncluded: 260, maxVideoLength: 180, maxClipsPerVideo: 10, autoWatchAllowed: true, autoPostAllowed: false }
+    { id: 'free',    name: 'Free',    monthlyPrice: 0,   creditsIncluded: 15,   maxVideoLength: 20,  maxClipsPerVideo: 3,    autoWatchAllowed: false, autoPostAllowed: false },
+    { id: 'pro',     name: 'Pro',     monthlyPrice: 19,  creditsIncluded: 300,  maxVideoLength: 90,  maxClipsPerVideo: 8,    autoWatchAllowed: true,  autoPostAllowed: false },
+    { id: 'creator', name: 'Creator', monthlyPrice: 49,  creditsIncluded: 800,  maxVideoLength: 180, maxClipsPerVideo: 20,   autoWatchAllowed: true,  autoPostAllowed: false },
+    { id: 'agency',  name: 'Agency',  monthlyPrice: 149, creditsIncluded: 2500, maxVideoLength: 999, maxClipsPerVideo: 9999, autoWatchAllowed: true,  autoPostAllowed: true  }
   ];
 }
 

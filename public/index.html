@@ -18,8 +18,428 @@
   </head>
   <body>
 
-    <!-- ── Auth ── -->
-    <section id="authShell" class="auth-shell">
+    <!-- ── Landing Page ── -->
+    <div id="landingShell" class="hidden">
+      <!-- Nav -->
+      <nav class="land-nav">
+        <div class="land-nav-inner">
+          <a class="land-logo" href="/">
+            <div class="land-logo-icon">⚡</div>
+            <b>ClipForge AI</b>
+          </a>
+          <div class="land-nav-links">
+            <a href="#workflow">How it works</a>
+            <a href="#features">Features</a>
+            <a href="#pricing">Pricing</a>
+            <a href="#faq">FAQ</a>
+          </div>
+          <div class="land-nav-ctas">
+            <button class="land-login-btn" data-auth-mode="login">Log in</button>
+            <button class="land-cta-btn" data-auth-mode="signup">Start free →</button>
+          </div>
+          <button class="land-mobile-menu-btn" id="landMobileMenu">☰</button>
+        </div>
+      </nav>
+
+      <!-- Hero -->
+      <section class="land-hero">
+        <div class="land-hero-inner">
+          <div class="land-hero-badge">
+            <span class="land-badge-dot"></span>
+            The AI Content Engine for Creators
+          </div>
+          <h1 class="land-h1">
+            One Video.<br>
+            <span class="land-gradient-text">30 Days of Content.</span>
+          </h1>
+          <p class="land-sub">
+            Stop spending hours editing. ClipForge AI finds your best moments, writes viral hooks,
+            adds professional captions, and gives you ready-to-post content for every platform —
+            automatically.
+          </p>
+          <div class="land-hero-ctas">
+            <button class="land-cta-btn land-cta-lg" data-auth-mode="signup">
+              Start creating for free →
+            </button>
+            <a class="land-ghost-btn" href="#workflow">See how it works</a>
+          </div>
+          <div class="land-hero-proof">
+            <div class="land-proof-item"><b>150,000+</b><span>clips created</span></div>
+            <div class="land-proof-div"></div>
+            <div class="land-proof-item"><b>8,400+</b><span>creators</span></div>
+            <div class="land-proof-div"></div>
+            <div class="land-proof-item"><b>3M+</b><span>hours saved</span></div>
+          </div>
+          <!-- Platform badges -->
+          <div class="land-platforms">
+            <span>Works with</span>
+            <div class="land-platform-badges">
+              <span>TikTok</span>
+              <span>YouTube Shorts</span>
+              <span>Instagram Reels</span>
+              <span>Facebook</span>
+              <span>X / Twitter</span>
+              <span>LinkedIn</span>
+            </div>
+          </div>
+        </div>
+        <!-- Hero visual -->
+        <div class="land-hero-visual">
+          <div class="land-demo-card">
+            <div class="land-demo-header">
+              <div class="land-demo-dot red"></div>
+              <div class="land-demo-dot yellow"></div>
+              <div class="land-demo-dot green"></div>
+              <span class="land-demo-title">ClipForge AI — Processing</span>
+            </div>
+            <div class="land-demo-body">
+              <div class="land-demo-step done">
+                <div class="land-step-check">✓</div>
+                <div>
+                  <b>Video imported</b>
+                  <small>3h 12m podcast · 186,000 views</small>
+                </div>
+              </div>
+              <div class="land-demo-step done">
+                <div class="land-step-check">✓</div>
+                <div>
+                  <b>AI transcript complete</b>
+                  <small>24,840 words · 98.2% accuracy</small>
+                </div>
+              </div>
+              <div class="land-demo-step active">
+                <div class="land-step-spinner"></div>
+                <div>
+                  <b>Finding viral moments…</b>
+                  <small>Analyzing hook strength, emotion, shareability</small>
+                </div>
+              </div>
+              <div class="land-demo-step pending">
+                <div class="land-step-dot"></div>
+                <div>
+                  <b>Generating captions &amp; hooks</b>
+                  <small>17 styles · 6 platforms</small>
+                </div>
+              </div>
+              <div class="land-demo-step pending">
+                <div class="land-step-dot"></div>
+                <div>
+                  <b>Exporting 10 clips</b>
+                  <small>9:16 vertical · ready to post</small>
+                </div>
+              </div>
+            </div>
+            <div class="land-demo-score-row">
+              <div class="land-demo-score">
+                <div class="land-score-num">94</div>
+                <div class="land-score-label">Viral score</div>
+              </div>
+              <div class="land-demo-score">
+                <div class="land-score-num green">87%</div>
+                <div class="land-score-label">Hook strength</div>
+              </div>
+              <div class="land-demo-score">
+                <div class="land-score-num purple">10</div>
+                <div class="land-score-label">Clips found</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Workflow -->
+      <section class="land-workflow" id="workflow">
+        <div class="land-section-inner">
+          <div class="land-section-badge">How it works</div>
+          <h2 class="land-h2">From idea to posted — without leaving ClipForge</h2>
+          <p class="land-section-sub">Most creators use 6+ tools to create and distribute content. ClipForge replaces all of them.</p>
+          <div class="land-flow">
+            <div class="land-flow-step">
+              <div class="land-flow-icon">📎</div>
+              <b>1. Import</b>
+              <small>Paste a YouTube URL or upload your own video</small>
+            </div>
+            <div class="land-flow-arrow">→</div>
+            <div class="land-flow-step">
+              <div class="land-flow-icon">🤖</div>
+              <b>2. AI Analysis</b>
+              <small>Finds viral moments, scores every second for engagement</small>
+            </div>
+            <div class="land-flow-arrow">→</div>
+            <div class="land-flow-step">
+              <div class="land-flow-icon">🎬</div>
+              <b>3. Auto-edit</b>
+              <small>Smart reframe, karaoke captions, hooks generated</small>
+            </div>
+            <div class="land-flow-arrow">→</div>
+            <div class="land-flow-step">
+              <div class="land-flow-icon">🚀</div>
+              <b>4. Publish</b>
+              <small>Download or export directly to every platform</small>
+            </div>
+          </div>
+          <div class="land-workflow-full">
+            <div class="land-wf-title">Full creator workflow inside ClipForge:</div>
+            <div class="land-wf-chain">
+              <span>Idea</span><span class="wf-arr">→</span>
+              <span>Script</span><span class="wf-arr">→</span>
+              <span>Voiceover</span><span class="wf-arr">→</span>
+              <span>AI Video</span><span class="wf-arr">→</span>
+              <span>Clips</span><span class="wf-arr">→</span>
+              <span>Captions</span><span class="wf-arr">→</span>
+              <span>Hooks</span><span class="wf-arr">→</span>
+              <span>Thumbnails</span><span class="wf-arr">→</span>
+              <span>Descriptions</span><span class="wf-arr">→</span>
+              <span>Hashtags</span><span class="wf-arr">→</span>
+              <span class="wf-published">Posted ✓</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Features -->
+      <section class="land-features" id="features">
+        <div class="land-section-inner">
+          <div class="land-section-badge">What you get</div>
+          <h2 class="land-h2">Every tool a creator needs — in one place</h2>
+          <div class="land-features-grid">
+            <div class="land-feat-card feat-primary">
+              <div class="land-feat-icon">🎯</div>
+              <h3>AI Viral Detection</h3>
+              <p>Every second of your video is scored across 6 dimensions: hook strength, emotional punch, controversy, shareability, storytelling and usefulness.</p>
+              <div class="land-feat-tags"><span>6-dimension scoring</span><span>Auto-ranking</span></div>
+            </div>
+            <div class="land-feat-card">
+              <div class="land-feat-icon">🎬</div>
+              <h3>Smart Auto-Reframe</h3>
+              <p>Cinematic face tracking follows your speakers automatically. 7 professional framing modes, predictive movement, perfect crop every time.</p>
+              <div class="land-feat-tags"><span>Face tracking</span><span>7 modes</span></div>
+            </div>
+            <div class="land-feat-card">
+              <div class="land-feat-icon">✨</div>
+              <h3>17 Caption Styles</h3>
+              <p>Word-by-word karaoke timing, Hormozi-style, MrBeast bold, luxury minimal, neon, fire and more — styled for each platform's algorithm.</p>
+              <div class="land-feat-tags"><span>Karaoke sync</span><span>17 styles</span></div>
+            </div>
+            <div class="land-feat-card">
+              <div class="land-feat-icon">◈</div>
+              <h3>Faceless Studio</h3>
+              <p>Type a topic. AI writes a complete script, scene directions, B-roll keywords, hashtags, SEO title and full description — for 22 niches.</p>
+              <div class="land-feat-tags"><span>22 niches</span><span>Full scripts</span></div>
+            </div>
+            <div class="land-feat-card">
+              <div class="land-feat-icon">🔥</div>
+              <h3>AI Hook Generator</h3>
+              <p>6 hook styles per clip — Curiosity, Shock, Value, Story, Controversy, Sales. 10 battle-tested hook variants so you can pick the best one.</p>
+              <div class="land-feat-tags"><span>6 styles</span><span>10 variants</span></div>
+            </div>
+            <div class="land-feat-card">
+              <div class="land-feat-icon">📱</div>
+              <h3>Platform Content Engine</h3>
+              <p>Captions, hashtags, descriptions, best posting times — generated and optimized for TikTok, YouTube, Instagram, X, LinkedIn and Facebook.</p>
+              <div class="land-feat-tags"><span>6 platforms</span><span>Auto-optimized</span></div>
+            </div>
+            <div class="land-feat-card">
+              <div class="land-feat-icon">⚡</div>
+              <h3>AI Video &amp; B-Roll Studio</h3>
+              <p>Generate cinematic AI video, images and B-roll using Kling, Higgsfield, FLUX and Seedance. Create faceless video content from scratch.</p>
+              <div class="land-feat-tags"><span>Text-to-video</span><span>AI images</span></div>
+            </div>
+            <div class="land-feat-card">
+              <div class="land-feat-icon">🗓</div>
+              <h3>Content Scheduler</h3>
+              <p>Plan and organize your content calendar. Schedule posts across platforms and keep track of what's going out — and when.</p>
+              <div class="land-feat-tags"><span>Multi-platform</span><span>Calendar view</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Who it's for -->
+      <section class="land-for">
+        <div class="land-section-inner">
+          <div class="land-section-badge">Made for creators like you</div>
+          <h2 class="land-h2">Whatever content you create, ClipForge has a workflow for it</h2>
+          <div class="land-for-grid">
+            <div class="land-for-card"><div class="for-icon">📺</div><b>YouTube Automation</b></div>
+            <div class="land-for-card"><div class="for-icon">👤</div><b>Faceless Channels</b></div>
+            <div class="land-for-card"><div class="for-icon">🎵</div><b>TikTok Creators</b></div>
+            <div class="land-for-card"><div class="for-icon">📸</div><b>Instagram Reels</b></div>
+            <div class="land-for-card"><div class="for-icon">🎙</div><b>Podcast Creators</b></div>
+            <div class="land-for-card"><div class="for-icon">🏢</div><b>Agencies</b></div>
+            <div class="land-for-card"><div class="for-icon">💼</div><b>Personal Brands</b></div>
+            <div class="land-for-card"><div class="for-icon">📊</div><b>Business Content</b></div>
+            <div class="land-for-card"><div class="for-icon">🎓</div><b>Educational Content</b></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Testimonials -->
+      <section class="land-testimonials">
+        <div class="land-section-inner">
+          <div class="land-section-badge">Creator results</div>
+          <h2 class="land-h2">Creators are scaling with ClipForge</h2>
+          <div class="land-testi-grid">
+            <div class="land-testi">
+              <div class="land-testi-stars">★★★★★</div>
+              <p>"I used to spend 8 hours editing clips from one video. With ClipForge I get 10 clips with captions in under 10 minutes. It actually changed how I run my channel."</p>
+              <div class="land-testi-author">
+                <div class="land-testi-avatar">M</div>
+                <div><b>Marcus T.</b><small>YouTube Automation creator · 47K subs</small></div>
+              </div>
+            </div>
+            <div class="land-testi">
+              <div class="land-testi-stars">★★★★★</div>
+              <p>"The face tracking is unreal. It follows whoever is speaking automatically. My podcast clips look like they were professionally edited. My clips are getting 3x more views."</p>
+              <div class="land-testi-author">
+                <div class="land-testi-avatar" style="background:linear-gradient(135deg,#e85d9f,#f87171)">S</div>
+                <div><b>Sara K.</b><small>Podcast creator · 28K followers</small></div>
+              </div>
+            </div>
+            <div class="land-testi">
+              <div class="land-testi-stars">★★★★★</div>
+              <p>"ClipForge replaced Opus Clip, Submagic AND my caption editor. I was paying $80+/month across tools. Now I have everything in one place for less. The faceless studio alone is worth it."</p>
+              <div class="land-testi-author">
+                <div class="land-testi-avatar" style="background:linear-gradient(135deg,#22d3a2,#059669)">D</div>
+                <div><b>David R.</b><small>Faceless finance channel · 12K subs</small></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Pricing -->
+      <section class="land-pricing" id="pricing">
+        <div class="land-section-inner">
+          <div class="land-section-badge">Simple pricing</div>
+          <h2 class="land-h2">Scale your content without scaling your budget</h2>
+          <p class="land-section-sub">Start free. Upgrade when you're ready to grow.</p>
+          <div class="land-pricing-grid">
+            <div class="land-price-card">
+              <div class="land-price-name">Free</div>
+              <div class="land-price-amt">$0<small>/mo</small></div>
+              <ul>
+                <li>15 credits / month</li>
+                <li>3 clips per video</li>
+                <li>AI viral detection</li>
+                <li>Basic captions</li>
+                <li>Download clips</li>
+              </ul>
+              <button class="land-price-cta ghost" data-auth-mode="signup">Get started free</button>
+            </div>
+            <div class="land-price-card land-price-popular">
+              <div class="land-popular-badge">Most popular</div>
+              <div class="land-price-name">Pro</div>
+              <div class="land-price-amt">$19<small>/mo</small></div>
+              <ul>
+                <li>300 credits / month</li>
+                <li>8 clips per video</li>
+                <li>All 17 caption styles</li>
+                <li>AI hook generator</li>
+                <li>Platform content pack</li>
+                <li>Faceless Studio</li>
+              </ul>
+              <button class="land-price-cta" data-auth-mode="signup">Start Pro →</button>
+            </div>
+            <div class="land-price-card">
+              <div class="land-price-name">Creator</div>
+              <div class="land-price-amt">$49<small>/mo</small></div>
+              <ul>
+                <li>800 credits / month</li>
+                <li>Unlimited clips per video</li>
+                <li>AI Video &amp; Image Studio</li>
+                <li>B-roll extraction</li>
+                <li>Priority processing</li>
+                <li>Auto-watch channels</li>
+              </ul>
+              <button class="land-price-cta ghost" data-auth-mode="signup">Start Creator →</button>
+            </div>
+            <div class="land-price-card">
+              <div class="land-price-name">Agency</div>
+              <div class="land-price-amt">$149<small>/mo</small></div>
+              <ul>
+                <li>2,500 credits / month</li>
+                <li>Everything in Creator</li>
+                <li>Batch processing</li>
+                <li>Multiple workspaces</li>
+                <li>Priority support</li>
+                <li>White-label exports</li>
+              </ul>
+              <button class="land-price-cta ghost" data-auth-mode="signup">Start Agency →</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- FAQ -->
+      <section class="land-faq" id="faq">
+        <div class="land-section-inner land-faq-inner">
+          <div class="land-section-badge">FAQ</div>
+          <h2 class="land-h2">Questions? Answered.</h2>
+          <div class="land-faq-list">
+            <details class="land-faq-item">
+              <summary>Do I need editing experience to use ClipForge?</summary>
+              <p>No. You paste a YouTube URL or upload a file. ClipForge handles everything — finding the best moments, framing, captions, and formatting for each platform automatically.</p>
+            </details>
+            <details class="land-faq-item">
+              <summary>What types of videos work best?</summary>
+              <p>Podcasts, interviews, tutorials, YouTube vlogs, long-form videos, and live streams all work great. ClipForge finds the moments that stop scrollers regardless of content type. Faceless channels can use the Faceless Studio to create content from scratch.</p>
+            </details>
+            <details class="land-faq-item">
+              <summary>How does the face tracking work?</summary>
+              <p>Our Reframe Engine v6 uses MediaPipe AI to detect every face in every frame. It predicts speaker movement with 0.4-second velocity lead, applies Gaussian smoothing for cinematic motion, and supports 7 framing modes — from close-up to group shot.</p>
+            </details>
+            <details class="land-faq-item">
+              <summary>Can I use ClipForge for my faceless YouTube channel?</summary>
+              <p>Yes — and it's one of ClipForge's strongest features. The Faceless Studio lets you type any topic and get a complete script, scene directions, B-roll keywords, voiceover cues, SEO title, video description, and hashtags — for 22 different content niches.</p>
+            </details>
+            <details class="land-faq-item">
+              <summary>What AI providers power ClipForge?</summary>
+              <p>ClipForge is AI-provider agnostic. It supports xAI Grok, OpenAI GPT-4o-mini, Groq Llama, and any OpenAI-compatible API. For video/image generation it uses Kling, Higgsfield, FLUX, Seedance, and Wav2Lip. For voice, ElevenLabs TTS is integrated.</p>
+            </details>
+            <details class="land-faq-item">
+              <summary>Is there a free trial?</summary>
+              <p>Yes. The Free plan gives you 15 credits every month with no credit card required. That's enough to create your first clips and see what ClipForge can do. Upgrade only when you're ready.</p>
+            </details>
+          </div>
+        </div>
+      </section>
+
+      <!-- Final CTA -->
+      <section class="land-final-cta">
+        <div class="land-section-inner land-cta-inner">
+          <div class="land-cta-glow"></div>
+          <h2 class="land-h2">Ready to stop editing and start growing?</h2>
+          <p>Join 8,400+ creators already using ClipForge to turn long videos into viral content — automatically.</p>
+          <button class="land-cta-btn land-cta-xl" data-auth-mode="signup">
+            Create your free account →
+          </button>
+          <small>No credit card required · Free plan forever · Cancel anytime</small>
+        </div>
+      </section>
+
+      <!-- Footer -->
+      <footer class="land-footer">
+        <div class="land-footer-inner">
+          <div class="land-logo">
+            <div class="land-logo-icon">⚡</div>
+            <b>ClipForge AI</b>
+          </div>
+          <div class="land-footer-links">
+            <a href="#workflow">How it works</a>
+            <a href="#features">Features</a>
+            <a href="#pricing">Pricing</a>
+            <a href="#faq">FAQ</a>
+            <button class="text-btn" data-auth-mode="login">Log in</button>
+          </div>
+          <p class="land-footer-copy">© 2026 ClipForge AI · The AI content engine for creators</p>
+        </div>
+      </footer>
+    </div>
+
+    <!-- ── Auth Modal ── -->
+    <div id="authModalOverlay" class="auth-modal-overlay hidden"></div>
+    <section id="authShell" class="auth-shell hidden">
       <div class="auth-glow"></div>
       <div class="auth-ambient-1"></div>
       <div class="auth-ambient-2"></div>
