@@ -62,6 +62,7 @@ mkdirSync(path.join(STORAGE_DIR, 'transcripts'), { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'thumbnails'), { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'generations'), { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'audio'), { recursive: true });
+mkdirSync(path.join(STORAGE_DIR, 'logos'), { recursive: true });
 
 const seed = {
   users: [{
@@ -265,6 +266,7 @@ function defaultPlans() {
     { id: 'free',    name: 'Free',    monthlyPrice: 0,   creditsIncluded: 15,   maxVideoLength: 20,  maxClipsPerVideo: 3,    autoWatchAllowed: false, autoPostAllowed: false },
     { id: 'pro',     name: 'Pro',     monthlyPrice: 19,  creditsIncluded: 300,  maxVideoLength: 90,  maxClipsPerVideo: 8,    autoWatchAllowed: true,  autoPostAllowed: false },
     { id: 'creator', name: 'Creator', monthlyPrice: 49,  creditsIncluded: 800,  maxVideoLength: 180, maxClipsPerVideo: 20,   autoWatchAllowed: true,  autoPostAllowed: false },
+    { id: 'studio',  name: 'Studio',  monthlyPrice: 99,  creditsIncluded: 1500, maxVideoLength: 600, maxClipsPerVideo: 100,  autoWatchAllowed: true,  autoPostAllowed: true  },
     { id: 'agency',  name: 'Agency',  monthlyPrice: 149, creditsIncluded: 2500, maxVideoLength: 999, maxClipsPerVideo: 9999, autoWatchAllowed: true,  autoPostAllowed: true  }
   ];
 }
@@ -307,6 +309,7 @@ function loadDb() {
   if (!Array.isArray(db.paymentRequests)) db.paymentRequests = [];
   if (!Array.isArray(db.billingPlans)) db.billingPlans = defaultPlans();
   if (!Array.isArray(db.usageEvents)) db.usageEvents = [];
+  if (!Array.isArray(db.brandKits)) db.brandKits = [];
   for (const user of db.users) {
     if (!user.role) user.role = user.email === 'ava@clipforge.local' ? 'admin' : 'user';
     if (!user.passwordHash) user.passwordHash = hashPassword('demo12345');
@@ -337,6 +340,7 @@ function saveDb(db) {
   if (!Array.isArray(db.usageEvents)) db.usageEvents = [];
   if (!Array.isArray(db.studioGenerations)) db.studioGenerations = [];
   if (!Array.isArray(db.transcriptions)) db.transcriptions = [];
+  if (!Array.isArray(db.brandKits)) db.brandKits = [];
   writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 }
 
@@ -1635,6 +1639,11 @@ function buildASSFile(words, clipStart, clipEnd, presetName, W=1080, H=1920) {
       cw[i].re = Math.max(cw[i].rs + 0.01, cw[i + 1].rs - 0.001);
     }
   }
+  // Caption sync QA: clamp any word that starts earlier than it should
+  for (let i = 1; i < cw.length; i++) {
+    if (cw[i].rs < cw[i-1].re) cw[i].rs = cw[i-1].re + 0.005;
+    if (cw[i].re <= cw[i].rs)  cw[i].re = cw[i].rs + 0.04;
+  }
 
   const header = `[Script Info]
 ScriptType: v4.00+
@@ -1655,22 +1664,43 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
   // Build caption events — karaoke-style word-by-word highlighting.
   //
-  // Each PHRASE (group of SZ words) is shown as a continuous block.
-  // Within the block, one word is highlighted at a time.
-  // Key timing rules:
-  //   • Each word's highlight ends when the NEXT word starts (seamless hand-off)
-  //   • The last word's display is capped to its actual end time + 150ms max linger
-  //   • A 60ms gap is enforced between consecutive phrases (prevents bleed-through)
-  //   • Individual word highlight is capped at 650ms (prevents stuck words from bad Whisper ts)
+  // Caption sync rules:
+  //   • Speed-aware chunking: fast speech → fewer words per phrase, slow → more
+  //   • Gap-based phrase break: silence > GAP_BREAK forces a new phrase
+  //   • Seamless hand-off: highlighted word ends exactly when next word begins
+  //   • Hard cap on per-word highlight: prevents stuck captions from bad Whisper ts
+  //   • 60ms gap enforced between phrases: prevents bleed-through
 
-  const MAX_WORD_LINGER   = 0.15;  // seconds the last word can show after it ends
-  const MAX_WORD_HIGHLIGHT = 0.65; // hard cap on any single word's highlight window
-  const INTER_PHRASE_GAP  = 0.06; // minimum silence between consecutive phrases
+  const MAX_WORD_LINGER    = 0.15;
+  const MAX_WORD_HIGHLIGHT = 0.65;
+  const INTER_PHRASE_GAP   = 0.06;
+  const GAP_BREAK          = 0.40; // pause > 400ms → always start new phrase
 
-  // Build phrase groups
+  // ── Speed-aware adaptive phrase grouping ─────────────────────
   const phrases = [];
-  for (let i = 0; i < cw.length; i += SZ) {
-    phrases.push(cw.slice(i, i + SZ));
+  let i = 0;
+  while (i < cw.length) {
+    // Measure local speech rate using a lookahead window
+    const lookEnd = Math.min(i + SZ + 2, cw.length);
+    const window  = cw.slice(i, lookEnd);
+    const wDur    = (window[window.length - 1].re - window[0].rs) || 1;
+    const wps     = window.length / wDur; // words per second
+
+    // Adaptive target: fewer words when speaker is fast (hard to read),
+    // more words when speaker is slow (screen time to read them)
+    let target = SZ;
+    if (wps > 3.8) target = Math.max(2, SZ - 2);
+    else if (wps > 2.8) target = Math.max(2, SZ - 1);
+    else if (wps < 1.2) target = Math.min(SZ + 2, 8);
+
+    const phrase = [];
+    for (let j = i; j < Math.min(i + target, cw.length); j++) {
+      // Sentence break: long pause → close this phrase, start fresh next iteration
+      if (j > i && (cw[j].rs - cw[j - 1].re) > GAP_BREAK) break;
+      phrase.push(cw[j]);
+    }
+    phrases.push(phrase);
+    i += phrase.length;
   }
 
   // Enforce inter-phrase gap: shorten current phrase end if it bleeds into the next
@@ -2231,6 +2261,89 @@ async function validateClipRender(outputPath) {
   return { valid: issues.length === 0, scores, issues };
 }
 
+// ─── Logo upload helper ───────────────────────────────────────────────────────
+function streamUploadedLogo(req) {
+  return new Promise((resolve, reject) => {
+    const busboy = Busboy({ headers: req.headers, limits: { files: 1, fields: 10, fileSize: 8 * 1024 * 1024 } });
+    const fields = {};
+    let upload = null;
+    let done = false;
+    const fail = err => { if (!done) { done = true; reject(err); } };
+    busboy.on('field', (name, val) => { fields[name] = String(val || '').slice(0, 500); });
+    busboy.on('file', (field, file, info) => {
+      const ext = path.extname(info.filename || 'logo.png').toLowerCase();
+      if (!['.png','.jpg','.jpeg','.webp'].includes(ext)) {
+        file.resume();
+        return fail(new Error('Logo must be PNG, JPG, or WebP.'));
+      }
+      const logoId = randomUUID();
+      const storedName = `${logoId}${ext}`;
+      const logoPath = path.join(STORAGE_DIR, 'logos', storedName);
+      const write = createWriteStream(logoPath);
+      upload = { logoId, storedName, logoPath, url: `/media/logos/${storedName}` };
+      file.pipe(write);
+      write.on('finish', () => { if (!done) { done = true; resolve({ fields, upload }); } });
+      write.on('error', fail);
+    });
+    busboy.on('error', fail);
+    busboy.on('close', () => { if (!done && !upload) { done = true; reject(new Error('No logo file received.')); } });
+    req.pipe(busboy);
+  });
+}
+
+// ─── Smart logo overlay builder ──────────────────────────────────────────────
+// Returns null if no valid logo, or an object with:
+//   { logoPath, inputArgs[], filterStr, outputLabel }
+// The caller appends inputArgs to FFmpeg, appends filterStr to filter_complex,
+// and replaces vMap with outputLabel.
+function buildLogoOverlay(brandKit, outW, outH) {
+  if (!brandKit || brandKit.watermarkEnabled === false) return null;
+  const logoFile = brandKit.logoStoredName
+    ? path.join(STORAGE_DIR, 'logos', brandKit.logoStoredName)
+    : null;
+  if (!logoFile || !existsSync(logoFile)) return null;
+
+  // Size: small=8%, medium=12%, large=18% of output width
+  const sizePct = { small: 8, medium: 12, large: 18 }[brandKit.logoSize || 'medium']
+                  ?? Number(brandKit.logoSizePercent || 12);
+  const logoW = Math.max(40, Math.round(outW * sizePct / 100 / 2) * 2);
+  const opacity = Math.min(1, Math.max(0.1, Number(brandKit.logoOpacity ?? 0.9)));
+
+  // Safe-zone margins (TikTok / Reels / Shorts)
+  const MT = 80;           // top margin
+  const MB = 200;          // bottom margin (above platform UI)
+  const MS = 60;           // side margin
+
+  const pos = brandKit.logoPosition || 'top-left';
+  let ox, oy;
+  switch (pos) {
+    case 'top-center':   ox = '(main_w-overlay_w)/2';             oy = MT; break;
+    case 'top-right':    ox = `main_w-overlay_w-${MS}`;           oy = MT; break;
+    case 'bottom-left':  ox = MS;                                  oy = `main_h-overlay_h-${MB}`; break;
+    case 'bottom-center':ox = '(main_w-overlay_w)/2';             oy = `main_h-overlay_h-${MB}`; break;
+    case 'bottom-right': ox = `main_w-overlay_w-${MS}`;           oy = `main_h-overlay_h-${MB}`; break;
+    default:             ox = MS;                                  oy = MT; break; // top-left / auto
+  }
+
+  // Build per-logo FFmpeg filter chain
+  // [LOGO_IDX:v] → scale → opacity → optional pill bg → [_logo]
+  // Then [vout][_logo]overlay → [_vwm]
+  let logoChain = `scale=${logoW}:-2:flags=lanczos,format=rgba`;
+  if (opacity < 0.99) logoChain += `,colorchannelmixer=aa=${opacity.toFixed(2)}`;
+  if (brandKit.logoBg) {
+    // Wrap logo in a semi-transparent dark rounded pill (pad + transparent bg)
+    logoChain += `,pad=iw+24:ih+14:12:7:color=0x00000099`;
+  }
+
+  return {
+    logoPath: logoFile,
+    filterStr: (logoInputIdx) =>
+      `[${logoInputIdx}:v]${logoChain}[_logo];[_vout_pre][_logo]overlay=x=${ox}:y=${oy}:format=auto[_vwm]`,
+    outputLabel: '[_vwm]',
+    preLabel: '[_vout_pre]',
+  };
+}
+
 async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   if (!(await hasCommand(FFMPEG))) throw new Error('FFmpeg is required to render clips.');
   if (jobId && isJobStopped(jobId)) throw new Error('Job cancelled before rendering.');
@@ -2316,13 +2429,16 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   let hasASS = false;
   try { writeFileSync(assPath, assContent, 'utf8'); hasASS = true; } catch {}
 
+  // ── Stage 5b: Brand kit / logo ────────────────────────────────
+  const brandKit = moment.brandKitId
+    ? (db.brandKits || []).find(bk => bk.id === moment.brandKitId)
+    : null;
+  const logoOverlay = buildLogoOverlay(brandKit, RW, RH);
+
   // ── Stage 6: Filter complex ───────────────────────────────────
   const framingMode = moment.framingMode || 'dynamic';
-  // pfObj.type === 'fill'    → pfObj.filter fills portrait completely, no blur needed
-  // pfObj.type === 'blurred' → pfObj.bgFilter + pfObj.fgFilter for blurred-bg overlay
-  // pfObj holds crop dimensions, keyframes, bgFilter etc. from v5 engine
   const pfObj = buildPortraitFilter(srcW, srcH, RW, RH, speakerSide, clipDuration, faceData, framingMode);
-  pfObj.momentStart = moment.start;  // needed by getSegmentCropX
+  pfObj.momentStart = moment.start;
 
   // loudnorm: broadcast-standard loudness (-14 LUFS), prevents clipping
   const audioF = 'acompressor=threshold=0.089:ratio=4:attack=5:release=50,loudnorm=I=-14:TP=-1.5:LRA=11';
@@ -2333,11 +2449,15 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-movflags', '+faststart',
   ];
 
-  // Helpers for building filter strings from pfObj
-  const assInject = hasASS ? `,ass='${assPath}'` : '';
-  const assSuffix = hasASS ? `;[_vout_pre]ass='${assPath}'[vout]` : '';
   // Quality enhancement: sharpen + subtle contrast/saturation lift for premium look
   const qualityF = ',unsharp=5:5:0.7:3:3:0.3,eq=contrast=1.04:saturation=1.10:brightness=0.01';
+  // When a logo is present, captions bake into [_vcap] and logo goes on top.
+  // Without logo, captions bake directly into [vout].
+  const capLabel   = logoOverlay ? '[_vcap]' : '[vout]';
+  const assInject  = hasASS ? `,ass='${assPath}'` : '';
+  const capInject  = hasASS ? `${assInject}${capLabel.replace(/^\[|\]$/g,'')==='vout'?'':`,null${capLabel}`}` : '';
+  // Simplified: captions always injected inline, logo applied after
+  const capSuffix  = hasASS ? `,ass='${assPath}'` : '';
 
   // Build a crop+scale filter for a specific static X (used in EDL segments)
   function segFillFilter(cropX) {
@@ -2346,9 +2466,6 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   function segBlurFilter(cropX) {
     return {
       fg: `crop=${pfObj.cropW}:${pfObj.cropH}:${cropX}:0,scale=${RW}:${pfObj.scaledH}:flags=lanczos,setsar=1${qualityF}`,
-      // Background: same crop as foreground, scaled to fill, heavily blurred.
-      // This is much cleaner than blurring the whole source frame — no distracting
-      // content outside the framing zone, and the bg feels visually intentional.
       bg: pfObj.bgFilterFor(cropX, pfObj.cropW),
     };
   }
@@ -2357,15 +2474,12 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
 
   if (useEDL) {
     // ── EDL path: each segment gets its own crop position ────────────
-    // After concat, [vcat] is already portrait-sized (1080×1920).
-    // We apply ASS subtitles once at the end.
     const segParts = edlSegs.map((s, i) => {
       const segX = pfObj.portraitFill
-        ? 0  // portrait source: no crop X needed
+        ? 0
         : getSegmentCropX(pfObj.keyframes, s.start, s.end, moment.start, pfObj.cropW, srcW);
 
       if (pfObj.portraitFill) {
-        // portrait/square source — simple scale
         return [
           `[0:v]trim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},setpts=PTS-STARTPTS,${pfObj.portraitFill}[v${i}]`,
           `[0:a]atrim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`,
@@ -2376,7 +2490,6 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
           `[0:a]atrim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`,
         ].join(';');
       } else {
-        // blurred — split → bg + fg → overlay → 1080×1920 per segment
         const { fg, bg } = segBlurFilter(segX);
         return [
           `[0:v]trim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},setpts=PTS-STARTPTS,split[_s${i}a][_s${i}b]`,
@@ -2389,35 +2502,37 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     });
 
     const cIn = edlSegs.map((_, i) => `[v${i}][a${i}]`).join('');
-    // After concat: apply ASS (if any) then route to [vout]
-    const assChain = hasASS ? `[vcat]ass='${assPath}'[vout]` : '';
+    // After concat: apply captions → route to pre-logo label
+    const preCapLabel = logoOverlay ? '[_vcap]' : '[vout]';
+    const assChain = hasASS ? `[vcat]ass='${assPath}'${preCapLabel}` : '';
     filterComplex =
       `${segParts.join(';')};${cIn}concat=n=${edlSegs.length}:v=1:a=1[vcat][acat]` +
       (hasASS ? `;${assChain}` : '') +
       `;[acat]${audioF}[aout]`;
-    vMap = hasASS ? '[vout]' : '[vcat]';
+    vMap = hasASS ? preCapLabel : '[vcat]';
     aMap = '[aout]';
 
   } else {
     // ── Non-EDL path: dynamic per-frame crop expression ──────────────
-    // After setpts=PTS-STARTPTS, t=0 = clip start = matches keyframe times.
-    // blackOffset shifts the effective start, so we subtract it from keyframe times.
     const { xExpr, wExpr } = pfObj.portraitFill
       ? { xExpr: '0', wExpr: String(pfObj.cropW) }
       : buildCropExprs(pfObj.keyframes, pfObj.cropW, srcW, blackOffset);
 
     const tS = effectiveStart.toFixed(3);
     const tE = moment.end.toFixed(3);
+    // Captions are burned in before logo overlay
+    const preCapLabel = logoOverlay ? '[_vcap]' : '[vout]';
+    const capF = hasASS ? `,ass='${assPath}'` : '';
 
     if (pfObj.portraitFill) {
       filterComplex =
-        `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,${pfObj.portraitFill}${qualityF}${assInject}[vout];` +
+        `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,${pfObj.portraitFill}${qualityF}${capF}${preCapLabel};` +
         `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
     } else if (pfObj.type === 'fill') {
       filterComplex =
         `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,` +
         `crop=w='${wExpr}':h=${pfObj.cropH}:x='${xExpr}':y=0:eval=frame,` +
-        `scale=${RW}:${RH}:flags=lanczos,setsar=1${qualityF}${assInject}[vout];` +
+        `scale=${RW}:${RH}:flags=lanczos,setsar=1${qualityF}${capF}${preCapLabel};` +
         `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
     } else {
       const dynBgF = pfObj.bgFilterDynamic(xExpr, wExpr);
@@ -2426,16 +2541,33 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
         `[_dvbg]${dynBgF}[_dbbg];` +
         `[_dvfg]crop=w='${wExpr}':h=${pfObj.cropH}:x='${xExpr}':y=0:eval=frame,` +
         `scale=${RW}:${pfObj.scaledH}:flags=lanczos,setsar=1${qualityF}[_dbfg];` +
-        `[_dbbg][_dbfg]overlay=x=0:y=(H-h)/2${assInject}[vout];` +
+        `[_dbbg][_dbfg]overlay=x=0:y=(H-h)/2${capF}${preCapLabel};` +
         `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
     }
-    vMap = '[vout]'; aMap = '[aout]';
+    vMap = preCapLabel; aMap = '[aout]';
+  }
+
+  // ── Logo injection ────────────────────────────────────────────
+  // Logo input is [1:v] (or [2:v] if something else added a second input).
+  // The logo overlay reads from preCapLabel and writes to [vout].
+  let extraInputArgs = [];
+  if (logoOverlay) {
+    extraInputArgs = ['-i', logoOverlay.logoPath];
+    const logoInputIdx = 1;
+    const logoF = logoOverlay.filterStr(logoInputIdx);
+    // logoF: [1:v]<scale/opacity>[_logo];[_vcap][_logo]overlay...[_vwm]
+    // We need to rename _vcap → _vout_pre for the logo filter
+    const logoFAdapted = logoF
+      .replace('[_vout_pre]', vMap)
+      .replace(/^\[(\d+):v\]/, `[${logoInputIdx}:v]`);
+    filterComplex += `;${logoFAdapted}`;
+    vMap = '[_vwm]';
   }
 
   // ── Stage 7: Render ───────────────────────────────────────────
   try {
     await run(FFMPEG, [
-      '-y', '-i', mediaPath,
+      '-y', '-i', mediaPath, ...extraInputArgs,
       '-filter_complex', filterComplex,
       '-map', vMap, '-map', aMap,
       ...encodeArgs, output,
@@ -2443,13 +2575,13 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   } catch (renderErr) {
     console.warn('[render:v5-fallback]', { clipId, err: String(renderErr.message||renderErr).slice(0,300) });
     try { if (existsSync(output)) unlinkSync(output); } catch {}
-    // Fallback: single-pass, static global crop, no EDL, no ASS (most robust)
+    // Fallback: single-pass, static global crop, no EDL, no logo (most robust)
     const staticX = pfObj.portraitFill ? 0 : pfObj.globalCropX;
     const fallbackVF = pfObj.portraitFill
       ? pfObj.portraitFill
       : pfObj.type === 'fill'
         ? segFillFilter(staticX)
-        : `${segBlurFilter(staticX).fg}`;  // just the fg scaled, no blur bg in fallback
+        : `${segBlurFilter(staticX).fg}`;
     const fallbackAssF = hasASS ? `,ass='${assPath}'` : '';
     await run(FFMPEG, [
       '-y', '-ss', String(effectiveStart), '-to', String(moment.end), '-i', mediaPath,
@@ -2671,6 +2803,7 @@ async function processVideo(payload) {
     clipLength:  Math.max(60, Math.min(600, Number(payload.clipLength || 60))),
     framingMode: ['tight','original','wide','medium','close','dynamic'].includes(payload.framingMode)
                    ? payload.framingMode : 'dynamic',
+    brandKitId:  payload.brandKitId || null,
   };
   if (!rightsConfirmed) throw new Error('Confirm that you own this video or have permission to reuse it before processing.');
   if (fairUseMode && !String(transformationNote || '').trim()) {
@@ -2742,7 +2875,8 @@ async function processVideo(payload) {
       suggestBrollKeywords(db, transcript, video.title).catch(() => {});
     }
     updateJob(job.id, { progress: 58, stage: 'AI analysis — scoring viral moments', steps: processingSteps('analysis', 58) });
-    const moments = transcript.length ? await detectViralMoments(db, video, transcript, clipOptions) : fallbackMomentsForVideo(video, clipOptions);
+    const rawMoments = transcript.length ? await detectViralMoments(db, video, transcript, clipOptions) : fallbackMomentsForVideo(video, clipOptions);
+    const moments = rawMoments.map(m => ({ ...m, brandKitId: m.brandKitId || clipOptions.brandKitId || null }));
     if (!moments.length) throw new Error('Could not create a clipping window for this video.');
     updateJob(job.id, { progress: 72, stage: 'creating vertical clips', steps: processingSteps('vertical', 72) });
     const rendered = [];
@@ -3265,6 +3399,7 @@ Return exactly this JSON (no extra fields, no markdown):
           bestPlatform: item.bestPlatform || 'TikTok',
           captionStyle: item.captionStyle || 'viral',
           framingMode: options.framingMode || 'dynamic',
+          brandKitId: options.brandKitId || null,
           rationale: item.rationale || 'AI-selected viral moment.',
           retentionScore: Number(item.retentionScore || 7),
           dropoffRisk: item.dropoffRisk || 'medium',
@@ -3272,7 +3407,7 @@ Return exactly this JSON (no extra fields, no markdown):
           text: text || primaryHook || video.title
         };
       })
-      .filter(item => item.end > item.start && item.end - item.start <= 62)
+      .filter(item => item.end > item.start && item.end - item.start <= 610)
       .slice(0, desiredCount);
     return moments.length ? moments : fallbackMoments;
   } catch {
@@ -4538,6 +4673,81 @@ async function handleApi(req, res, pathname) {
       }
       return json(res, 200, { jobs: db.jobs });
     }
+    // ── Brand Kits ────────────────────────────────────────────────
+    if (pathname === '/api/brand-kits' && req.method === 'GET') {
+      const db = loadDb();
+      const user = requireUser(req, db);
+      return json(res, 200, { brandKits: db.brandKits.filter(bk => bk.userId === user.id) });
+    }
+    if (pathname === '/api/brand-kit' && req.method === 'POST') {
+      const body = await readJson(req);
+      const db = loadDb();
+      const user = requireUser(req, db);
+      const kit = {
+        id: `bk_${randomUUID().replace(/-/g,'')}`,
+        userId: user.id,
+        name: String(body.name || 'My Brand').slice(0, 80),
+        logoStoredName: null,
+        logoUrl: null,
+        logoPosition: body.logoPosition || 'top-left',
+        logoSize: body.logoSize || 'medium',
+        logoSizePercent: Number(body.logoSizePercent || 12),
+        logoOpacity: Math.min(1, Math.max(0.1, Number(body.logoOpacity ?? 0.9))),
+        logoBg: Boolean(body.logoBg),
+        watermarkEnabled: body.watermarkEnabled !== false,
+        captionStyle: body.captionStyle || 'bold',
+        exportFormat: body.exportFormat || 'tiktok',
+        primaryColor: body.primaryColor || '#FFFFFF',
+        highlightColor: body.highlightColor || '#FFD700',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      db.brandKits.push(kit);
+      saveDb(db);
+      return json(res, 201, kit);
+    }
+    if (pathname === '/api/brand-kit' && req.method === 'PUT') {
+      const body = await readJson(req);
+      const db = loadDb();
+      const user = requireUser(req, db);
+      const kit = db.brandKits.find(bk => bk.id === body.id && bk.userId === user.id);
+      if (!kit) throw Object.assign(new Error('Brand kit not found.'), { status: 404 });
+      const editable = ['name','logoPosition','logoSize','logoSizePercent','logoOpacity','logoBg',
+                        'watermarkEnabled','captionStyle','exportFormat','primaryColor','highlightColor'];
+      for (const k of editable) { if (k in body) kit[k] = body[k]; }
+      kit.updatedAt = new Date().toISOString();
+      saveDb(db);
+      return json(res, 200, kit);
+    }
+    if (pathname === '/api/brand-kit' && req.method === 'DELETE') {
+      const body = await readJson(req);
+      const db = loadDb();
+      const user = requireUser(req, db);
+      const kit = db.brandKits.find(bk => bk.id === body.id && bk.userId === user.id);
+      if (!kit) throw Object.assign(new Error('Brand kit not found.'), { status: 404 });
+      if (kit.logoStoredName) unlinkQuiet(path.join(STORAGE_DIR, 'logos', kit.logoStoredName));
+      db.brandKits = db.brandKits.filter(bk => bk.id !== body.id);
+      saveDb(db);
+      return json(res, 200, { deleted: true });
+    }
+    if (pathname === '/api/brand-kit/logo' && req.method === 'POST') {
+      const db = loadDb();
+      const user = requireUser(req, db);
+      const { fields, upload } = await streamUploadedLogo(req);
+      const kit = db.brandKits.find(bk => bk.id === fields.brandKitId && bk.userId === user.id);
+      if (!kit) {
+        unlinkQuiet(upload.logoPath);
+        throw Object.assign(new Error('Brand kit not found.'), { status: 404 });
+      }
+      // Remove old logo file if any
+      if (kit.logoStoredName) unlinkQuiet(path.join(STORAGE_DIR, 'logos', kit.logoStoredName));
+      kit.logoStoredName = upload.storedName;
+      kit.logoUrl = upload.url;
+      kit.updatedAt = new Date().toISOString();
+      saveDb(db);
+      return json(res, 200, { logoUrl: upload.url, kit });
+    }
+
     if (pathname === '/api/health') {
       const db = loadDb();
       const ytdlpCommand = await workingYtDlpCommand();

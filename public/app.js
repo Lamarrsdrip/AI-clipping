@@ -95,6 +95,12 @@ const state = {
   // Framing mode for new clips
   framingMode: 'dynamic',
   clipLength: 60,
+  // Brand kit state
+  brandKits: [],
+  activeBrandKitId: null,
+  brandKitTab: 'list',          // 'list' | 'edit'
+  editingBrandKit: null,        // kit being edited
+  brandKitSaving: false,
   // TTS studio state
   ttsText: '',
   ttsVoiceId: '',
@@ -383,6 +389,7 @@ async function loadAll() {
   if (libResult.status === 'fulfilled') state.library = libResult.value;
   else console.warn('Library load failed:', libResult.reason?.message);
   api('/api/ai/generations').then(r => { state.generations = r.generations || []; }).catch(() => {});
+  api('/api/brand-kits').then(r => { state.brandKits = r.brandKits || []; }).catch(() => {});
 }
 
 /* ── Home ─────────────────────────────────────────────────────────── */
@@ -618,6 +625,12 @@ function renderCreate() {
                 <option value="original"${state.framingMode==='original'?'selected':''}>Original frame</option>
               </select>
             </div>
+            <div class="option-row"><label>Brand kit</label>
+              <select id="brandKitSelect">
+                <option value="">None (no watermark)</option>
+                ${state.brandKits.map(bk=>`<option value="${esc(bk.id)}" ${state.activeBrandKitId===bk.id?'selected':''}>${esc(bk.name)}${bk.logoUrl?'  ✓':''}</option>`).join('')}
+              </select>
+            </div>
           </div>
 
           <label class="permission" style="margin-top:12px"><input id="rightsBulk" type="checkbox"> I own or have permission to use this content.</label>
@@ -724,18 +737,20 @@ async function processSelected() {
   const btn=$('#processSelected');
   const origLabel=btn.textContent;
   btn.disabled=true; btn.textContent='Processing…';
-  const clipCount    = Number($('#clipCount')?.value  || 3);
-  const clipLength   = Number($('#clipLength')?.value || 60);
-  const captionStyle = $('#captionStyle')?.value  || 'bold';
-  const framingMode  = $('#framingMode')?.value   || 'dynamic';
-  state.framingMode  = framingMode;
-  state.clipLength   = clipLength;
+  const clipCount      = Number($('#clipCount')?.value  || 3);
+  const clipLength     = Number($('#clipLength')?.value || 60);
+  const captionStyle   = $('#captionStyle')?.value  || 'bold';
+  const framingMode    = $('#framingMode')?.value   || 'dynamic';
+  const brandKitId     = $('#brandKitSelect')?.value || null;
+  state.framingMode    = framingMode;
+  state.clipLength     = clipLength;
+  state.activeBrandKitId = brandKitId || null;
   state.importStatus = {type:'loading', text:'Starting AI analysis. Check Clips page for progress.'};
   renderCreate();
   try {
     await Promise.all(selected.map(videoId => api('/api/process', {
       method:'POST',
-      body:JSON.stringify({videoId, rightsConfirmed:true, clipCount, clipLength, captionStyle, framingMode})
+      body:JSON.stringify({videoId, rightsConfirmed:true, clipCount, clipLength, captionStyle, framingMode, brandKitId: brandKitId||undefined})
     })));
     state.selected.clear(); await loadAll(); setView('clips');
   } catch(err) {
@@ -2221,6 +2236,27 @@ function renderSettings() {
           ${CAPTION_STYLES.map(s=>`<div class="swatch ${s}" data-style="${s}" title="${CAPTION_STYLE_LABELS[s]||s}"><small>${CAPTION_STYLE_LABELS[s]||s}</small></div>`).join('')}
         </div>
       </section>
+      <section class="panel" style="margin-top:16px" id="brandKitSection">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+          <h2 style="margin:0">Brand Kits</h2>
+          <button id="newBrandKitBtn" class="btn-sm">+ New kit</button>
+        </div>
+        ${state.brandKits.length === 0
+          ? `<p class="muted">No brand kits yet. Create one to add your logo and brand settings to every exported clip.</p>`
+          : state.brandKits.map(bk => `
+            <div class="brand-kit-row" data-kit-id="${esc(bk.id)}" style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border)">
+              ${bk.logoUrl
+                ? `<img src="${esc(bk.logoUrl)}" style="height:36px;width:auto;max-width:80px;object-fit:contain;border-radius:4px;background:#111">`
+                : `<div style="width:80px;height:36px;background:var(--surface2);border-radius:4px;display:flex;align-items:center;justify-content:center"><span class="muted" style="font-size:11px">No logo</span></div>`}
+              <div style="flex:1;min-width:0">
+                <b>${esc(bk.name)}</b>
+                <div class="muted" style="font-size:12px">${esc(bk.logoPosition||'top-left')} · ${esc(bk.logoSize||'medium')} · opacity ${Math.round((bk.logoOpacity??0.9)*100)}%</div>
+              </div>
+              <button class="btn-sm edit-kit-btn" data-kit-id="${esc(bk.id)}">Edit</button>
+              <button class="btn-sm btn-danger delete-kit-btn" data-kit-id="${esc(bk.id)}">Delete</button>
+            </div>`).join('')}
+        ${state.editingBrandKit ? renderBrandKitForm() : ''}
+      </section>
     </div>`;
 
   $('#profileForm').addEventListener('submit', async e => {
@@ -2230,6 +2266,128 @@ function renderSettings() {
       await loadAll(); renderSettings();
     } catch(e2) { alert(e2.message); }
   });
+
+  // Brand kit events
+  $('#newBrandKitBtn')?.addEventListener('click', () => {
+    state.editingBrandKit = {
+      id: null, name:'My Brand', logoPosition:'top-left', logoSize:'medium',
+      logoSizePercent:12, logoOpacity:0.9, logoBg:false, watermarkEnabled:true,
+      captionStyle:'bold', exportFormat:'tiktok', primaryColor:'#FFFFFF', highlightColor:'#FFD700'
+    };
+    renderSettings();
+  });
+
+  $$('.edit-kit-btn').forEach(btn => btn.addEventListener('click', () => {
+    state.editingBrandKit = { ...state.brandKits.find(bk => bk.id === btn.dataset.kitId) };
+    renderSettings();
+  }));
+
+  $$('.delete-kit-btn').forEach(btn => btn.addEventListener('click', async () => {
+    if (!confirm('Delete this brand kit?')) return;
+    try {
+      await api('/api/brand-kit',{method:'DELETE',body:JSON.stringify({id:btn.dataset.kitId})});
+      state.brandKits = state.brandKits.filter(bk => bk.id !== btn.dataset.kitId);
+      state.editingBrandKit = null;
+      renderSettings();
+    } catch(e2) { alert(e2.message); }
+  }));
+
+  $('#brandKitForm')?.addEventListener('submit', async e => {
+    e.preventDefault();
+    const kit = state.editingBrandKit;
+    const payload = {
+      id: kit.id,
+      name: $('#bkName').value.trim() || 'My Brand',
+      logoPosition: $('#bkPosition').value,
+      logoSize: $('#bkSize').value,
+      logoOpacity: Number($('#bkOpacity').value) / 100,
+      logoBg: $('#bkBg').checked,
+      watermarkEnabled: $('#bkEnabled').checked,
+      captionStyle: $('#bkCaptionStyle').value,
+    };
+    try {
+      state.brandKitSaving = true;
+      let saved;
+      if (kit.id) {
+        saved = await api('/api/brand-kit', {method:'PUT', body:JSON.stringify(payload)});
+        state.brandKits = state.brandKits.map(bk => bk.id === saved.id ? saved : bk);
+      } else {
+        saved = await api('/api/brand-kit', {method:'POST', body:JSON.stringify(payload)});
+        state.brandKits.push(saved);
+      }
+      // Logo upload if a file was selected
+      const logoFile = $('#bkLogo')?.files?.[0];
+      if (logoFile) {
+        const fd = new FormData();
+        fd.append('brandKitId', saved.id);
+        fd.append('logo', logoFile);
+        const r = await fetch('/api/brand-kit/logo', {method:'POST', credentials:'include', body:fd});
+        const rd = await r.json();
+        if (!r.ok) throw new Error(rd.error || 'Logo upload failed');
+        state.brandKits = state.brandKits.map(bk => bk.id === rd.kit.id ? rd.kit : bk);
+      }
+      state.editingBrandKit = null;
+      state.brandKitSaving = false;
+      renderSettings();
+    } catch(e2) { state.brandKitSaving = false; alert(e2.message); }
+  });
+
+  $('#cancelBrandKitBtn')?.addEventListener('click', () => {
+    state.editingBrandKit = null;
+    renderSettings();
+  });
+}
+
+function renderBrandKitForm() {
+  const kit = state.editingBrandKit || {};
+  const opacityPct = Math.round((kit.logoOpacity ?? 0.9) * 100);
+  return `
+    <form id="brandKitForm" class="stack" style="margin-top:16px;padding-top:16px;border-top:2px solid var(--accent)">
+      <h3 style="margin:0 0 12px">${kit.id ? 'Edit brand kit' : 'New brand kit'}</h3>
+      <div class="option-row"><label>Kit name</label>
+        <input id="bkName" type="text" value="${esc(kit.name||'My Brand')}" placeholder="e.g. My Channel" required>
+      </div>
+      <div class="option-row"><label>Logo file</label>
+        <div>
+          ${kit.logoUrl ? `<img src="${esc(kit.logoUrl)}" style="height:32px;margin-bottom:6px;border-radius:4px;background:#111;display:block">` : ''}
+          <input id="bkLogo" type="file" accept=".png,.jpg,.jpeg,.webp" style="font-size:13px">
+          <small class="muted" style="display:block;margin-top:4px">PNG recommended (supports transparency). Max 8 MB.</small>
+        </div>
+      </div>
+      <div class="option-row"><label>Position</label>
+        <select id="bkPosition">
+          ${['top-left','top-center','top-right','bottom-left','bottom-center','bottom-right'].map(p=>`<option value="${p}" ${(kit.logoPosition||'top-left')===p?'selected':''}>${p.replace('-',' ')}</option>`).join('')}
+        </select>
+      </div>
+      <div class="option-row"><label>Size</label>
+        <select id="bkSize">
+          <option value="small"  ${(kit.logoSize||'medium')==='small' ?'selected':''}>Small  (~8% width)</option>
+          <option value="medium" ${(kit.logoSize||'medium')==='medium'?'selected':''}>Medium (~12% width)</option>
+          <option value="large"  ${(kit.logoSize||'medium')==='large' ?'selected':''}>Large  (~18% width)</option>
+        </select>
+      </div>
+      <div class="option-row"><label>Opacity <span id="bkOpacityVal">${opacityPct}</span>%</label>
+        <input id="bkOpacity" type="range" min="10" max="100" value="${opacityPct}"
+          oninput="document.getElementById('bkOpacityVal').textContent=this.value" style="width:160px">
+      </div>
+      <div class="option-row"><label>Background pill</label>
+        <label class="toggle-label"><input id="bkBg" type="checkbox" ${kit.logoBg?'checked':''}> Add semi-transparent dark background behind logo</label>
+      </div>
+      <div class="option-row"><label>Watermark</label>
+        <label class="toggle-label"><input id="bkEnabled" type="checkbox" ${kit.watermarkEnabled!==false?'checked':''}> Enable watermark on exported clips</label>
+      </div>
+      <div class="option-row"><label>Caption style</label>
+        <select id="bkCaptionStyle">
+          ${CAPTION_STYLES.map(s=>`<option value="${s}" ${(kit.captionStyle||'bold')===s?'selected':''}>${CAPTION_STYLE_LABELS[s]||s}</option>`).join('')}
+        </select>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:4px">
+        <button type="submit" ${state.brandKitSaving?'disabled':''}>
+          ${state.brandKitSaving ? 'Saving…' : (kit.id ? 'Save changes' : 'Create brand kit')}
+        </button>
+        <button type="button" id="cancelBrandKitBtn" class="btn-secondary">Cancel</button>
+      </div>
+    </form>`;
 }
 
 /* ── Admin ─────────────────────────────────────────────────────────── */
