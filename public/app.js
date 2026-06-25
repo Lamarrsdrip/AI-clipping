@@ -2256,8 +2256,55 @@ function renderSettings() {
   const user=state.session?.user||{};
   const tools=state.session?.tools||{};
   const setup=state.session?.setup||[];
+  const kitsHtml = state.brandKits.length === 0
+    ? `<div style="border:2px dashed var(--border2);border-radius:10px;padding:24px;text-align:center;margin-top:12px">
+         <div style="font-size:36px;margin-bottom:8px">🖼</div>
+         <p style="margin:0 0 4px;font-weight:700;font-size:15px">No logo uploaded yet</p>
+         <p class="muted" style="font-size:13px;margin:0">Click <b style="color:var(--text)">+ Upload my logo</b> above to get started.</p>
+       </div>`
+    : state.brandKits.map(bk => `
+        <div class="brand-kit-row" data-kit-id="${esc(bk.id)}" style="display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--border)">
+          ${bk.logoUrl
+            ? `<img src="${esc(bk.logoUrl)}" style="height:44px;width:auto;max-width:100px;object-fit:contain;border-radius:6px;background:#111;padding:4px;flex-shrink:0">`
+            : `<div style="width:100px;height:44px;background:var(--surface2);border-radius:6px;display:flex;align-items:center;justify-content:center;flex-shrink:0"><span class="muted" style="font-size:11px">No logo file</span></div>`}
+          <div style="flex:1;min-width:0">
+            <b style="font-size:14px">${esc(bk.name)}</b>
+            <div class="muted" style="font-size:12px;margin-top:3px">
+              ${esc(bk.logoPosition||'top-left')} &middot; ${esc(bk.logoSize||'medium')} size &middot; ${Math.round((bk.logoOpacity??0.9)*100)}% opacity
+              &nbsp;
+              <span style="color:${bk.watermarkEnabled!==false?'#7be57b':'#888'}">${bk.watermarkEnabled!==false?'● Active':'○ Disabled'}</span>
+            </div>
+          </div>
+          <button class="btn-sm edit-kit-btn" data-kit-id="${esc(bk.id)}" style="flex-shrink:0">Edit</button>
+          <button class="btn-sm btn-danger delete-kit-btn" data-kit-id="${esc(bk.id)}" style="flex-shrink:0">Remove</button>
+        </div>`).join('');
+
   $('#settings').innerHTML = `
     <div class="settings-wrap">
+
+      <!-- LOGO SECTION — always first -->
+      <section class="panel" id="brandKitSection" style="border:2px solid var(--accent)">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:10px">
+          <div>
+            <h2 style="margin:0">🏷 My Logo / Watermark</h2>
+            <p class="muted" style="font-size:13px;margin:5px 0 0">Upload your logo once — it will stamp every clip automatically. PNG with transparent background works best.</p>
+          </div>
+          <button id="newBrandKitBtn" style="padding:10px 20px;font-size:13px;font-weight:700">+ Upload my logo</button>
+        </div>
+        ${kitsHtml}
+        ${state.editingBrandKit ? renderBrandKitForm() : ''}
+      </section>
+
+      <!-- Profile -->
+      <section class="panel">
+        <h2>Profile</h2>
+        <form id="profileForm" class="stack" style="max-width:420px">
+          <input id="profileName" type="text" value="${esc(user.name||'')}" placeholder="Display name">
+          <button type="submit">Save profile</button>
+        </form>
+      </section>
+
+      <!-- System status -->
       <section class="panel">
         <h2>System status</h2>
         <div class="status-list">
@@ -2268,44 +2315,16 @@ function renderSettings() {
           </div>`).join('')}
         </div>
       </section>
-      <section class="panel" style="margin-top:16px">
-        <h2>Profile</h2>
-        <form id="profileForm" class="stack" style="max-width:420px">
-          <input id="profileName" type="text" value="${esc(user.name||'')}" placeholder="Display name">
-          <button type="submit">Save profile</button>
-        </form>
-      </section>
-      <section class="panel" style="margin-top:16px" id="brandKitSection">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-          <div>
-            <h2 style="margin:0">Logo &amp; Brand Kit</h2>
-            <p class="muted" style="font-size:12px;margin:2px 0 10px">Upload your logo here — it will appear as a watermark on every clip you generate.</p>
-          </div>
-          <button id="newBrandKitBtn" class="btn-sm">+ Upload logo</button>
-        </div>
-        ${state.brandKits.length === 0
-          ? `<p class="muted">No brand kits yet. Create one to add your logo and brand settings to every exported clip.</p>`
-          : state.brandKits.map(bk => `
-            <div class="brand-kit-row" data-kit-id="${esc(bk.id)}" style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border)">
-              ${bk.logoUrl
-                ? `<img src="${esc(bk.logoUrl)}" style="height:36px;width:auto;max-width:80px;object-fit:contain;border-radius:4px;background:#111">`
-                : `<div style="width:80px;height:36px;background:var(--surface2);border-radius:4px;display:flex;align-items:center;justify-content:center"><span class="muted" style="font-size:11px">No logo</span></div>`}
-              <div style="flex:1;min-width:0">
-                <b>${esc(bk.name)}</b>
-                <div class="muted" style="font-size:12px">${esc(bk.logoPosition||'top-left')} · ${esc(bk.logoSize||'medium')} · opacity ${Math.round((bk.logoOpacity??0.9)*100)}%</div>
-              </div>
-              <button class="btn-sm edit-kit-btn" data-kit-id="${esc(bk.id)}">Edit</button>
-              <button class="btn-sm btn-danger delete-kit-btn" data-kit-id="${esc(bk.id)}">Delete</button>
-            </div>`).join('')}
-        ${state.editingBrandKit ? renderBrandKitForm() : ''}
-      </section>
-      <section class="panel" style="margin-top:16px">
+
+      <!-- Caption styles -->
+      <section class="panel">
         <h2>Caption style preview</h2>
-        <p style="margin-bottom:12px">These are the caption styles available when generating clips. Each style is tuned for a different platform and content type.</p>
+        <p style="margin-bottom:12px">Caption styles available when generating clips.</p>
         <div class="style-swatches">
           ${CAPTION_STYLES.map(s=>`<div class="swatch ${s}" data-style="${s}" title="${CAPTION_STYLE_LABELS[s]||s}"><small>${CAPTION_STYLE_LABELS[s]||s}</small></div>`).join('')}
         </div>
       </section>
+
     </div>`;
 
   $('#profileForm').addEventListener('submit', async e => {

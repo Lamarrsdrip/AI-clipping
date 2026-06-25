@@ -2707,7 +2707,7 @@ input:focus, textarea:focus, select:focus {
   cursor: pointer;
   white-space: nowrap;
 }
-.btn-sm:hover { background: var(--surface3); }
+.btn-sm:hover { background: var(--surface2); filter: brightness(1.15); }
 .btn-danger { border-color: rgba(255,80,80,.4); color: #ff6060; }
 .btn-danger:hover { background: rgba(255,60,60,.12); }
 .btn-secondary { background: var(--surface2); border-color: var(--border); }
