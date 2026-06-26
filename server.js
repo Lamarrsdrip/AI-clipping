@@ -2311,7 +2311,21 @@ function streamUploadedLogo(req) {
 //   { logoPath, inputArgs[], filterStr, outputLabel }
 // The caller appends inputArgs to FFmpeg, appends filterStr to filter_complex,
 // and replaces vMap with outputLabel.
-function buildLogoOverlay(brandKit, outW, outH) {
+function smartWatermarkPos(faceData) {
+  if (!faceData) return 'top-right';
+  const meanFaceY = faceData.meanFaceY ?? 0.4;
+  const meanFaceX = faceData.meanFaceX ?? 0.5;
+  // If face is centered or toward top: top corners are fine (face doesn't occupy corners)
+  // If face is very low (>60%): face might be near the bottom, top is safest
+  // For portrait social video, top-right is almost always safe.
+  // If face leans strongly left (x < 0.4): top-left might be blocked, use top-right
+  // If face leans strongly right (x > 0.6): top-right might be near face, use top-left
+  if (meanFaceY < 0.5 && meanFaceX > 0.6) return 'top-left';
+  if (meanFaceY < 0.5 && meanFaceX < 0.4) return 'top-right';
+  return 'top-right'; // default: top-right is safest for portrait social content
+}
+
+function buildLogoOverlay(brandKit, outW, outH, faceData = null) {
   if (!brandKit || brandKit.watermarkEnabled === false) return null;
 
   const logoFile = brandKit.logoStoredName
@@ -2324,8 +2338,13 @@ function buildLogoOverlay(brandKit, outW, outH) {
   if (!hasLogo && !hasText) return null;
 
   // Safe-zone margins (TikTok / Reels / Shorts)
-  const MT = 80, MB = 200, MS = 60;
-  const pos = brandKit.logoPosition || 'top-left';
+  // MB is large enough to clear caption zone (captions sit ~200-280px from bottom)
+  const MT = 90, MB = 380, MS = 65;
+  const userPos = brandKit.logoPosition || 'auto';
+  // Smart auto: pick corner based on face position to avoid faces
+  const pos = (userPos === 'auto' || userPos === 'smart-auto')
+    ? smartWatermarkPos(faceData)
+    : userPos;
   const opacity = Math.min(1, Math.max(0.1, Number(brandKit.logoOpacity ?? 0.9)));
 
   if (hasLogo) {
@@ -2387,8 +2406,10 @@ function buildLogoOverlay(brandKit, outW, outH) {
   }
 
   const textStyle = explicitStyle === 'auto' ? autoStyle : explicitStyle;
-  // Position: user-override wins, else use auto
-  const finalPos  = (brandKit.logoPosition && brandKit.logoPosition !== 'auto') ? pos : autoPos;
+  // Position: user-override wins, else smart-auto, else text-type auto
+  const finalPos  = (userPos && userPos !== 'auto' && userPos !== 'smart-auto') ? userPos
+    : faceData ? pos   // face-aware position when face data available
+    : autoPos;
 
   // Smart font size: shorter text = bigger font (more presence)
   const sizeKey   = brandKit.logoSize || 'auto';
@@ -2528,7 +2549,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   const brandKit = moment.brandKitId
     ? (db.brandKits || []).find(bk => bk.id === moment.brandKitId)
     : null;
-  const logoOverlay = buildLogoOverlay(brandKit, RW, RH);
+  const logoOverlay = buildLogoOverlay(brandKit, RW, RH, faceData);
 
   // ── Stage 6: Filter complex ───────────────────────────────────
   const framingMode = moment.framingMode || 'dynamic';
@@ -2546,13 +2567,6 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
 
   // Quality enhancement: sharpen + subtle contrast/saturation lift for premium look
   const qualityF = ',unsharp=5:5:0.7:3:3:0.3,eq=contrast=1.04:saturation=1.10:brightness=0.01';
-  // When a logo is present, captions bake into [_vcap] and logo goes on top.
-  // Without logo, captions bake directly into [vout].
-  const capLabel   = logoOverlay ? '[_vcap]' : '[vout]';
-  const assInject  = hasASS ? `,ass='${assPath}'` : '';
-  const capInject  = hasASS ? `${assInject}${capLabel.replace(/^\[|\]$/g,'')==='vout'?'':`,null${capLabel}`}` : '';
-  // Simplified: captions always injected inline, logo applied after
-  const capSuffix  = hasASS ? `,ass='${assPath}'` : '';
 
   // Build a crop+scale filter for a specific static X (used in EDL segments)
   function segFillFilter(cropX) {
@@ -2982,19 +2996,14 @@ async function processVideo(payload) {
     }
     updateJob(job.id, { progress: 58, stage: 'AI analysis — scoring viral moments', steps: processingSteps('analysis', 58) });
     const targetDurations = getTargetDurations(video.durationSeconds);
-    let rawMoments;
-    if (transcript.length) {
-      const momentArrays = await Promise.all(
-        targetDurations.map(len =>
-          detectViralMoments(db, video, transcript, { ...clipOptions, clipCount: 1, clipLength: len })
-            .catch(() => [])
-        )
-      );
-      rawMoments = momentArrays.flat().filter(Boolean);
-      if (!rawMoments.length) rawMoments = fallbackMomentsForVideo(video, { ...clipOptions, targetDurations });
-    } else {
-      rawMoments = fallbackMomentsForVideo(video, { ...clipOptions, targetDurations });
-    }
+    const rawMoments = transcript.length
+      ? await detectViralMoments(db, video, transcript, {
+          ...clipOptions,
+          clipCount: targetDurations.length,
+          clipLength: targetDurations[0],
+          targetDurations,
+        })
+      : fallbackMomentsForVideo(video, { ...clipOptions, targetDurations });
     const moments = rawMoments.map(m => ({ ...m, brandKitId: m.brandKitId || clipOptions.brandKitId || null }));
     if (!moments.length) throw new Error('Could not create a clipping window for this video.');
     updateJob(job.id, { progress: 72, stage: 'creating vertical clips', steps: processingSteps('vertical', 72) });
@@ -3440,8 +3449,11 @@ async function testAiConnection(db) {
 async function detectViralMoments(db, video, segments, options = {}) {
   const desiredLength = Math.max(60, Math.min(600, Number(options.clipLength || 60)));
   const desiredCount = Math.max(1, Math.min(10, Number(options.clipCount || 3)));
+  const targetDurations = options.targetDurations || Array(desiredCount).fill(desiredLength);
   const framingMode = options.framingMode || 'dynamic';
-  const fallbackMoments = scoreMoments(segments, video.durationSeconds)
+  const videoDuration = Number(video.durationSeconds || 0);
+  const minGap = Math.max(30, videoDuration * 0.15);
+  const fallbackMoments = scoreMoments(segments, videoDuration)
     .slice(0, desiredCount)
     .map(m => ({ ...m, framingMode }));
   const transcript = segments.map(seg => `[${Math.round(seg.start)}-${Math.round(seg.end)}s] ${seg.text}`).join('\n').slice(0, 18000);
@@ -3453,8 +3465,15 @@ async function detectViralMoments(db, video, segments, options = {}) {
         { role: 'user', content: `Analyze this transcript and identify the ${desiredCount} highest-potential viral clips.
 
 Video: "${video.title}"
-Total duration: ${video.durationSeconds || 0}s
-Target clip length: ${desiredLength}s (min: 60s, max: 600s)
+Total duration: ${videoDuration}s
+${targetDurations.map((d, i) => `Clip ${i + 1} target length: ${d}s`).join('\n')}
+
+TEMPORAL DIVERSITY — MANDATORY:
+${desiredCount > 1 ? `You MUST select clips from COMPLETELY DIFFERENT sections of the video.
+• NO two clips can start within ${Math.round(minGap)}s of each other — they must cover different conversations
+• Spread across the FULL video: find moments in early, middle, AND late portions
+• If only 1-2 truly different viral moments exist, return fewer clips — NEVER repeat the same section
+• Each clip must end within a ${targetDurations.map((d, i) => `~${d}s`).join('/')} window matching the clip order above` : 'Select the single best viral moment.'}
 
 SELECTION RULES:
 1. Opening line MUST hook within 3 seconds — pattern interrupt, shocking fact, strong opinion, or story setup. The hook is SACRED — never cut it short.
@@ -3464,7 +3483,7 @@ SELECTION RULES:
 5. End on a natural pause, sentence end, or emotional beat — NEVER cut someone off mid-word or mid-idea
 6. Avoid filler, transitions ("so anyway..."), or meandering sections
 7. The clip must feel like a COMPLETE story arc: setup → tension/content → payoff
-8. Pick diverse moment types if possible — don't select clips from the same section of the video
+8. NEVER select two clips that cover the same topic or conversation — each clip must stand alone
 
 RETENTION PREDICTION:
 - retentionScore (1-10): Would viewers watch 80%+ of this clip to the end?
@@ -3531,9 +3550,34 @@ Return exactly this JSON (no extra fields, no markdown):
           text: text || primaryHook || video.title
         };
       })
-      .filter(item => item.end > item.start && item.end - item.start >= 55 && item.end - item.start <= 610)
-      .slice(0, desiredCount);
-    return moments.length ? moments : fallbackMoments;
+      .filter(item => item.end > item.start && item.end - item.start >= 55 && item.end - item.start <= 610);
+
+    // Enforce temporal diversity: pick top-scored non-overlapping clips
+    const diverse = [];
+    for (const m of moments.sort((a, b) => b.score - a.score)) {
+      if (diverse.every(d => Math.abs(d.start - m.start) >= minGap)) {
+        diverse.push(m);
+        if (diverse.length >= desiredCount) break;
+      }
+    }
+    // Fill remaining slots from scoreMoments fallback if AI didn't return enough diverse clips
+    for (const fb of fallbackMoments) {
+      if (diverse.length >= desiredCount) break;
+      if (diverse.every(d => Math.abs(d.start - fb.start) >= minGap)) {
+        diverse.push({ ...fb });
+      }
+    }
+
+    // Sort chronologically, then assign target durations and ensure minimum length
+    const sorted = diverse.sort((a, b) => a.start - b.start);
+    sorted.forEach((m, i) => {
+      const targetLen = targetDurations[i] || desiredLength;
+      if (m.end - m.start < targetLen - 5) {
+        m.end = Math.min(videoDuration || m.start + targetLen, m.start + targetLen);
+      }
+      m.framingMode = framingMode;
+    });
+    return sorted.length ? sorted : fallbackMoments;
   } catch {
     return fallbackMoments;
   }

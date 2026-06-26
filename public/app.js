@@ -2360,7 +2360,7 @@ function _renderSettings() {
   // Brand kit events
   $('#newBrandKitBtn')?.addEventListener('click', () => {
     state.editingBrandKit = {
-      id: null, name:'My Brand', logoPosition:'top-left', logoSize:'medium',
+      id: null, name:'My Brand', logoPosition:'auto', logoSize:'medium',
       logoSizePercent:12, logoOpacity:0.9, logoBg:false, watermarkEnabled:true,
       captionStyle:'bold', exportFormat:'tiktok', primaryColor:'#FFFFFF', highlightColor:'#FFD700'
     };
@@ -2498,13 +2498,13 @@ function renderBrandKitForm() {
 
       <div class="option-row"><label style="font-size:13px">Position</label>
         <select id="bkPosition" style="font-size:13px">
-          <option value="auto"        ${(kit.logoPosition||'auto')==='auto'         ?'selected':''}>Auto (based on text type)</option>
-          <option value="top-left"    ${kit.logoPosition==='top-left'    ?'selected':''}>Top left</option>
-          <option value="top-right"   ${kit.logoPosition==='top-right'   ?'selected':''}>Top right</option>
-          <option value="top-center"  ${kit.logoPosition==='top-center'  ?'selected':''}>Top center</option>
-          <option value="bottom-left" ${kit.logoPosition==='bottom-left' ?'selected':''}>Bottom left</option>
+          <option value="auto"         ${(kit.logoPosition||'auto')==='auto'          ?'selected':''}>Smart Auto — avoids faces & captions (Recommended)</option>
+          <option value="top-right"   ${kit.logoPosition==='top-right'    ?'selected':''}>Top right</option>
+          <option value="top-left"    ${kit.logoPosition==='top-left'     ?'selected':''}>Top left</option>
+          <option value="top-center"  ${kit.logoPosition==='top-center'   ?'selected':''}>Top center</option>
+          <option value="bottom-left" ${kit.logoPosition==='bottom-left'  ?'selected':''}>Bottom left</option>
           <option value="bottom-center"${kit.logoPosition==='bottom-center'?'selected':''}>Bottom center</option>
-          <option value="bottom-right"${kit.logoPosition==='bottom-right'?'selected':''}>Bottom right</option>
+          <option value="bottom-right"${kit.logoPosition==='bottom-right' ?'selected':''}>Bottom right</option>
         </select>
       </div>
 
