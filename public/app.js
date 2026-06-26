@@ -12,6 +12,22 @@ function showToast(msg, type='ok', duration=4000) {
 const $ = sel => document.querySelector(sel);
 const $$ = sel => [...document.querySelectorAll(sel)];
 const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function updateWmHint(val) {
+  const h = document.getElementById('bkWmHint');
+  if (!h) return;
+  const v = (val||'').trim();
+  if (!v) { h.textContent = ''; return; }
+  if (v.startsWith('@'))
+    h.textContent = '✓ Social handle detected — bottom-right, clean white style';
+  else if (/\.(com|net|org|io|co|tv|me|app|ai|gg|xyz)(\b|\/|$)/i.test(v))
+    h.textContent = '✓ Website detected — bottom-center, subtle minimal style';
+  else if (v === v.toUpperCase() && /[A-Z]/.test(v) && v.replace(/\s/g,'').length <= 10)
+    h.textContent = '✓ Brand name detected — top-right, bold prominent style';
+  else if (v.replace(/\s/g,'').length <= 8)
+    h.textContent = '✓ Short brand name — top-right, clean style, auto-uppercased';
+  else
+    h.textContent = '✓ Brand name — top-right, dark pill background for readability';
+}
 const fmt = n => Number(n) >= 1e6 ? (n/1e6).toFixed(1)+'M' : Number(n) >= 1e3 ? (n/1e3).toFixed(1)+'K' : String(n||0);
 const dur = s => { const n=Number(s||0); if(!n) return '--'; const m=Math.floor(n/60); return m>0?`${m}m ${n%60|0}s`:`${n|0}s`; };
 const when = d => { if(!d) return ''; const ms=Date.now()-new Date(d).getTime(); const m=Math.floor(ms/60000); return m<1?'just now':m<60?`${m}m ago`:m<1440?`${Math.floor(m/60)}h ago`:`${Math.floor(m/1440)}d ago`; };
@@ -2372,13 +2388,13 @@ function _renderSettings() {
     const payload = {
       id: kit.id,
       name: $('#bkName').value.trim() || 'My Brand',
-      textWatermark: ($('#bkTextWatermark').value || '').trim().slice(0, 50),
-      logoPosition: $('#bkPosition').value,
-      logoSize: $('#bkSize').value,
+      textWatermark: ($('#bkTextWatermark').value || '').trim().slice(0, 60),
+      textStyle: $('#bkTextStyle').value || 'auto',
+      logoPosition: $('#bkPosition').value || 'auto',
+      logoSize: 'auto',
       logoOpacity: Number($('#bkOpacity').value) / 100,
-      logoBg: $('#bkBg').checked,
+      logoBg: false,
       watermarkEnabled: $('#bkEnabled').checked,
-      captionStyle: $('#bkCaptionStyle').value,
     };
     try {
       state.brandKitSaving = true;
@@ -2413,64 +2429,97 @@ function _renderSettings() {
   });
 }
 
+function getTextWatermarkHint(val) {
+  if (!val) return null;
+  const v = val.trim();
+  if (v.startsWith('@'))
+    return '✓ Detected as social handle — will appear bottom-right, clean white style';
+  if (/\.(com|net|org|io|co|tv|me|app|ai|gg|xyz)(\b|\/|$)/i.test(v))
+    return '✓ Detected as website — will appear bottom-center, subtle minimal style';
+  if (v === v.toUpperCase() && /[A-Z]/.test(v) && v.replace(/\s/g,'').length <= 10)
+    return '✓ Detected as brand name — will appear top-right, bold prominent style';
+  if (v.replace(/\s/g,'').length <= 8)
+    return '✓ Short brand name — will appear top-right, clean style, auto-uppercased';
+  return '✓ Brand name — will appear top-right in a dark pill for readability';
+}
+
 function renderBrandKitForm() {
   const kit = state.editingBrandKit || {};
   const opacityPct = Math.round((kit.logoOpacity ?? 0.9) * 100);
+  const wmVal = kit.textWatermark || '';
+  const hint  = getTextWatermarkHint(wmVal);
   return `
     <form id="brandKitForm" class="stack" style="margin-top:16px;padding-top:16px;border-top:2px solid var(--accent)">
-      <h3 style="margin:0 0 12px">${kit.id ? 'Edit brand kit' : 'New brand kit'}</h3>
+      <h3 style="margin:0 0 4px">${kit.id ? 'Edit watermark' : 'Set up your watermark'}</h3>
+      <p class="muted" style="font-size:12px;margin:0 0 14px">ClipForge auto-styles the watermark based on what you type — no design skills needed.</p>
 
-      <div class="option-row"><label>Brand name</label>
-        <input id="bkName" type="text" value="${esc(kit.name||'My Brand')}" placeholder="e.g. My Channel" required>
+      <!-- PRIMARY: text watermark -->
+      <div style="padding:14px;background:var(--surface2);border-radius:10px;border:1px solid var(--border2)">
+        <label style="display:block;font-weight:700;font-size:13px;margin-bottom:8px">Your brand name, handle, or website</label>
+        <input id="bkTextWatermark" type="text" value="${esc(wmVal)}"
+          placeholder="e.g.  @YourChannel  ·  BrandName  ·  yoursite.com"
+          style="width:100%;box-sizing:border-box;font-size:15px;padding:10px 12px"
+          oninput="updateWmHint(this.value)">
+        <div id="bkWmHint" style="font-size:12px;color:var(--accent);margin-top:6px;min-height:18px">${hint ? esc(hint) : ''}</div>
+        <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px">
+          <span style="font-size:11px;color:#888">Examples:</span>
+          ${['@YourChannel','ClipForge','yoursite.com','MY BRAND'].map(ex=>`
+            <button type="button" onclick="document.getElementById('bkTextWatermark').value='${ex}';document.getElementById('bkTextWatermark').dispatchEvent(new Event('input'))"
+              style="font-size:11px;padding:3px 8px;background:var(--surface3,var(--surface2));border:1px solid var(--border);border-radius:4px;cursor:pointer;color:var(--text)">${ex}</button>
+          `).join('')}
+        </div>
       </div>
 
-      <!-- Logo section -->
-      <div style="padding:12px;background:var(--surface2);border-radius:8px;margin:4px 0">
-        <p style="margin:0 0 8px;font-weight:600;font-size:13px">Option A — Upload a logo image</p>
+      <p style="font-size:12px;color:#666;text-align:center;margin:8px 0">— or upload a logo image (optional, replaces text) —</p>
+
+      <!-- SECONDARY: logo image -->
+      <div style="padding:12px;background:var(--surface2);border-radius:8px;border:1px solid var(--border)">
         ${kit.logoUrl ? `<img src="${esc(kit.logoUrl)}" style="height:36px;margin-bottom:8px;border-radius:4px;background:#111;display:block;padding:4px">` : ''}
-        <input id="bkLogo" type="file" accept=".png,.jpg,.jpeg,.webp" style="font-size:13px">
-        <small class="muted" style="display:block;margin-top:4px">PNG with transparent background works best. Max 8 MB.</small>
+        <input id="bkLogo" type="file" accept=".png,.jpg,.jpeg,.webp" style="font-size:12px">
+        <small class="muted" style="display:block;margin-top:4px">PNG with transparent background recommended. Replaces text if uploaded.</small>
       </div>
 
-      <!-- Text watermark section -->
-      <div style="padding:12px;background:var(--surface2);border-radius:8px;margin:4px 0">
-        <p style="margin:0 0 8px;font-weight:600;font-size:13px">Option B — Use text as watermark (if no logo)</p>
-        <input id="bkTextWatermark" type="text" value="${esc(kit.textWatermark||'')}"
-          placeholder="e.g. @YourChannel · YourBrand · yoursite.com"
-          style="width:100%;box-sizing:border-box;font-size:13px">
-        <small class="muted" style="display:block;margin-top:4px">If no logo is uploaded, this text will be stamped on every clip. Max 50 chars.</small>
+      <!-- Kit internal name -->
+      <div class="option-row"><label style="font-size:13px">Kit label</label>
+        <input id="bkName" type="text" value="${esc(kit.name||'My Brand')}" placeholder="e.g. Main Channel" style="font-size:13px">
       </div>
 
-      <div class="option-row"><label>Position</label>
-        <select id="bkPosition">
-          ${['top-left','top-center','top-right','bottom-left','bottom-center','bottom-right'].map(p=>`<option value="${p}" ${(kit.logoPosition||'top-left')===p?'selected':''}>${p.replace('-',' ')}</option>`).join('')}
+      <!-- Style override (auto by default) -->
+      <div class="option-row"><label style="font-size:13px">Text style</label>
+        <select id="bkTextStyle" style="font-size:13px">
+          <option value="auto"     ${(kit.textStyle||'auto')==='auto'    ?'selected':''}>Auto (ClipForge decides)</option>
+          <option value="clean"    ${kit.textStyle==='clean'   ?'selected':''}>Clean — white bold, thin outline</option>
+          <option value="bold"     ${kit.textStyle==='bold'    ?'selected':''}>Bold — heavy outline, max visibility</option>
+          <option value="minimal"  ${kit.textStyle==='minimal' ?'selected':''}>Minimal — subtle, semi-transparent</option>
+          <option value="pill"     ${kit.textStyle==='pill'    ?'selected':''}>Pill — text in dark rounded box</option>
+          <option value="outlined" ${kit.textStyle==='outlined'?'selected':''}>Outlined — dark text, white border</option>
         </select>
       </div>
-      <div class="option-row"><label>Size</label>
-        <select id="bkSize">
-          <option value="small"  ${(kit.logoSize||'medium')==='small' ?'selected':''}>Small</option>
-          <option value="medium" ${(kit.logoSize||'medium')==='medium'?'selected':''}>Medium</option>
-          <option value="large"  ${(kit.logoSize||'medium')==='large' ?'selected':''}>Large</option>
+
+      <div class="option-row"><label style="font-size:13px">Position</label>
+        <select id="bkPosition" style="font-size:13px">
+          <option value="auto"        ${(kit.logoPosition||'auto')==='auto'         ?'selected':''}>Auto (based on text type)</option>
+          <option value="top-left"    ${kit.logoPosition==='top-left'    ?'selected':''}>Top left</option>
+          <option value="top-right"   ${kit.logoPosition==='top-right'   ?'selected':''}>Top right</option>
+          <option value="top-center"  ${kit.logoPosition==='top-center'  ?'selected':''}>Top center</option>
+          <option value="bottom-left" ${kit.logoPosition==='bottom-left' ?'selected':''}>Bottom left</option>
+          <option value="bottom-center"${kit.logoPosition==='bottom-center'?'selected':''}>Bottom center</option>
+          <option value="bottom-right"${kit.logoPosition==='bottom-right'?'selected':''}>Bottom right</option>
         </select>
       </div>
-      <div class="option-row"><label>Opacity <span id="bkOpacityVal">${opacityPct}</span>%</label>
+
+      <div class="option-row"><label style="font-size:13px">Opacity <span id="bkOpacityVal">${opacityPct}</span>%</label>
         <input id="bkOpacity" type="range" min="10" max="100" value="${opacityPct}"
-          oninput="document.getElementById('bkOpacityVal').textContent=this.value" style="width:160px">
+          oninput="document.getElementById('bkOpacityVal').textContent=this.value" style="width:140px">
       </div>
-      <div class="option-row"><label>Background box</label>
-        <label class="toggle-label"><input id="bkBg" type="checkbox" ${kit.logoBg?'checked':''}> Add dark background behind watermark</label>
+
+      <div class="option-row"><label style="font-size:13px">Active</label>
+        <label class="toggle-label"><input id="bkEnabled" type="checkbox" ${kit.watermarkEnabled!==false?'checked':''}> Stamp on every exported clip</label>
       </div>
-      <div class="option-row"><label>Active</label>
-        <label class="toggle-label"><input id="bkEnabled" type="checkbox" ${kit.watermarkEnabled!==false?'checked':''}> Enable watermark on exported clips</label>
-      </div>
-      <div class="option-row"><label>Caption style</label>
-        <select id="bkCaptionStyle">
-          ${CAPTION_STYLES.map(s=>`<option value="${s}" ${(kit.captionStyle||'bold')===s?'selected':''}>${CAPTION_STYLE_LABELS[s]||s}</option>`).join('')}
-        </select>
-      </div>
+
       <div style="display:flex;gap:8px;margin-top:8px">
         <button type="submit" ${state.brandKitSaving?'disabled':''}>
-          ${state.brandKitSaving ? 'Saving…' : (kit.id ? 'Save changes' : 'Create brand kit')}
+          ${state.brandKitSaving ? 'Saving…' : (kit.id ? 'Save changes' : 'Save watermark')}
         </button>
         <button type="button" id="cancelBrandKitBtn" class="btn-secondary">Cancel</button>
       </div>

@@ -2356,13 +2356,69 @@ function buildLogoOverlay(brandKit, outW, outH) {
     };
   }
 
-  // ── Text watermark via drawtext ────────────────────────────────
-  const text = ffmpegText(textRaw.slice(0, 50));
-  const fontSize = { small: 32, medium: 44, large: 60 }[brandKit.logoSize || 'medium'] ?? 44;
-  const alpha = opacity.toFixed(2);
+  // ── Smart text watermark via drawtext ─────────────────────────
+  // Auto-detect text type and apply the right style + position + size.
+  // Users just type their name — the system handles the rest.
+  const rawClean = textRaw.slice(0, 60);
+  const isHandle  = rawClean.startsWith('@');
+  const isDomain  = /\.(com|net|org|io|co|tv|me|app|ai|gg|xyz)(\b|\/|$)/i.test(rawClean);
+  const isAllCaps = rawClean === rawClean.toUpperCase() && /[A-Z]/.test(rawClean);
+  const charCount = rawClean.replace(/\s/g, '').length;
+
+  // Auto-style selection (overridden by user's explicit textStyle if set)
+  const explicitStyle = brandKit.textStyle || 'auto';
+  let autoStyle, autoPos;
+
+  if (isHandle) {
+    autoStyle = 'clean';      // @handles: clean white, thin outline
+    autoPos   = 'bottom-right';
+  } else if (isDomain) {
+    autoStyle = 'minimal';    // domains: subtle, small, unobtrusive
+    autoPos   = 'bottom-center';
+  } else if (isAllCaps && charCount <= 10) {
+    autoStyle = 'bold';       // ALL CAPS SHORT BRAND: heavy, prominent
+    autoPos   = 'top-right';
+  } else if (charCount <= 8) {
+    autoStyle = 'clean';      // short brand name: clean + prominent
+    autoPos   = 'top-right';
+  } else {
+    autoStyle = 'pill';       // longer name: text in dark pill for readability
+    autoPos   = 'top-right';
+  }
+
+  const textStyle = explicitStyle === 'auto' ? autoStyle : explicitStyle;
+  // Position: user-override wins, else use auto
+  const finalPos  = (brandKit.logoPosition && brandKit.logoPosition !== 'auto') ? pos : autoPos;
+
+  // Smart font size: shorter text = bigger font (more presence)
+  const sizeKey   = brandKit.logoSize || 'auto';
+  let fontSize;
+  if (sizeKey === 'auto') {
+    fontSize = charCount <= 6 ? 58 : charCount <= 12 ? 46 : charCount <= 20 ? 38 : 32;
+  } else {
+    fontSize = { small: 30, medium: 44, large: 62 }[sizeKey] ?? 44;
+  }
+
+  const alpha    = opacity.toFixed(2);
+  const minAlpha = Math.min(opacity * 0.75, 0.65).toFixed(2);
+
+  // Style-specific FFmpeg fragment
+  const styleFrags = {
+    clean:    `fontcolor=white@${alpha}:borderw=2:bordercolor=black@0.85:shadowcolor=black@0.35:shadowx=1:shadowy=1`,
+    bold:     `fontcolor=white@${alpha}:borderw=4:bordercolor=black@0.95:shadowcolor=black@0.5:shadowx=2:shadowy=2`,
+    minimal:  `fontcolor=white@${minAlpha}:borderw=1:bordercolor=black@0.55`,
+    pill:     `fontcolor=white@${alpha}:box=1:boxcolor=black@0.50:boxborderw=18`,
+    outlined: `fontcolor=black@${alpha}:borderw=3:bordercolor=white@${alpha}`,
+  };
+  const styleFrag = styleFrags[textStyle] || styleFrags.clean;
+
+  // Smart text: @handles stay as-is; short brand names auto-uppercase for impact
+  const displayText = isHandle || isDomain ? rawClean
+    : (charCount <= 10 && !rawClean.includes(' ') ? rawClean.toUpperCase() : rawClean);
+  const text = ffmpegText(displayText);
 
   let tx, ty;
-  switch (pos) {
+  switch (finalPos) {
     case 'top-center':    tx = '(W-tw)/2';   ty = MT;           break;
     case 'top-right':     tx = `W-tw-${MS}`; ty = MT;           break;
     case 'bottom-left':   tx = MS;            ty = `H-th-${MB}`; break;
@@ -2371,13 +2427,11 @@ function buildLogoOverlay(brandKit, outW, outH) {
     default:              tx = MS;            ty = MT;           break;
   }
 
-  const boxFrag = brandKit.logoBg
-    ? ':box=1:boxcolor=black@0.45:boxborderw=10'
-    : ':shadowcolor=black@0.75:shadowx=2:shadowy=2';
-
   return {
     type: 'drawtext',
-    filterFrag: `drawtext=text='${text}':font=Arial:fontsize=${fontSize}:fontcolor=white@${alpha}:borderw=2:bordercolor=black@0.7${boxFrag}:x=${tx}:y=${ty}`,
+    filterFrag: `drawtext=text='${text}':font=Arial:fontsize=${fontSize}:${styleFrag}:x=${tx}:y=${ty}`,
+    detectedStyle: textStyle,
+    detectedPos: finalPos,
   };
 }
 
@@ -4736,7 +4790,8 @@ async function handleApi(req, res, pathname) {
         id: `bk_${randomUUID().replace(/-/g,'')}`,
         userId: user.id,
         name: String(body.name || 'My Brand').slice(0, 80),
-        textWatermark: String(body.textWatermark || '').slice(0, 50),
+        textWatermark: String(body.textWatermark || '').slice(0, 60),
+        textStyle: ['auto','clean','bold','minimal','pill','outlined'].includes(body.textStyle) ? body.textStyle : 'auto',
         logoStoredName: null,
         logoUrl: null,
         logoPosition: body.logoPosition || 'top-left',
@@ -4762,8 +4817,8 @@ async function handleApi(req, res, pathname) {
       const user = requireUser(req, db);
       const kit = db.brandKits.find(bk => bk.id === body.id && bk.userId === user.id);
       if (!kit) throw Object.assign(new Error('Brand kit not found.'), { status: 404 });
-      const editable = ['name','textWatermark','logoPosition','logoSize','logoSizePercent','logoOpacity','logoBg',
-                        'watermarkEnabled','captionStyle','exportFormat','primaryColor','highlightColor'];
+      const editable = ['name','textWatermark','textStyle','logoPosition','logoSize','logoSizePercent','logoOpacity',
+                        'logoBg','watermarkEnabled','captionStyle','exportFormat','primaryColor','highlightColor'];
       for (const k of editable) { if (k in body) kit[k] = body[k]; }
       kit.updatedAt = new Date().toISOString();
       saveDb(db);
