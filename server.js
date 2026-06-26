@@ -1503,56 +1503,56 @@ const ASS_PRESETS = {
     primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&HCC000000&',
     outlineW:2, shadow:3, borderStyle:4, alignment:2, marginV:230, marginLR:90,
     highlight:'&H0000FFFF&', context:'&H99FFFFFF&',
-    phraseSize:6, uppercase:false, spacing:0, fad:'40,30',
+    phraseSize:4, uppercase:false, spacing:0, fad:'40,30',
   },
   minimal: {
     name:'Minimal', font:'Arial', size:58, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H00FFFFFF&', outline:'&H00000000&', back:'&H00000000&',
     outlineW:3, shadow:3, borderStyle:1, alignment:2, marginV:210, marginLR:110,
     highlight:'&H00FFFFFF&', context:'&H88FFFFFF&',
-    phraseSize:6, uppercase:false, spacing:0, fad:'35,25',
+    phraseSize:4, uppercase:false, spacing:0, fad:'35,25',
   },
   luxury: {
     name:'Luxury', font:'Georgia', size:62, bold:0, italic:0,
     primary:'&H00E8E8E8&', secondary:'&H0000D7FF&', outline:'&H00000000&', back:'&H00000000&',
     outlineW:2, shadow:3, borderStyle:1, alignment:2, marginV:240, marginLR:95,
     highlight:'&H0000D7FF&', context:'&H80E8E8E8&',
-    phraseSize:5, uppercase:false, spacing:2, fad:'70,50',
+    phraseSize:4, uppercase:false, spacing:2, fad:'70,50',
   },
   finance: {
     name:'Finance', font:'Arial', size:64, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H00FF7800&', outline:'&H00050505&', back:'&H99000000&',
     outlineW:3, shadow:3, borderStyle:1, alignment:2, marginV:230, marginLR:90,
     highlight:'&H00FF7800&', context:'&H88FFFFFF&',
-    phraseSize:5, uppercase:false, spacing:0, fad:'45,30',
+    phraseSize:4, uppercase:false, spacing:0, fad:'45,30',
   },
   tiktok: {
     name:'TikTok', font:'Arial Black', size:86, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&H00000000&',
     outlineW:4, shadow:4, borderStyle:1, alignment:2, marginV:260, marginLR:65,
     highlight:'&H0000FFFF&', context:'&H80FFFFFF&',
-    phraseSize:4, uppercase:true, spacing:1, fad:'45,30',
+    phraseSize:3, uppercase:true, spacing:1, fad:'45,30',
   },
   instagram: {
     name:'Instagram', font:'Arial', size:70, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H00FF7800&', outline:'&H00000000&', back:'&HCC000000&',
     outlineW:2, shadow:3, borderStyle:4, alignment:2, marginV:245, marginLR:75,
     highlight:'&H00FF7800&', context:'&H88FFFFFF&',
-    phraseSize:5, uppercase:false, spacing:0, fad:'50,35',
+    phraseSize:4, uppercase:false, spacing:0, fad:'50,35',
   },
   bold: {
     name:'Bold', font:'Arial Black', size:84, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&H99000000&',
     outlineW:4, shadow:4, borderStyle:1, alignment:2, marginV:250, marginLR:75,
     highlight:'&H0000FFFF&', context:'&H80FFFFFF&',
-    phraseSize:4, uppercase:true, spacing:0, fad:'55,35',
+    phraseSize:3, uppercase:true, spacing:0, fad:'55,35',
   },
   karaoke: {
     name:'Karaoke', font:'Arial Black', size:78, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H0000FFFF&', outline:'&H00000000&', back:'&HDD000000&',
     outlineW:2, shadow:2, borderStyle:4, alignment:2, marginV:250, marginLR:80,
     highlight:'&H0000FFFF&', context:'&HBBFFFFFF&',
-    phraseSize:5, uppercase:false, spacing:0, fad:'40,25',
+    phraseSize:4, uppercase:false, spacing:0, fad:'40,25',
   },
   // ── 2026 Elite Viral Styles ──────────────────────────────────────────
   viral: {
@@ -1581,7 +1581,7 @@ const ASS_PRESETS = {
     primary:'&H00F5F0E0&', secondary:'&H00D4AF37&', outline:'&H00000000&', back:'&HCC000000&',
     outlineW:2, shadow:2, borderStyle:4, alignment:8, marginV:200, marginLR:100,
     highlight:'&H00D4AF37&', context:'&H99F5F0E0&',
-    phraseSize:7, uppercase:false, spacing:0, fad:'80,60',
+    phraseSize:4, uppercase:false, spacing:0, fad:'80,60',
   },
   hype: {
     name:'Hype', font:'Impact', size:112, bold:0, italic:0,
@@ -1595,14 +1595,14 @@ const ASS_PRESETS = {
     primary:'&H00FFFFFF&', secondary:'&H00FF6EB4&', outline:'&H00000000&', back:'&HAA000000&',
     outlineW:3, shadow:3, borderStyle:4, alignment:2, marginV:248, marginLR:80,
     highlight:'&H00FF6EB4&', context:'&H90FFFFFF&',
-    phraseSize:5, uppercase:false, spacing:0, fad:'60,40',
+    phraseSize:4, uppercase:false, spacing:0, fad:'60,40',
   },
   faceless: {
     name:'Faceless', font:'Arial', size:64, bold:-1, italic:0,
     primary:'&H00FFFFFF&', secondary:'&H0099AAFF&', outline:'&H00000000&', back:'&HBB000000&',
     outlineW:2, shadow:3, borderStyle:4, alignment:2, marginV:235, marginLR:95,
     highlight:'&H0099AAFF&', context:'&H88FFFFFF&',
-    phraseSize:6, uppercase:false, spacing:0, fad:'50,40',
+    phraseSize:4, uppercase:false, spacing:0, fad:'50,40',
   },
   kids: {
     name:'Kids', font:'Arial Rounded MT Bold', size:90, bold:-1, italic:0,
@@ -1626,22 +1626,24 @@ function assEscape(t) { return String(t).replace(/[{}]/g,'').replace(/\n/g,'\\N'
 
 function buildASSFile(words, clipStart, clipEnd, presetName, W=1080, H=1920, faceCyAvg=null) {
   const p   = ASS_PRESETS[presetName] || ASS_PRESETS.bold;
-  const SZ  = Math.max(2, Math.min(p.phraseSize || 5, 5));  // cap at 5 words (was 6)
+  // Hard cap: 4 words max per phrase for professional creator look
+  const SZ  = Math.max(2, Math.min(p.phraseSize || 3, 4));
   const dur = clipEnd - clipStart;
 
-  // Face-aware MarginV: if speaker face is in bottom 45% of frame, push captions higher
-  // faceCyAvg is 0=top, 1=bottom (normalized face center Y in source frame)
-  const faceInBottom = faceCyAvg !== null && faceCyAvg > 0.55;
-  const dynamicMarginV = faceInBottom
-    ? Math.round(p.marginV * 1.6)   // much higher up
-    : p.marginV;                      // standard position
+  // Graduated face-aware margin: push captions up proportionally to face Y position
+  let dynamicMarginV = p.marginV;
+  if (faceCyAvg !== null) {
+    if      (faceCyAvg > 0.65) dynamicMarginV = Math.round(p.marginV * 1.85);
+    else if (faceCyAvg > 0.50) dynamicMarginV = Math.round(p.marginV * 1.35);
+  }
 
   const cw = words
     .filter(w => w.end > clipStart && w.start < clipEnd)
     .map(w => ({
-      word: assEscape(p.uppercase ? w.word.toUpperCase() : w.word),
-      rs:   Math.max(0, w.start - clipStart),
-      re:   Math.min(dur, w.end - clipStart),
+      word:    assEscape(p.uppercase ? w.word.toUpperCase() : w.word),
+      rawWord: (w.word || '').trim(),
+      rs:      Math.max(0, w.start - clipStart),
+      re:      Math.min(dur, w.end - clipStart),
     }))
     .filter(w => w.re > w.rs + 0.01 && w.word.trim());
 
@@ -1683,88 +1685,116 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   //   • Hard cap on per-word highlight: prevents stuck captions from bad Whisper ts
   //   • 60ms gap enforced between phrases: prevents bleed-through
 
-  const MAX_WORD_LINGER    = 0.12;   // tighter linger = snappier sync
-  const MAX_WORD_HIGHLIGHT = 0.55;   // cap highlight so it never feels stuck
-  const INTER_PHRASE_GAP   = 0.04;   // 40ms between phrases (was 60ms — tighter)
-  const GAP_BREAK          = 0.35;   // 350ms silence → new phrase (was 400ms)
+  // Timing constants — professional creator standard
+  const LINGER       = 0.04;   // 40ms hold after last spoken word then hard cut
+  const MAX_WORD_DUR = 0.42;   // cap any single-word highlight (prevents stuck captions)
+  const PHRASE_GAP   = 0.03;   // 30ms gap enforced between adjacent phrases
+  const PAUSE_BREAK  = 0.22;   // 220ms silence forces a phrase boundary
+  const SENT_END     = /[.!?,;:]$/;
 
-  // ── Speed-aware adaptive phrase grouping ─────────────────────
-  // Sentence-ending words that should trigger a phrase break
-  const SENTENCE_END = /[.!?,;]$/;
+  // ── Emotional / high-impact word detection ────────────────────
+  const EMPH_WORDS = new Set([
+    'never','always','every','nobody','nothing','everything','everyone','anyone',
+    'insane','crazy','unbelievable','impossible','shocking','amazing','incredible',
+    'terrible','horrible','awful','perfect','brilliant','genius','stupid','idiot',
+    'destroyed','failed','won','lost','fired','arrested','died','killed','exposed',
+    'secret','truth','lie','revealed','actually','honestly','literally','seriously',
+    'most','best','worst','biggest','smallest','fastest','richest','poorest','only',
+    'stop','listen','watch','look','wait','remember','imagine','think','know',
+    'million','billion','trillion','thousand','hundred','free','zero','first','last',
+    'never','hate','love','fear','money','rich','broke','poor','win','lose',
+  ]);
+  const NUMBER_RE = /^[\$£€]?[\d,]+([kKmMbBtT%])?$|^\d+[\d,]*[%]$/;
 
+  function emphType(rawWord) {
+    const w = rawWord.replace(/[^a-zA-Z0-9$£€%]/g, '').toLowerCase();
+    if (EMPH_WORDS.has(w)) return 'emotion';
+    if (NUMBER_RE.test(rawWord.trim())) return 'number';
+    return null;
+  }
+
+  // ── Smart phrase grouping ─────────────────────────────────────
   const phrases = [];
   let i = 0;
   while (i < cw.length) {
-    const lookEnd = Math.min(i + SZ + 2, cw.length);
-    const window  = cw.slice(i, lookEnd);
-    const wDur    = (window[window.length - 1].re - window[0].rs) || 1;
-    const wps     = window.length / wDur;
+    const win  = cw.slice(i, Math.min(i + SZ + 2, cw.length));
+    const wDur = Math.max(0.1, win[win.length - 1].re - win[0].rs);
+    const wps  = win.length / wDur;
 
-    // Adaptive word count per phrase based on speech rate
+    // Adaptive target: faster speech → shorter phrases (more dynamic)
     let target = SZ;
-    if (wps > 4.2)      target = Math.max(2, SZ - 2);  // very fast: 2-3 words
-    else if (wps > 3.2) target = Math.max(2, SZ - 1);  // fast: 3-4 words
-    else if (wps < 1.0) target = Math.min(SZ + 1, 6);  // slow: up to 6 words
-    // (was allowing 8 — reduced to keep readability at any pace)
+    if      (wps > 4.5) target = 2;
+    else if (wps > 3.5) target = Math.max(2, SZ - 1);
+    else if (wps < 1.0) target = Math.min(SZ + 1, 4);
 
     const phrase = [];
     for (let j = i; j < Math.min(i + target, cw.length); j++) {
-      if (j > i && (cw[j].rs - cw[j - 1].re) > GAP_BREAK) break;
+      if (j > i && (cw[j].rs - cw[j - 1].re) > PAUSE_BREAK) break;
       phrase.push(cw[j]);
-      // Natural sentence break: stop after punctuation to match how people read
-      if (j > i && SENTENCE_END.test(cw[j].word.replace(/\{[^}]*\}/g, ''))) break;
+      if (j > i && SENT_END.test(cw[j].rawWord)) break;
     }
+    if (!phrase.length) { i++; continue; }
     phrases.push(phrase);
     i += phrase.length;
   }
 
-  // Enforce inter-phrase gap: shorten current phrase end if it bleeds into the next
+  // Enforce strict inter-phrase gap
   for (let pi = 0; pi < phrases.length - 1; pi++) {
-    const cur  = phrases[pi];
-    const nxt  = phrases[pi + 1];
-    const curLastWord = cur[cur.length - 1];
-    const nxtFirstWord = nxt[0];
-    const maxEnd = nxtFirstWord.rs - INTER_PHRASE_GAP;
-    if (curLastWord.re > maxEnd) {
-      curLastWord.re = Math.max(curLastWord.rs + 0.04, maxEnd);
+    const lastW    = phrases[pi][phrases[pi].length - 1];
+    const nextStart = phrases[pi + 1][0].rs;
+    if (lastW.re > nextStart - PHRASE_GAP) {
+      lastW.re = Math.max(lastW.rs + 0.03, nextStart - PHRASE_GAP);
     }
   }
+
+  // ── Build ASS dialogue events ─────────────────────────────────
+  // Each event = one word's highlight window showing the full phrase.
+  // Phrase lifetime: first word start → last word end + LINGER (then instant cut).
+  // Instant cut (fad out = 0) = tight sync, no caption overhang.
+  const emphSzBig  = Math.round(p.size * 1.14);  // emphasis current word: 14% bigger
+  const emphSzCtx  = Math.round(p.size * 0.88);  // emphasis non-current: 12% smaller
 
   const events = [];
   for (let pi = 0; pi < phrases.length; pi++) {
     const phrase  = phrases[pi];
     const phraseS = phrase[0].rs;
-    // Cap phrase end: last word end + linger, but never past next phrase start
     const lastW   = phrase[phrase.length - 1];
     const phraseE = Math.min(
-      lastW.re + MAX_WORD_LINGER,
-      pi < phrases.length - 1 ? phrases[pi + 1][0].rs - INTER_PHRASE_GAP : lastW.re + MAX_WORD_LINGER
+      lastW.re + LINGER,
+      pi < phrases.length - 1 ? phrases[pi + 1][0].rs - PHRASE_GAP : lastW.re + LINGER
     );
-    if (phraseE <= phraseS + 0.02) continue;
+    if (phraseE <= phraseS + 0.01) continue;
 
     for (let wi = 0; wi < phrase.length; wi++) {
       const w    = phrase[wi];
       const nxtW = phrase[wi + 1];
       if (w.rs < 0 || w.re <= w.rs) continue;
 
-      const lineStart = Math.max(phraseS, w.rs);
-      // End: next word's start (seamless) or capped phrase end for last word
-      let lineEnd = nxtW
+      const evtS = Math.max(phraseS, w.rs);
+      let   evtE = nxtW
         ? Math.min(phraseE, Math.max(w.re, nxtW.rs))
         : phraseE;
-      // Hard cap: no single word shown longer than MAX_WORD_HIGHLIGHT
-      lineEnd = Math.min(lineEnd, lineStart + MAX_WORD_HIGHLIGHT);
+      evtE = Math.min(evtE, evtS + MAX_WORD_DUR);
+      if (evtE <= evtS + 0.01) continue;
 
-      if (lineEnd <= lineStart + 0.01) continue;
+      const parts = phrase.map((pw, j) => {
+        const et = emphType(pw.rawWord);
+        if (j === wi) {
+          // Current highlighted word — pop with emphasis if high-impact
+          return et
+            ? `{\\c${p.highlight}\\b1\\fs${emphSzBig}}${pw.word}{\\r}`
+            : `{\\c${p.highlight}\\b1}${pw.word}{\\r}`;
+        }
+        // Non-current words in the same phrase
+        return et
+          ? `{\\c${p.highlight}\\b1\\fs${emphSzCtx}}${pw.word}{\\r}`  // emph: stay colored
+          : `{\\c${p.context}\\b0}${pw.word}`;                          // normal: dim
+      });
 
-      const parts = phrase.map((pw, j) =>
-        j === wi
-          ? `{\\c${p.highlight}\\b1}${pw.word}{\\r}`
-          : `{\\c${p.context}\\b0}${pw.word}`
-      );
+      // fad(80,0): clean 80ms fade-in, ZERO fade-out = instant hard cut = no caption overhang
       events.push(
-        `Dialogue: 0,${assTime(lineStart)},${assTime(lineEnd)},${p.name},,0,0,0,,` +
-        `{\\an${p.alignment}\\fad(${p.fad})}${parts.join(' ')}`
+        `Dialogue: 0,${assTime(evtS)},${assTime(evtE)},${p.name},,0,0,0,,` +
+        `{\\an${p.alignment}\\fad(80,0)}${parts.join(' ')}`
       );
     }
   }
@@ -2425,11 +2455,11 @@ function buildLogoOverlay(brandKit, outW, outH, faceData = null) {
 
   // Style-specific FFmpeg fragment
   const styleFrags = {
-    clean:    `fontcolor=white@${alpha}:borderw=2:bordercolor=black@0.85:shadowcolor=black@0.35:shadowx=1:shadowy=1`,
-    bold:     `fontcolor=white@${alpha}:borderw=4:bordercolor=black@0.95:shadowcolor=black@0.5:shadowx=2:shadowy=2`,
-    minimal:  `fontcolor=white@${minAlpha}:borderw=1:bordercolor=black@0.55`,
-    pill:     `fontcolor=white@${alpha}:box=1:boxcolor=black@0.50:boxborderw=18`,
-    outlined: `fontcolor=black@${alpha}:borderw=3:bordercolor=white@${alpha}`,
+    clean:    `fontcolor=white@${alpha}:font='Arial Black':borderw=2.5:bordercolor=black@0.90:shadowcolor=black@0.50:shadowx=2:shadowy=2`,
+    bold:     `fontcolor=white@${alpha}:font=Impact:borderw=4:bordercolor=black@0.95:shadowcolor=black@0.65:shadowx=3:shadowy=3`,
+    minimal:  `fontcolor=white@${minAlpha}:font=Arial:borderw=1.5:bordercolor=black@0.60:shadowcolor=black@0.25:shadowx=1:shadowy=1`,
+    pill:     `fontcolor=white@${alpha}:font='Arial Black':box=1:boxcolor=black@0.55:boxborderw=28:shadowcolor=black@0.30:shadowx=0:shadowy=3`,
+    outlined: `fontcolor=white@${alpha}:font='Arial Black':borderw=3.5:bordercolor=black@0.95:shadowcolor=black@0.55:shadowx=2:shadowy=2`,
   };
   const styleFrag = styleFrags[textStyle] || styleFrags.clean;
 
@@ -2448,9 +2478,12 @@ function buildLogoOverlay(brandKit, outW, outH, faceData = null) {
     default:              tx = MS;            ty = MT;           break;
   }
 
+  // Scale font size to output resolution (base = 1080px wide)
+  const scaledFontSize = Math.round(fontSize * (outW / 1080));
+
   return {
     type: 'drawtext',
-    filterFrag: `drawtext=text='${text}':font=Arial:fontsize=${fontSize}:${styleFrag}:x=${tx}:y=${ty}`,
+    filterFrag: `drawtext=text='${text}':fontsize=${scaledFontSize}:${styleFrag}:x=${tx}:y=${ty}:expansion=none`,
     detectedStyle: textStyle,
     detectedPos: finalPos,
   };
