@@ -1413,6 +1413,7 @@ function scoreMoments(segments, durationSeconds) {
 
       const text = group.map(s => s.text).join(' ').toLowerCase();
       const firstLine = group[0].text.trim();
+      const lastLine  = group[group.length - 1].text.trim();
       const wordCount = text.split(/\s+/).length;
 
       // Scoring dimensions
@@ -1423,10 +1424,14 @@ function scoreMoments(segments, durationSeconds) {
       const punctScore = (text.match(/[?!]/g) || []).length * 5;
       const densityScore = Math.min(25, Math.round(wordCount / Math.max(1, dur) * 10));
       const openingHookScore = QUESTION_STARTERS.test(firstLine) || firstLine.length < 60 ? 10 : 0;
-      // Prefer 60-90s clips (minimum is 60s per user settings)
+      // Prefer 60-90s clips (user's minimum is 60s)
       const durationBonus = targetDur >= 60 && targetDur <= 90 ? 12 : 0;
+      // Bonus: clip starts at a clean sentence start (capitalized / after punctuation)
+      const cleanStartBonus = /^[A-Z"'"'([]/.test(firstLine) ? 8 : 0;
+      // Bonus: clip ends on punctuation (complete thought)
+      const cleanEndBonus = /[.!?]$/.test(lastLine.replace(/['"'"')\]]+$/, '')) ? 8 : 0;
 
-      const score = Math.min(99, 30 + hookScore + emotionScore + valueScore + questionScore + punctScore + densityScore + openingHookScore + durationBonus);
+      const score = Math.min(99, 30 + hookScore + emotionScore + valueScore + questionScore + punctScore + densityScore + openingHookScore + durationBonus + cleanStartBonus + cleanEndBonus);
 
       windows.push({ start, end, score, text: group.map(s => s.text).join(' '), targetDur });
     }
@@ -1619,10 +1624,17 @@ function assTime(s) {
 
 function assEscape(t) { return String(t).replace(/[{}]/g,'').replace(/\n/g,'\\N'); }
 
-function buildASSFile(words, clipStart, clipEnd, presetName, W=1080, H=1920) {
+function buildASSFile(words, clipStart, clipEnd, presetName, W=1080, H=1920, faceCyAvg=null) {
   const p   = ASS_PRESETS[presetName] || ASS_PRESETS.bold;
-  const SZ  = Math.max(2, Math.min(p.phraseSize || 5, 6));
+  const SZ  = Math.max(2, Math.min(p.phraseSize || 5, 5));  // cap at 5 words (was 6)
   const dur = clipEnd - clipStart;
+
+  // Face-aware MarginV: if speaker face is in bottom 45% of frame, push captions higher
+  // faceCyAvg is 0=top, 1=bottom (normalized face center Y in source frame)
+  const faceInBottom = faceCyAvg !== null && faceCyAvg > 0.55;
+  const dynamicMarginV = faceInBottom
+    ? Math.round(p.marginV * 1.6)   // much higher up
+    : p.marginV;                      // standard position
 
   const cw = words
     .filter(w => w.end > clipStart && w.start < clipEnd)
@@ -1655,7 +1667,7 @@ WrapStyle: 1
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ${p.name},${p.font},${p.size},${p.primary},${p.secondary},${p.outline},${p.back},${p.bold},${p.italic},0,0,100,100,${p.spacing},0,${p.borderStyle},${p.outlineW},${p.shadow},${p.alignment},${p.marginLR},${p.marginLR},${p.marginV},1
+Style: ${p.name},${p.font},${p.size},${p.primary},${p.secondary},${p.outline},${p.back},${p.bold},${p.italic},0,0,100,100,${p.spacing},0,${p.borderStyle},${p.outlineW},${p.shadow},${p.alignment},${p.marginLR},${p.marginLR},${dynamicMarginV},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -1671,33 +1683,36 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   //   • Hard cap on per-word highlight: prevents stuck captions from bad Whisper ts
   //   • 60ms gap enforced between phrases: prevents bleed-through
 
-  const MAX_WORD_LINGER    = 0.15;
-  const MAX_WORD_HIGHLIGHT = 0.65;
-  const INTER_PHRASE_GAP   = 0.06;
-  const GAP_BREAK          = 0.40; // pause > 400ms → always start new phrase
+  const MAX_WORD_LINGER    = 0.12;   // tighter linger = snappier sync
+  const MAX_WORD_HIGHLIGHT = 0.55;   // cap highlight so it never feels stuck
+  const INTER_PHRASE_GAP   = 0.04;   // 40ms between phrases (was 60ms — tighter)
+  const GAP_BREAK          = 0.35;   // 350ms silence → new phrase (was 400ms)
 
   // ── Speed-aware adaptive phrase grouping ─────────────────────
+  // Sentence-ending words that should trigger a phrase break
+  const SENTENCE_END = /[.!?,;]$/;
+
   const phrases = [];
   let i = 0;
   while (i < cw.length) {
-    // Measure local speech rate using a lookahead window
     const lookEnd = Math.min(i + SZ + 2, cw.length);
     const window  = cw.slice(i, lookEnd);
     const wDur    = (window[window.length - 1].re - window[0].rs) || 1;
-    const wps     = window.length / wDur; // words per second
+    const wps     = window.length / wDur;
 
-    // Adaptive target: fewer words when speaker is fast (hard to read),
-    // more words when speaker is slow (screen time to read them)
+    // Adaptive word count per phrase based on speech rate
     let target = SZ;
-    if (wps > 3.8) target = Math.max(2, SZ - 2);
-    else if (wps > 2.8) target = Math.max(2, SZ - 1);
-    else if (wps < 1.2) target = Math.min(SZ + 2, 8);
+    if (wps > 4.2)      target = Math.max(2, SZ - 2);  // very fast: 2-3 words
+    else if (wps > 3.2) target = Math.max(2, SZ - 1);  // fast: 3-4 words
+    else if (wps < 1.0) target = Math.min(SZ + 1, 6);  // slow: up to 6 words
+    // (was allowing 8 — reduced to keep readability at any pace)
 
     const phrase = [];
     for (let j = i; j < Math.min(i + target, cw.length); j++) {
-      // Sentence break: long pause → close this phrase, start fresh next iteration
       if (j > i && (cw[j].rs - cw[j - 1].re) > GAP_BREAK) break;
       phrase.push(cw[j]);
+      // Natural sentence break: stop after punctuation to match how people read
+      if (j > i && SENTENCE_END.test(cw[j].word.replace(/\{[^}]*\}/g, ''))) break;
     }
     phrases.push(phrase);
     i += phrase.length;
@@ -2117,9 +2132,9 @@ function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920,
   } else if (framingMode === 'close') {
     cropFrac = tightFrac * 1.25;           // slight breathing room, usually no bars
   } else if (framingMode === 'medium') {
-    cropFrac = sceneType === 'group' ? 0.65 : sceneType === 'interview' ? 0.62 : 0.52;
+    cropFrac = sceneType === 'group' ? 0.72 : sceneType === 'interview' ? 0.70 : 0.62;
   } else if (framingMode === 'wide') {
-    cropFrac = sceneType === 'group' ? 0.88 : sceneType === 'interview' ? 0.80 : 0.70;
+    cropFrac = sceneType === 'group' ? 0.90 : sceneType === 'interview' ? 0.84 : 0.74;
   } else if (framingMode === 'original') {
     cropFrac = 0.85;
   } else {
@@ -2127,16 +2142,16 @@ function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920,
     if (suggestedFrac > 0.01) {
       cropFrac = suggestedFrac;
     } else if (!hasFaces) {
-      cropFrac = 0.60;                     // no faces → show context (was 0.42)
+      cropFrac = 0.68;                     // no faces → wider context shot
     } else {
       switch (sceneType) {
-        case 'group':          cropFrac = 0.88; break;
-        case 'interview':      cropFrac = faceCount >= 2 ? 0.78 : 0.62; break;
-        case 'podcast':        cropFrac = faceCount >= 2 ? 0.68 : 0.58; break;
-        case 'reaction':       cropFrac = 0.62; break;
-        case 'wide_shot':      cropFrac = 0.75; break;
-        case 'close_up':       cropFrac = 0.48; break;
-        default:               cropFrac = rangeCX > 0.20 ? 0.60 : 0.58;
+        case 'group':          cropFrac = 0.90; break;
+        case 'interview':      cropFrac = faceCount >= 2 ? 0.82 : 0.70; break;
+        case 'podcast':        cropFrac = faceCount >= 2 ? 0.75 : 0.66; break;
+        case 'reaction':       cropFrac = 0.70; break;
+        case 'wide_shot':      cropFrac = 0.80; break;
+        case 'close_up':       cropFrac = 0.56; break;
+        default:               cropFrac = rangeCX > 0.20 ? 0.68 : 0.66;
       }
     }
   }
@@ -2447,7 +2462,11 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   const totalOutDur = useEDL
     ? edlSegs.reduce((s, seg) => s + seg.end - seg.start, 0)
     : moment.end - effectiveStart;
-  const assContent = buildASSFile(assWords, 0, totalOutDur, captionPreset, RW, RH);
+  // Compute average face Y to position captions above faces in bottom-framed shots
+  const kfCyVals = (faceData?.keyframes || []).filter(kf => kf.faceCount > 0).map(kf => kf.cy);
+  const faceCyAvg = kfCyVals.length ? kfCyVals.reduce((s, v) => s + v, 0) / kfCyVals.length : null;
+
+  const assContent = buildASSFile(assWords, 0, totalOutDur, captionPreset, RW, RH, faceCyAvg);
   let hasASS = false;
   try { writeFileSync(assPath, assContent, 'utf8'); hasASS = true; } catch {}
 
@@ -3363,12 +3382,14 @@ Total duration: ${video.durationSeconds || 0}s
 Target clip length: ${desiredLength}s (min: 60s, max: 600s)
 
 SELECTION RULES:
-1. Opening line MUST hook within 3 seconds — pattern interrupt, shocking fact, strong opinion, or story setup
+1. Opening line MUST hook within 3 seconds — pattern interrupt, shocking fact, strong opinion, or story setup. The hook is SACRED — never cut it short.
 2. Prioritize moments with: jaw-dropping reveals, emotional peaks, laugh moments, heated arguments, shocking stats, vulnerable confessions, contrarian takes, "you won't believe this" structures
-3. NEVER start mid-sentence — always at a clean sentence boundary
-4. NEVER cut before the punchline, resolution, or payoff
-5. Avoid filler, transitions ("so anyway..."), or meandering sections
-6. Pick diverse moment types if possible — don't select 3 identical clips
+3. NEVER start mid-sentence — always at a clean sentence boundary where the speaker begins a complete thought
+4. NEVER cut before the punchline, resolution, or payoff — the end must feel COMPLETE and satisfying
+5. End on a natural pause, sentence end, or emotional beat — NEVER cut someone off mid-word or mid-idea
+6. Avoid filler, transitions ("so anyway..."), or meandering sections
+7. The clip must feel like a COMPLETE story arc: setup → tension/content → payoff
+8. Pick diverse moment types if possible — don't select clips from the same section of the video
 
 RETENTION PREDICTION:
 - retentionScore (1-10): Would viewers watch 80%+ of this clip to the end?

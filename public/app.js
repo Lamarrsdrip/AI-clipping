@@ -1481,7 +1481,7 @@ const FL_STYLES = [
 ];
 const FL_TONES = ['mysterious','energetic','calm','authoritative','conversational','dramatic','inspirational','urgent'];
 const FL_PLATFORMS = ['TikTok','YouTube Shorts','Instagram Reels'];
-const FL_DURATIONS = [{v:15,l:'15s'},{v:30,l:'30s'},{v:45,l:'45s'},{v:60,l:'60s'},{v:90,l:'90s'}];
+const FL_DURATIONS = [{v:60,l:'1 min'},{v:90,l:'90 s'},{v:120,l:'2 min'},{v:180,l:'3 min'}];
 const FL_LANGUAGES = ['English','Spanish','French','Portuguese','German','Arabic','Hindi','Japanese'];
 const FL_AUDIENCES = [
   {v:'general',l:'General'},{v:'18-24',l:'18-24 Gen Z'},{v:'25-35',l:'25-35 Millennials'},
@@ -1894,9 +1894,9 @@ function renderFacelessPanel(f) {
         <div class="option-row">
           <label>Duration</label>
           <select id="facelessDur">
-            <option value="30">30 seconds</option>
-            <option value="45" selected>45 seconds</option>
-            <option value="60">60 seconds</option>
+            <option value="60" selected>1 minute</option>
+            <option value="90">90 seconds</option>
+            <option value="120">2 minutes</option>
           </select>
         </div>
         <button type="submit">Generate script</button>

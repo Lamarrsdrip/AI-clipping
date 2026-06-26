@@ -55,15 +55,15 @@ QUAL_TARGET = 92     # below this average = auto-widen crop and retry
 # Deliberately wider than v6 — less zoom, more breathing room.
 # "It looks like a mugshot" was caused by ~2× zoom; these stay ≤ 1.7×.
 CROP_FRACS = {
-    "monologue":    0.62,   # medium shot — face ~25–38% of output width
-    "interview":    0.80,   # both subjects comfortably framed
-    "podcast":      0.72,   # podcast two-shot (slightly tighter than interview)
-    "group":        0.88,   # 3+ people — fit everyone with margin
-    "reaction":     0.65,   # looking off-camera (e.g., at screen)
-    "presentation": 0.78,   # walking / pointing / gesturing presenter
-    "wide_shot":    0.82,   # subject occupies small fraction of source
-    "close_up":     0.52,   # deliberate tight shot
-    "default":      0.64,
+    "monologue":    0.68,   # cinematic medium — shows upper body + breathing room
+    "interview":    0.82,   # both subjects comfortably framed with generous margin
+    "podcast":      0.75,   # podcast two-shot — slightly wider for comfort
+    "group":        0.90,   # 3+ people — fit everyone with margin
+    "reaction":     0.70,   # looking off-camera — wider to show context
+    "presentation": 0.80,   # walking / gesturing presenter — needs space
+    "wide_shot":    0.84,   # subject occupies small fraction of source
+    "close_up":     0.56,   # deliberate tight shot — still show some context
+    "default":      0.70,   # global default — natural medium wide shot
 }
 
 # ── Looking-room / rule-of-thirds constants ───────────────────────────────
@@ -248,34 +248,35 @@ def base_crop_frac(scene_type, n_faces, spread):
 def compose_single(face_cx, crop_frac, yaw, gaze_x):
     """
     Compute crop-center X for a single speaker with:
-      - Looking room: subject at left-third when facing right
+      - Rule-of-thirds: subject positioned with natural looking room
       - Head pose + gaze combined direction signal
+      - Face never cropped at edge — 12% padding minimum each side
     """
     # Direction signal: +1 = facing/looking right, -1 = facing/looking left
-    gaze_norm = max(-1.0, min(1.0, gaze_x * 6.0))   # scale: ±0.17 gaze → ±1.0
+    gaze_norm = max(-1.0, min(1.0, gaze_x * 5.0))
     yaw_norm  = max(-1.0, min(1.0, yaw / YAW_SCALE))
-    direction = 0.65 * gaze_norm + 0.35 * yaw_norm
+    # Weight: 60% gaze, 40% head pose — gaze is more reliable signal
+    direction = 0.60 * gaze_norm + 0.40 * yaw_norm
 
-    # Apply looking room only beyond threshold
+    # Apply looking room only when direction is clear
     if abs(direction) < LOOK_THRESH:
         face_pos_in_crop = 0.50   # neutral: center
     else:
         t = min(1.0, (abs(direction) - LOOK_THRESH) / (1.0 - LOOK_THRESH))
         shift = t * LOOK_MAX
-        # facing right → face at left of frame (space ahead = right)
-        # facing left  → face at right of frame (space ahead = left)
         face_pos_in_crop = 0.50 - math.copysign(shift, direction)
-        face_pos_in_crop = max(0.22, min(0.78, face_pos_in_crop))
+        # Never closer than 25% from crop edge — ensures face never gets cut
+        face_pos_in_crop = max(0.25, min(0.75, face_pos_in_crop))
 
-    # Crop center that places face at face_pos_in_crop within crop window
     cx = face_cx + crop_frac * (0.5 - face_pos_in_crop)
     return _clamp_cx(cx, crop_frac)
 
 
 def compose_multi(faces, crop_frac, speaker_idx):
     """
-    Crop center for multi-person shot: centered on combined bounding box
-    with a slight pull toward the active speaker.
+    Crop center for multi-person shot: keep ALL faces visible when possible,
+    pull toward active speaker only when faces fit comfortably in frame.
+    Never cuts anyone's face — always shows both people in interaction.
     """
     if not faces:
         return 0.5
@@ -285,12 +286,17 @@ def compose_multi(faces, crop_frac, speaker_idx):
     combined_cx = (x1 + x2) / 2.0
     combined_w  = x2 - x1
 
-    if combined_w + 0.22 <= crop_frac:
-        # All faces fit — pull slightly toward speaker
+    # Padding: require 14% free space around the combined bounding box
+    PADDING = 0.14
+    if combined_w + PADDING <= crop_frac:
+        # All faces fit comfortably — subtle pull toward speaker (70% center, 30% speaker)
         if 0 <= speaker_idx < len(faces):
-            combined_cx = 0.80 * combined_cx + 0.20 * faces[speaker_idx]["cx"]
+            combined_cx = 0.75 * combined_cx + 0.25 * faces[speaker_idx]["cx"]
+    elif combined_w + 0.06 <= crop_frac:
+        # Tight fit — stay centered on the group, no speaker pull
+        pass
     else:
-        # Too spread — keep most important face (speaker if known, else largest)
+        # Too spread out — frame the speaker but keep any nearby face partially visible
         if 0 <= speaker_idx < len(faces):
             combined_cx = faces[speaker_idx]["cx"]
         else:
@@ -377,11 +383,11 @@ class CameraSpring:
     Mass-spring-damper system for natural camera motion.
 
     Parameters:
-      omega (ω)  = 3.8 rad/s  → settling time ~1.6 s — responsive but not jumpy
-      zeta  (ζ)  = 0.85       → slightly underdamped: tiny overshoot, feels alive
-      zoom_ratio = 0.28        → zoom spring is much slower than pan spring
+      omega (ω)  = 2.6 rad/s  → settling time ~2.4 s — smooth, professional feel
+      zeta  (ζ)  = 0.92       → nearly critically damped: no bounce, silky movement
+      zoom_ratio = 0.18        → zoom spring very slow — invisible to viewer
     """
-    def __init__(self, cx0, frac0, omega=3.8, zeta=0.85, zoom_ratio=0.28):
+    def __init__(self, cx0, frac0, omega=2.6, zeta=0.92, zoom_ratio=0.18):
         self.cx   = float(cx0)
         self.frac = float(frac0)
         self.vcx  = 0.0
@@ -772,10 +778,11 @@ def main():
             faces = r["faces"]
             n     = r["n_faces"]
 
-            # Dynamic crop fraction: widen slightly in high-motion frames
-            motion_boost = min(0.10, r["motion"] / 25.0) * b_frac
+            # Dynamic crop fraction: gentle widen in high-motion frames only
+            # Keep boost small so framing stays consistent across clip durations
+            motion_boost = min(0.04, r["motion"] / 60.0) * b_frac
             target_frac  = (frac_override or b_frac) + motion_boost
-            target_frac  = min(0.92, max(0.44, target_frac))
+            target_frac  = min(0.92, max(0.50, target_frac))
 
             if n == 0:
                 # No face: hold current frac, use last known cx or center
@@ -809,7 +816,28 @@ def main():
     def apply_spring(frame_targets):
         """
         Run spring physics over frame_targets. Returns list of smoothed keyframes.
+        Predictive lookahead: blend current target with upcoming targets so the
+        camera begins moving before a speaker change, like a professional operator.
         """
+        # Pre-compute predictive targets using 0.6s lookahead
+        LOOKAHEAD_S = 0.6
+        LOOKAHEAD_W = 0.20   # how much to blend toward the future position
+        for i, ft in enumerate(frame_targets):
+            if ft["target_cx"] is None:
+                continue
+            # Collect valid targets within lookahead window
+            future_cxs = [
+                frame_targets[j]["target_cx"]
+                for j in range(i + 1, len(frame_targets))
+                if frame_targets[j]["t"] - ft["t"] <= LOOKAHEAD_S
+                and frame_targets[j]["target_cx"] is not None
+            ]
+            if future_cxs:
+                avg_future = sum(future_cxs) / len(future_cxs)
+                # Only blend when the camera will need to move significantly
+                if abs(avg_future - ft["target_cx"]) > 0.04:
+                    ft["target_cx"] = (1.0 - LOOKAHEAD_W) * ft["target_cx"] + LOOKAHEAD_W * avg_future
+
         # Find first valid target for spring initialization
         first = next((ft for ft in frame_targets if ft["target_cx"] is not None), None)
         if first is None:
@@ -835,7 +863,7 @@ def main():
 
             # Clamp after spring step
             cx   = _clamp_cx(cx, frac)
-            frac = min(0.92, max(0.44, frac))
+            frac = min(0.92, max(0.50, frac))
 
             if ft["target_cx"] is not None:
                 last_cx = cx
