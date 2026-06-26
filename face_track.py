@@ -55,15 +55,15 @@ QUAL_TARGET = 92     # below this average = auto-widen crop and retry
 # Deliberately wider than v6 — less zoom, more breathing room.
 # "It looks like a mugshot" was caused by ~2× zoom; these stay ≤ 1.7×.
 CROP_FRACS = {
-    "monologue":    0.68,   # cinematic medium — shows upper body + breathing room
-    "interview":    0.82,   # both subjects comfortably framed with generous margin
-    "podcast":      0.75,   # podcast two-shot — slightly wider for comfort
-    "group":        0.90,   # 3+ people — fit everyone with margin
-    "reaction":     0.70,   # looking off-camera — wider to show context
-    "presentation": 0.80,   # walking / gesturing presenter — needs space
-    "wide_shot":    0.84,   # subject occupies small fraction of source
-    "close_up":     0.56,   # deliberate tight shot — still show some context
-    "default":      0.70,   # global default — natural medium wide shot
+    "monologue":    0.34,   # fills frame fully (nearFill), shows face + shoulders
+    "interview":    0.38,   # both subjects from chest up, ~8% subtle bars
+    "podcast":      0.36,   # two-shot, minimal bars (~5%)
+    "group":        0.44,   # 3+ people, wider but still tight
+    "reaction":     0.34,   # fills frame, looking off-camera
+    "presentation": 0.38,   # moving presenter with slight breathing room
+    "wide_shot":    0.40,   # subject smaller in frame
+    "close_up":     0.32,   # very tight, fills completely
+    "default":      0.36,   # natural default — fills or nearly fills
 }
 
 # ── Looking-room / rule-of-thirds constants ───────────────────────────────
@@ -238,7 +238,7 @@ def base_crop_frac(scene_type, n_faces, spread):
     frac = CROP_FRACS.get(scene_type, CROP_FRACS["default"])
     if scene_type in ("interview", "podcast") and n_faces >= 2 and spread > 0:
         frac = max(frac, spread + 0.26)   # face spread + 13% padding each side
-    return min(0.92, max(0.44, frac))
+    return min(0.92, max(0.30, frac))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -782,7 +782,7 @@ def main():
             # Keep boost small so framing stays consistent across clip durations
             motion_boost = min(0.04, r["motion"] / 60.0) * b_frac
             target_frac  = (frac_override or b_frac) + motion_boost
-            target_frac  = min(0.92, max(0.50, target_frac))
+            target_frac  = min(0.92, max(0.30, target_frac))
 
             if n == 0:
                 # No face: hold current frac, use last known cx or center
@@ -863,7 +863,7 @@ def main():
 
             # Clamp after spring step
             cx   = _clamp_cx(cx, frac)
-            frac = min(0.92, max(0.50, frac))
+            frac = min(0.92, max(0.30, frac))
 
             if ft["target_cx"] is not None:
                 last_cx = cx
@@ -926,7 +926,7 @@ def main():
         w = max(0.05, kf["confidence"]) * max(0.05, kf["quality"] / 100.0)
         f_sum += kf["cropFrac"] * w
         w_sum += w
-    global_frac = round(min(0.92, max(0.44, f_sum / max(0.001, w_sum))), 3)
+    global_frac = round(min(0.92, max(0.30, f_sum / max(0.001, w_sum))), 3)
 
     # ── Output ────────────────────────────────────────────────────────────
     print(json.dumps({

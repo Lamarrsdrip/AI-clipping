@@ -2132,26 +2132,26 @@ function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920,
   } else if (framingMode === 'close') {
     cropFrac = tightFrac * 1.25;           // slight breathing room, usually no bars
   } else if (framingMode === 'medium') {
-    cropFrac = sceneType === 'group' ? 0.72 : sceneType === 'interview' ? 0.70 : 0.62;
+    cropFrac = sceneType === 'group' ? 0.44 : sceneType === 'interview' ? 0.40 : 0.36;
   } else if (framingMode === 'wide') {
-    cropFrac = sceneType === 'group' ? 0.90 : sceneType === 'interview' ? 0.84 : 0.74;
+    cropFrac = sceneType === 'group' ? 0.52 : sceneType === 'interview' ? 0.44 : 0.42;
   } else if (framingMode === 'original') {
-    cropFrac = 0.85;
+    cropFrac = 0.50;
   } else {
-    // 'dynamic': trust v6 face_track suggestion first
+    // 'dynamic': trust face_track suggestion first
     if (suggestedFrac > 0.01) {
       cropFrac = suggestedFrac;
     } else if (!hasFaces) {
-      cropFrac = 0.68;                     // no faces → wider context shot
+      cropFrac = 0.36;                     // no faces → natural medium shot
     } else {
       switch (sceneType) {
-        case 'group':          cropFrac = 0.90; break;
-        case 'interview':      cropFrac = faceCount >= 2 ? 0.82 : 0.70; break;
-        case 'podcast':        cropFrac = faceCount >= 2 ? 0.75 : 0.66; break;
-        case 'reaction':       cropFrac = 0.70; break;
-        case 'wide_shot':      cropFrac = 0.80; break;
-        case 'close_up':       cropFrac = 0.56; break;
-        default:               cropFrac = rangeCX > 0.20 ? 0.68 : 0.66;
+        case 'group':          cropFrac = 0.44; break;
+        case 'interview':      cropFrac = faceCount >= 2 ? 0.40 : 0.36; break;
+        case 'podcast':        cropFrac = faceCount >= 2 ? 0.38 : 0.34; break;
+        case 'reaction':       cropFrac = 0.34; break;
+        case 'wide_shot':      cropFrac = 0.40; break;
+        case 'close_up':       cropFrac = 0.32; break;
+        default:               cropFrac = rangeCX > 0.20 ? 0.36 : 0.34;
       }
     }
   }
@@ -2753,15 +2753,23 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   };
 }
 
+function getTargetDurations(videoDurationSeconds) {
+  const d = videoDurationSeconds || 0;
+  if (d >= 120) return [60, 90, 120];
+  if (d >= 90)  return [60, 90];
+  if (d >= 60)  return [60];
+  return [Math.max(15, Math.floor(d * 0.85))];
+}
+
 function fallbackMomentsForVideo(video, options = {}) {
   const duration = Math.max(5, Number(video.durationSeconds || 30));
-  const wantedCount = Math.max(1, Math.min(10, Number(options.clipCount || 3)));
-  const wantedLength = Math.max(60, Math.min(600, Number(options.clipLength || 60)));
-  const count = duration < wantedLength ? 1 : Math.min(wantedCount, Math.max(1, Math.floor(duration / wantedLength)));
-  return Array.from({ length: count }).map((_, index) => {
-    const segmentLength = Math.min(wantedLength, Math.min(600, Math.max(60, Math.floor(duration / count))));
-    const start = Math.min(Math.max(0, index * segmentLength), Math.max(0, duration - 5));
-    const end = Math.min(duration, Math.max(start + 5, start + segmentLength));
+  const targetDurations = options.targetDurations || getTargetDurations(duration);
+  const positions = targetDurations.length === 1
+    ? [0]
+    : targetDurations.map((_, i) => Math.floor(i * duration / targetDurations.length));
+  return targetDurations.map((segLen, index) => {
+    const start = Math.min(positions[index], Math.max(0, duration - segLen));
+    const end   = Math.min(duration, Math.max(start + 15, start + segLen));
     return {
       start,
       end,
@@ -2973,7 +2981,20 @@ async function processVideo(payload) {
       suggestBrollKeywords(db, transcript, video.title).catch(() => {});
     }
     updateJob(job.id, { progress: 58, stage: 'AI analysis — scoring viral moments', steps: processingSteps('analysis', 58) });
-    const rawMoments = transcript.length ? await detectViralMoments(db, video, transcript, clipOptions) : fallbackMomentsForVideo(video, clipOptions);
+    const targetDurations = getTargetDurations(video.durationSeconds);
+    let rawMoments;
+    if (transcript.length) {
+      const momentArrays = await Promise.all(
+        targetDurations.map(len =>
+          detectViralMoments(db, video, transcript, { ...clipOptions, clipCount: 1, clipLength: len })
+            .catch(() => [])
+        )
+      );
+      rawMoments = momentArrays.flat().filter(Boolean);
+      if (!rawMoments.length) rawMoments = fallbackMomentsForVideo(video, { ...clipOptions, targetDurations });
+    } else {
+      rawMoments = fallbackMomentsForVideo(video, { ...clipOptions, targetDurations });
+    }
     const moments = rawMoments.map(m => ({ ...m, brandKitId: m.brandKitId || clipOptions.brandKitId || null }));
     if (!moments.length) throw new Error('Could not create a clipping window for this video.');
     updateJob(job.id, { progress: 72, stage: 'creating vertical clips', steps: processingSteps('vertical', 72) });
