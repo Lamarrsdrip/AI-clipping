@@ -1400,8 +1400,8 @@ function scoreMoments(segments, durationSeconds) {
   const windows = [];
 
   for (let i = 0; i < segments.length; i++) {
-    // Try multiple window sizes: 15s, 30s, 45s, 60s
-    for (const targetDur of [15, 30, 45, 60]) {
+    // Window sizes must respect the 60s minimum clip length
+    for (const targetDur of [60, 90, 120, 180]) {
       const start = segments[i].start;
       const endLimit = start + targetDur;
       const group = [];
@@ -1409,7 +1409,7 @@ function scoreMoments(segments, durationSeconds) {
       if (!group.length) continue;
       const end = Math.min(group.at(-1).end, endLimit);
       const dur = end - start;
-      if (dur < 12 || dur > 62) continue;
+      if (dur < 55 || dur > 185) continue;
 
       const text = group.map(s => s.text).join(' ').toLowerCase();
       const firstLine = group[0].text.trim();
@@ -1423,8 +1423,8 @@ function scoreMoments(segments, durationSeconds) {
       const punctScore = (text.match(/[?!]/g) || []).length * 5;
       const densityScore = Math.min(25, Math.round(wordCount / Math.max(1, dur) * 10));
       const openingHookScore = QUESTION_STARTERS.test(firstLine) || firstLine.length < 60 ? 10 : 0;
-      // Prefer 30-45s clips (ideal for Reels/Shorts)
-      const durationBonus = targetDur >= 25 && targetDur <= 50 ? 12 : 0;
+      // Prefer 60-90s clips (minimum is 60s per user settings)
+      const durationBonus = targetDur >= 60 && targetDur <= 90 ? 12 : 0;
 
       const score = Math.min(99, 30 + hookScore + emotionScore + valueScore + questionScore + punctScore + densityScore + openingHookScore + durationBonus);
 
@@ -1435,7 +1435,7 @@ function scoreMoments(segments, durationSeconds) {
   // Deduplicate: keep highest-scoring window starting near each position
   return windows
     .sort((a, b) => b.score - a.score)
-    .filter((c, _, all) => all.findIndex(o => Math.abs(o.start - c.start) < 15) === all.indexOf(c))
+    .filter((c, _, all) => all.findIndex(o => Math.abs(o.start - c.start) < 40) === all.indexOf(c))
     .slice(0, 6);
 }
 
@@ -2298,49 +2298,71 @@ function streamUploadedLogo(req) {
 // and replaces vMap with outputLabel.
 function buildLogoOverlay(brandKit, outW, outH) {
   if (!brandKit || brandKit.watermarkEnabled === false) return null;
+
   const logoFile = brandKit.logoStoredName
     ? path.join(STORAGE_DIR, 'logos', brandKit.logoStoredName)
     : null;
-  if (!logoFile || !existsSync(logoFile)) return null;
+  const hasLogo = !!(logoFile && existsSync(logoFile));
+  const textRaw = (brandKit.textWatermark || '').trim();
+  const hasText = !hasLogo && !!textRaw;
 
-  // Size: small=8%, medium=12%, large=18% of output width
-  const sizePct = { small: 8, medium: 12, large: 18 }[brandKit.logoSize || 'medium']
-                  ?? Number(brandKit.logoSizePercent || 12);
-  const logoW = Math.max(40, Math.round(outW * sizePct / 100 / 2) * 2);
-  const opacity = Math.min(1, Math.max(0.1, Number(brandKit.logoOpacity ?? 0.9)));
+  if (!hasLogo && !hasText) return null;
 
   // Safe-zone margins (TikTok / Reels / Shorts)
-  const MT = 80;           // top margin
-  const MB = 200;          // bottom margin (above platform UI)
-  const MS = 60;           // side margin
-
+  const MT = 80, MB = 200, MS = 60;
   const pos = brandKit.logoPosition || 'top-left';
-  let ox, oy;
-  switch (pos) {
-    case 'top-center':   ox = '(main_w-overlay_w)/2';             oy = MT; break;
-    case 'top-right':    ox = `main_w-overlay_w-${MS}`;           oy = MT; break;
-    case 'bottom-left':  ox = MS;                                  oy = `main_h-overlay_h-${MB}`; break;
-    case 'bottom-center':ox = '(main_w-overlay_w)/2';             oy = `main_h-overlay_h-${MB}`; break;
-    case 'bottom-right': ox = `main_w-overlay_w-${MS}`;           oy = `main_h-overlay_h-${MB}`; break;
-    default:             ox = MS;                                  oy = MT; break; // top-left / auto
+  const opacity = Math.min(1, Math.max(0.1, Number(brandKit.logoOpacity ?? 0.9)));
+
+  if (hasLogo) {
+    // ── Image logo overlay ──────────────────────────────────────
+    const sizePct = { small: 8, medium: 12, large: 18 }[brandKit.logoSize || 'medium']
+                    ?? Number(brandKit.logoSizePercent || 12);
+    const logoW = Math.max(40, Math.round(outW * sizePct / 100 / 2) * 2);
+
+    let ox, oy;
+    switch (pos) {
+      case 'top-center':    ox = '(main_w-overlay_w)/2';  oy = MT;                       break;
+      case 'top-right':     ox = `main_w-overlay_w-${MS}`; oy = MT;                      break;
+      case 'bottom-left':   ox = MS;                       oy = `main_h-overlay_h-${MB}`; break;
+      case 'bottom-center': ox = '(main_w-overlay_w)/2';  oy = `main_h-overlay_h-${MB}`; break;
+      case 'bottom-right':  ox = `main_w-overlay_w-${MS}`; oy = `main_h-overlay_h-${MB}`; break;
+      default:              ox = MS;                       oy = MT;                       break;
+    }
+
+    let logoChain = `scale=${logoW}:-2:flags=lanczos,format=rgba`;
+    if (opacity < 0.99) logoChain += `,colorchannelmixer=aa=${opacity.toFixed(2)}`;
+    if (brandKit.logoBg) logoChain += `,pad=iw+24:ih+14:12:7:color=0x00000099`;
+
+    return {
+      type: 'overlay',
+      logoPath: logoFile,
+      filterStr: (logoInputIdx) =>
+        `[${logoInputIdx}:v]${logoChain}[_logo];[_vout_pre][_logo]overlay=x=${ox}:y=${oy}:format=auto[_vwm]`,
+    };
   }
 
-  // Build per-logo FFmpeg filter chain
-  // [LOGO_IDX:v] → scale → opacity → optional pill bg → [_logo]
-  // Then [vout][_logo]overlay → [_vwm]
-  let logoChain = `scale=${logoW}:-2:flags=lanczos,format=rgba`;
-  if (opacity < 0.99) logoChain += `,colorchannelmixer=aa=${opacity.toFixed(2)}`;
-  if (brandKit.logoBg) {
-    // Wrap logo in a semi-transparent dark rounded pill (pad + transparent bg)
-    logoChain += `,pad=iw+24:ih+14:12:7:color=0x00000099`;
+  // ── Text watermark via drawtext ────────────────────────────────
+  const text = ffmpegText(textRaw.slice(0, 50));
+  const fontSize = { small: 32, medium: 44, large: 60 }[brandKit.logoSize || 'medium'] ?? 44;
+  const alpha = opacity.toFixed(2);
+
+  let tx, ty;
+  switch (pos) {
+    case 'top-center':    tx = '(W-tw)/2';   ty = MT;           break;
+    case 'top-right':     tx = `W-tw-${MS}`; ty = MT;           break;
+    case 'bottom-left':   tx = MS;            ty = `H-th-${MB}`; break;
+    case 'bottom-center': tx = '(W-tw)/2';   ty = `H-th-${MB}`; break;
+    case 'bottom-right':  tx = `W-tw-${MS}`; ty = `H-th-${MB}`; break;
+    default:              tx = MS;            ty = MT;           break;
   }
+
+  const boxFrag = brandKit.logoBg
+    ? ':box=1:boxcolor=black@0.45:boxborderw=10'
+    : ':shadowcolor=black@0.75:shadowx=2:shadowy=2';
 
   return {
-    logoPath: logoFile,
-    filterStr: (logoInputIdx) =>
-      `[${logoInputIdx}:v]${logoChain}[_logo];[_vout_pre][_logo]overlay=x=${ox}:y=${oy}:format=auto[_vwm]`,
-    outputLabel: '[_vwm]',
-    preLabel: '[_vout_pre]',
+    type: 'drawtext',
+    filterFrag: `drawtext=text='${text}':font=Arial:fontsize=${fontSize}:fontcolor=white@${alpha}:borderw=2:bordercolor=black@0.7${boxFrag}:x=${tx}:y=${ty}`,
   };
 }
 
@@ -2547,21 +2569,24 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     vMap = preCapLabel; aMap = '[aout]';
   }
 
-  // ── Logo injection ────────────────────────────────────────────
-  // Logo input is [1:v] (or [2:v] if something else added a second input).
-  // The logo overlay reads from preCapLabel and writes to [vout].
+  // ── Watermark injection ───────────────────────────────────────
   let extraInputArgs = [];
   if (logoOverlay) {
-    extraInputArgs = ['-i', logoOverlay.logoPath];
-    const logoInputIdx = 1;
-    const logoF = logoOverlay.filterStr(logoInputIdx);
-    // logoF: [1:v]<scale/opacity>[_logo];[_vcap][_logo]overlay...[_vwm]
-    // We need to rename _vcap → _vout_pre for the logo filter
-    const logoFAdapted = logoF
-      .replace('[_vout_pre]', vMap)
-      .replace(/^\[(\d+):v\]/, `[${logoInputIdx}:v]`);
-    filterComplex += `;${logoFAdapted}`;
-    vMap = '[_vwm]';
+    if (logoOverlay.type === 'drawtext') {
+      // Text watermark: just chain a drawtext filter — no extra input needed
+      filterComplex += `;${vMap}${logoOverlay.filterFrag}[_vwm]`;
+      vMap = '[_vwm]';
+    } else {
+      // Image logo overlay: needs extra -i input
+      extraInputArgs = ['-i', logoOverlay.logoPath];
+      const logoInputIdx = 1;
+      const logoF = logoOverlay.filterStr(logoInputIdx);
+      const logoFAdapted = logoF
+        .replace('[_vout_pre]', vMap)
+        .replace(/^\[(\d+):v\]/, `[${logoInputIdx}:v]`);
+      filterComplex += `;${logoFAdapted}`;
+      vMap = '[_vwm]';
+    }
   }
 
   // ── Stage 7: Render ───────────────────────────────────────────
@@ -3374,9 +3399,12 @@ Return exactly this JSON (no extra fields, no markdown):
         const text = segments.filter(seg => seg.end >= start && seg.start <= end).map(seg => seg.text).join(' ');
         const hooks = item.hooks || {};
         const primaryHook = hooks.curiosity || hooks.shock || hooks.value || buildCaptionText(text);
+        // Hard-enforce minimum 60s: if AI returned a short clip, push end out
+        const minEnd = Math.min(Number(video.durationSeconds || end), start + desiredLength);
+        const clampedEnd = end - start < 55 ? minEnd : end;
         return {
           start,
-          end,
+          end: clampedEnd,
           score: Math.max(1, Math.min(100, Number(item.overallScore || item.score || 75))),
           hookStrength:   Number(item.hookStrength || 7),
           emotionalPunch: Number(item.emotionalPunch || 7),
@@ -3407,7 +3435,7 @@ Return exactly this JSON (no extra fields, no markdown):
           text: text || primaryHook || video.title
         };
       })
-      .filter(item => item.end > item.start && item.end - item.start <= 610)
+      .filter(item => item.end > item.start && item.end - item.start >= 55 && item.end - item.start <= 610)
       .slice(0, desiredCount);
     return moments.length ? moments : fallbackMoments;
   } catch {
@@ -4265,8 +4293,8 @@ async function handleApi(req, res, pathname) {
         if (!video) throw new Error('Video not found for retry.');
         db.jobs = db.jobs.filter(item => item.id !== body.jobId);
         saveDb(db);
-        const queued = createQueuedProcessingJob({ videoId: video.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 15 });
-        const retry = enqueueRenderJob({ videoId: video.id, jobId: queued.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 15 });
+        const queued = createQueuedProcessingJob({ videoId: video.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 60 });
+        const retry = enqueueRenderJob({ videoId: video.id, jobId: queued.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 60 });
         retry.catch(error => console.error('[job:retry-failed]', String(error.message || error).slice(0, 2000)));
         return json(res, 202, { queued: true, jobId: queued.id, queueDepth: renderQueue.length, activeRenderJobs });
       }
@@ -4687,6 +4715,7 @@ async function handleApi(req, res, pathname) {
         id: `bk_${randomUUID().replace(/-/g,'')}`,
         userId: user.id,
         name: String(body.name || 'My Brand').slice(0, 80),
+        textWatermark: String(body.textWatermark || '').slice(0, 50),
         logoStoredName: null,
         logoUrl: null,
         logoPosition: body.logoPosition || 'top-left',
@@ -4712,7 +4741,7 @@ async function handleApi(req, res, pathname) {
       const user = requireUser(req, db);
       const kit = db.brandKits.find(bk => bk.id === body.id && bk.userId === user.id);
       if (!kit) throw Object.assign(new Error('Brand kit not found.'), { status: 404 });
-      const editable = ['name','logoPosition','logoSize','logoSizePercent','logoOpacity','logoBg',
+      const editable = ['name','textWatermark','logoPosition','logoSize','logoSizePercent','logoOpacity','logoBg',
                         'watermarkEnabled','captionStyle','exportFormat','primaryColor','highlightColor'];
       for (const k of editable) { if (k in body) kit[k] = body[k]; }
       kit.updatedAt = new Date().toISOString();

@@ -2372,6 +2372,7 @@ function _renderSettings() {
     const payload = {
       id: kit.id,
       name: $('#bkName').value.trim() || 'My Brand',
+      textWatermark: ($('#bkTextWatermark').value || '').trim().slice(0, 50),
       logoPosition: $('#bkPosition').value,
       logoSize: $('#bkSize').value,
       logoOpacity: Number($('#bkOpacity').value) / 100,
@@ -2418,16 +2419,28 @@ function renderBrandKitForm() {
   return `
     <form id="brandKitForm" class="stack" style="margin-top:16px;padding-top:16px;border-top:2px solid var(--accent)">
       <h3 style="margin:0 0 12px">${kit.id ? 'Edit brand kit' : 'New brand kit'}</h3>
-      <div class="option-row"><label>Kit name</label>
+
+      <div class="option-row"><label>Brand name</label>
         <input id="bkName" type="text" value="${esc(kit.name||'My Brand')}" placeholder="e.g. My Channel" required>
       </div>
-      <div class="option-row"><label>Logo file</label>
-        <div>
-          ${kit.logoUrl ? `<img src="${esc(kit.logoUrl)}" style="height:32px;margin-bottom:6px;border-radius:4px;background:#111;display:block">` : ''}
-          <input id="bkLogo" type="file" accept=".png,.jpg,.jpeg,.webp" style="font-size:13px">
-          <small class="muted" style="display:block;margin-top:4px">PNG recommended (supports transparency). Max 8 MB.</small>
-        </div>
+
+      <!-- Logo section -->
+      <div style="padding:12px;background:var(--surface2);border-radius:8px;margin:4px 0">
+        <p style="margin:0 0 8px;font-weight:600;font-size:13px">Option A — Upload a logo image</p>
+        ${kit.logoUrl ? `<img src="${esc(kit.logoUrl)}" style="height:36px;margin-bottom:8px;border-radius:4px;background:#111;display:block;padding:4px">` : ''}
+        <input id="bkLogo" type="file" accept=".png,.jpg,.jpeg,.webp" style="font-size:13px">
+        <small class="muted" style="display:block;margin-top:4px">PNG with transparent background works best. Max 8 MB.</small>
       </div>
+
+      <!-- Text watermark section -->
+      <div style="padding:12px;background:var(--surface2);border-radius:8px;margin:4px 0">
+        <p style="margin:0 0 8px;font-weight:600;font-size:13px">Option B — Use text as watermark (if no logo)</p>
+        <input id="bkTextWatermark" type="text" value="${esc(kit.textWatermark||'')}"
+          placeholder="e.g. @YourChannel · YourBrand · yoursite.com"
+          style="width:100%;box-sizing:border-box;font-size:13px">
+        <small class="muted" style="display:block;margin-top:4px">If no logo is uploaded, this text will be stamped on every clip. Max 50 chars.</small>
+      </div>
+
       <div class="option-row"><label>Position</label>
         <select id="bkPosition">
           ${['top-left','top-center','top-right','bottom-left','bottom-center','bottom-right'].map(p=>`<option value="${p}" ${(kit.logoPosition||'top-left')===p?'selected':''}>${p.replace('-',' ')}</option>`).join('')}
@@ -2435,19 +2448,19 @@ function renderBrandKitForm() {
       </div>
       <div class="option-row"><label>Size</label>
         <select id="bkSize">
-          <option value="small"  ${(kit.logoSize||'medium')==='small' ?'selected':''}>Small  (~8% width)</option>
-          <option value="medium" ${(kit.logoSize||'medium')==='medium'?'selected':''}>Medium (~12% width)</option>
-          <option value="large"  ${(kit.logoSize||'medium')==='large' ?'selected':''}>Large  (~18% width)</option>
+          <option value="small"  ${(kit.logoSize||'medium')==='small' ?'selected':''}>Small</option>
+          <option value="medium" ${(kit.logoSize||'medium')==='medium'?'selected':''}>Medium</option>
+          <option value="large"  ${(kit.logoSize||'medium')==='large' ?'selected':''}>Large</option>
         </select>
       </div>
       <div class="option-row"><label>Opacity <span id="bkOpacityVal">${opacityPct}</span>%</label>
         <input id="bkOpacity" type="range" min="10" max="100" value="${opacityPct}"
           oninput="document.getElementById('bkOpacityVal').textContent=this.value" style="width:160px">
       </div>
-      <div class="option-row"><label>Background pill</label>
-        <label class="toggle-label"><input id="bkBg" type="checkbox" ${kit.logoBg?'checked':''}> Add semi-transparent dark background behind logo</label>
+      <div class="option-row"><label>Background box</label>
+        <label class="toggle-label"><input id="bkBg" type="checkbox" ${kit.logoBg?'checked':''}> Add dark background behind watermark</label>
       </div>
-      <div class="option-row"><label>Watermark</label>
+      <div class="option-row"><label>Active</label>
         <label class="toggle-label"><input id="bkEnabled" type="checkbox" ${kit.watermarkEnabled!==false?'checked':''}> Enable watermark on exported clips</label>
       </div>
       <div class="option-row"><label>Caption style</label>
@@ -2455,7 +2468,7 @@ function renderBrandKitForm() {
           ${CAPTION_STYLES.map(s=>`<option value="${s}" ${(kit.captionStyle||'bold')===s?'selected':''}>${CAPTION_STYLE_LABELS[s]||s}</option>`).join('')}
         </select>
       </div>
-      <div style="display:flex;gap:8px;margin-top:4px">
+      <div style="display:flex;gap:8px;margin-top:8px">
         <button type="submit" ${state.brandKitSaving?'disabled':''}>
           ${state.brandKitSaving ? 'Saving…' : (kit.id ? 'Save changes' : 'Create brand kit')}
         </button>
