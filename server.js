@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import Busboy from 'busboy';
 import {
-  GEMINI_COMPAT_BASE, GEMINI_FLASH,
+  GEMINI_COMPAT_BASE, GEMINI_FLASH, GEMINI_MODEL_CASCADE,
+  parseGemini429,
   geminiUploadFile, geminiDeleteFile, geminiGenerateWithFile, geminiGenerateText, geminiTranscribeFile,
 } from './ai/providers/index.js';
 
@@ -278,6 +279,7 @@ function defaultPlans() {
 const API_SETTING_META = [
   ['YOUTUBE_API_KEY', 'YouTube Data API key'],
   ['GEMINI_API_KEY', 'Google Gemini API key — free at aistudio.google.com (powers viral detection, hooks, titles, hashtags, QA, and direct video analysis)'],
+  ['GEMINI_MODEL', 'Gemini model to use (default: gemini-2.5-flash-lite). Options: gemini-2.5-flash-lite | gemini-2.5-flash | gemini-1.5-flash | gemini-1.5-flash-8b'],
   ['AI_PROVIDER', 'Primary AI brain: gemini | openai | groq | xai | emergent (default: gemini when GEMINI_API_KEY is set)'],
   ['LLM_PROVIDER', 'Fallback LLM provider (openai | groq | xai | together | emergent) — used when Gemini is unavailable'],
   ['LLM_API_KEY', 'Fallback LLM API key — also used for Whisper transcription if set'],
@@ -1093,14 +1095,23 @@ Return ONLY this JSON (no markdown, no extra keys):
 {"moments":[{"start":number,"end":number,"overallScore":number,"hookStrength":number,"emotionalPunch":number,"voiceEnergy":number,"controversy":number,"usefulness":number,"storytelling":number,"shareability":number,"retentionScore":number,"dropoffRisk":"low|medium|high","reason":"laugh|revelation|shock|emotion|value|argument|reaction|story|inspiration|confession","rationale":"2-3 sentences why a top TikTok editor would cut this exact moment","hooks":{"curiosity":"hook under 96 chars","shock":"hook under 96 chars","value":"hook under 96 chars","story":"hook under 96 chars","controversy":"hook under 96 chars","sales":"hook under 96 chars"},"title":"viral clip title under 60 chars","tiktok_description":"TikTok caption under 300 chars","reels_description":"Instagram Reels caption under 220 chars","hashtags":["#tag1","#tag2","#tag3","#tag4","#tag5","#tag6","#tag7","#tag8"],"thumbnail_idea":"1-sentence thumbnail description","brollKeywords":["keyword1","keyword2","keyword3"],"soundEffectSuggestions":["sfx1","sfx2"],"captionStyle":"hormozi|mrbeast|karaoke|tiktok|viral|neon|fire|hype|reels|podcast|minimal|luxury|finance|bold","framingNotes":"ideal framing for this moment","bestPlatform":"TikTok|Instagram Reels|YouTube Shorts|X|LinkedIn","contentWarning":"none|mild|mature"}]}`;
 
   const { uri, name: fileName } = await geminiUploadFile(geminiKey, mediaPath, 'video/mp4');
+  const model = geminiModel(db);
+  console.log(`[Gemini] video analysis — model: ${model}, provider: gemini`);
   try {
-    const { text, usage } = await geminiGenerateWithFile({
-      apiKey: geminiKey, fileUri: uri, mimeType: 'video/mp4', prompt, model: GEMINI_FLASH, temperature: 0.3,
+    const { text, usage, model: usedModel } = await geminiGenerateWithFile({
+      apiKey: geminiKey, fileUri: uri, mimeType: 'video/mp4', prompt, model, temperature: 0.3,
     });
-    recordAiLog({ provider: 'gemini', model: GEMINI_FLASH, purpose: 'viral video analysis (video upload)', ok: true, ...usage });
+    recordAiLog({ provider: 'gemini', model: usedModel, purpose: 'viral video analysis (video upload)', ok: true, ...usage });
     return text;
+  } catch (err) {
+    const q429 = parseGemini429(err);
+    if (q429) {
+      console.error(`[Gemini] QUOTA: video analysis failed — ${q429.model} — retry after ${Math.ceil(q429.retryMs / 1000)}s`);
+      recordAiLog({ provider: 'gemini', model, purpose: 'viral video analysis', ok: false, error: `quota_exceeded: ${q429.model}` });
+    }
+    throw err;
   } finally {
-    geminiDeleteFile(geminiKey, fileName); // async privacy cleanup — don't await
+    geminiDeleteFile(geminiKey, fileName);
   }
 }
 
@@ -1137,12 +1148,14 @@ Generate rich metadata. Return ONLY this JSON:
   "best_posting_time": "day and time recommendation e.g. Tuesday 7pm EST"
 }`;
 
-    const { text, usage } = await geminiGenerateText({
+    const model = geminiModel(db);
+    console.log(`[Gemini] clip metadata — model: ${model}, provider: gemini`);
+    const { text, usage, model: usedModel } = await geminiGenerateText({
       apiKey: geminiKey, prompt,
       systemPrompt: 'You are an expert social media strategist and viral content writer. Return only valid JSON.',
-      model: GEMINI_FLASH, temperature: 0.6,
+      model, temperature: 0.6,
     });
-    recordAiLog({ provider: 'gemini', model: GEMINI_FLASH, purpose: 'clip metadata generation', ok: true, ...usage });
+    recordAiLog({ provider: 'gemini', model: usedModel, purpose: 'clip metadata generation', ok: true, ...usage });
     return extractJsonObject(text) || {};
   } catch { return {}; }
 }
@@ -1184,12 +1197,14 @@ Assess the clip quality. Return ONLY this JSON:
   "estimated_watch_rate": "percentage of viewers likely to watch to the end"
 }`;
 
-    const { text, usage } = await geminiGenerateText({
+    const model = geminiModel(db);
+    console.log(`[Gemini] QA review — model: ${model}, provider: gemini`);
+    const { text, usage, model: usedModel } = await geminiGenerateText({
       apiKey: geminiKey, prompt,
       systemPrompt: 'You are a strict QA reviewer for short-form video content. Be precise. Return only valid JSON.',
-      model: GEMINI_FLASH, temperature: 0.2,
+      model, temperature: 0.2,
     });
-    recordAiLog({ provider: 'gemini', model: GEMINI_FLASH, purpose: 'clip QA review', ok: true, ...usage });
+    recordAiLog({ provider: 'gemini', model: usedModel, purpose: 'clip QA review', ok: true, ...usage });
     return extractJsonObject(text) || null;
   } catch { return null; }
 }
@@ -3387,6 +3402,16 @@ function settingValue(db, key) {
   return String(setting?.value || process.env[key] || '').trim();
 }
 
+// Returns the Gemini model to use, respecting GEMINI_MODEL setting.
+// Falls back through the model cascade so quota errors on one model
+// don't block the whole pipeline — the native SDK functions handle the
+// per-call cascade automatically.
+function geminiModel(db) {
+  const configured = settingValue(db, 'GEMINI_MODEL');
+  if (configured && configured.startsWith('gemini')) return configured;
+  return GEMINI_MODEL_CASCADE[0]; // gemini-2.5-flash-lite default
+}
+
 function normalizeOpenAiBaseUrl(baseUrl) {
   const trimmed = String(baseUrl || '').trim().replace(/\/+$/, '');
   if (!trimmed || trimmed === 'REPLACE_WITH_EMERGENT_ENDPOINT') return '';
@@ -3402,12 +3427,12 @@ function aiConfig(db, fallback = false) {
     const geminiKey  = settingValue(db, 'GEMINI_API_KEY');
     // If AI_PROVIDER=gemini (or unset and GEMINI_API_KEY is present), route to Gemini
     if (geminiKey && (aiProvider === 'gemini' || !aiProvider)) {
-      const model = settingValue(db, 'LLM_MODEL') || GEMINI_FLASH;
+      const model = settingValue(db, 'GEMINI_MODEL') || settingValue(db, 'LLM_MODEL') || GEMINI_MODEL_CASCADE[0];
       return {
         provider:      'gemini',
         apiKey:        geminiKey,
         baseUrl:       `${GEMINI_COMPAT_BASE}/chat/completions`,
-        model:         model.startsWith('gemini') ? model : GEMINI_FLASH,
+        model:         model.startsWith('gemini') ? model : GEMINI_MODEL_CASCADE[0],
         customBaseUrl: false,
       };
     }
@@ -3430,7 +3455,7 @@ function aiConfig(db, fallback = false) {
     xai: 'grok-3-mini', grok: 'grok-3-mini',
     openai: 'gpt-4o-mini', groq: 'llama-3.3-70b-versatile',
     together: 'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo',
-    gemini: GEMINI_FLASH,
+    gemini: GEMINI_MODEL_CASCADE[0],
   };
   // For the gemini provider in LLM_PROVIDER slot, use GEMINI_API_KEY
   const resolvedApiKey = (provider === 'gemini' && !apiKey)
@@ -5041,25 +5066,37 @@ async function handleApi(req, res, pathname) {
       requireAdmin(req, db);
       const body = await readJson(req).catch(() => ({}));
       const apiKey = body.apiKey || settingValue(db, 'GEMINI_API_KEY');
-      if (!apiKey) throw new Error('GEMINI_API_KEY is not configured. Set it in Admin → Settings.');
+      if (!apiKey) throw new Error('GEMINI_API_KEY is not configured. Get a free key at aistudio.google.com/app/apikey');
+      const model = body.model || geminiModel(db);
+      console.log(`[Gemini] connection test — model: ${model}, provider: gemini`);
       try {
-        const { text, usage } = await geminiGenerateText({
+        const { text, usage, model: usedModel } = await geminiGenerateText({
           apiKey,
-          prompt: 'Reply with exactly: {"status":"ok","message":"Gemini is connected and working","model":"gemini-2.0-flash"}',
-          systemPrompt: 'You are a connectivity test. Return only valid JSON.',
-          model: GEMINI_FLASH,
+          prompt: 'Reply with OK',
+          systemPrompt: 'You are a connectivity test. Reply with just the word OK.',
+          model,
           temperature: 0,
         });
-        const parsed = extractJsonObject(text) || { status: 'ok', raw: text.slice(0, 200) };
-        recordAiLog({ provider: 'gemini', model: GEMINI_FLASH, purpose: 'gemini connection test', ok: true, ...usage });
+        recordAiLog({ provider: 'gemini', model: usedModel, purpose: 'gemini connection test', ok: true, ...usage });
+        console.log(`[Gemini] test OK — used model: ${usedModel}`);
         return json(res, 200, {
-          ok: true, provider: 'gemini', model: GEMINI_FLASH,
-          usage, reply: parsed,
-          compatBase: GEMINI_COMPAT_BASE,
+          ok: true, provider: 'gemini', model: usedModel, requestedModel: model,
+          usage, reply: text.slice(0, 200),
           features: ['viral-detection', 'video-analysis', 'hooks', 'titles', 'hashtags', 'thumbnail-ideas', 'broll-suggestions', 'qa-review', 'transcription-fallback'],
         });
       } catch (err) {
-        return json(res, 200, { ok: false, provider: 'gemini', error: err.message });
+        const q429 = parseGemini429(err);
+        const message = q429
+          ? `Quota exceeded on all Gemini models — retry after ${Math.ceil(q429.retryMs / 1000)}s. Try again later or add a fallback LLM key.`
+          : err.message;
+        console.error(`[Gemini] test FAILED — model: ${model} — ${message}`);
+        recordAiLog({ provider: 'gemini', model, purpose: 'gemini connection test', ok: false, error: message });
+        return json(res, 200, {
+          ok: false, provider: 'gemini', model,
+          error: message,
+          isQuota: Boolean(q429),
+          retryAfterSeconds: q429 ? Math.ceil(q429.retryMs / 1000) : null,
+        });
       }
     }
     if (pathname === '/api/admin/payments') {
@@ -5094,19 +5131,40 @@ async function handleApi(req, res, pathname) {
       const db = loadDb();
       requireAdmin(req, db);
       const body = await readJson(req);
-      // Allow testing a candidate key before saving
       const provider = body.provider || settingValue(db, 'LLM_PROVIDER') || 'xai';
       const apiKey   = body.apiKey   || settingValue(db, 'LLM_API_KEY');
       const model    = body.model    || settingValue(db, 'LLM_MODEL') || 'grok-3-mini';
+      if (!apiKey) return json(res, 400, { ok: false, error: 'No API key provided.' });
+
+      // ── Gemini: use native SDK path, not OpenAI-compat ──────────────────────
+      if (provider === 'gemini') {
+        const geminiKey = body.apiKey || settingValue(db, 'GEMINI_API_KEY') || apiKey;
+        const geminiMdl = body.model  || geminiModel(db);
+        console.log(`[Gemini] LLM verify — model: ${geminiMdl}`);
+        const t0 = Date.now();
+        try {
+          const { text, model: usedModel } = await geminiGenerateText({
+            apiKey: geminiKey, prompt: 'Reply with OK', model: geminiMdl, temperature: 0,
+          });
+          return json(res, 200, { ok: true, reply: text.trim(), model: usedModel, ms: Date.now() - t0, provider: 'gemini' });
+        } catch (err) {
+          const q429 = parseGemini429(err);
+          const message = q429
+            ? `Quota exceeded — retry after ${Math.ceil(q429.retryMs / 1000)}s. Your free tier limit for all models is exhausted. Wait or check aistudio.google.com/app/apikey for usage.`
+            : err.message;
+          return json(res, 200, { ok: false, error: message, isQuota: Boolean(q429), ms: Date.now() - t0, provider: 'gemini' });
+        }
+      }
+
+      // ── OpenAI-compatible providers ──────────────────────────────────────────
       const customBase = body.baseUrl || settingValue(db, 'LLM_BASE_URL');
       const providerBases = {
         xai: 'https://api.x.ai/v1', grok: 'https://api.x.ai/v1',
         openai: 'https://api.openai.com/v1', groq: 'https://api.groq.com/openai/v1',
-        together: 'https://api.together.xyz/v1'
+        together: 'https://api.together.xyz/v1', emergent: 'https://api.emergent.sh/v1',
       };
       const base = (customBase || providerBases[provider] || '').replace(/\/+$/, '');
-      if (!apiKey) return json(res, 400, { ok: false, error: 'No API key provided.' });
-      if (!base)   return json(res, 400, { ok: false, error: `Unknown provider "${provider}". Set a custom base URL.` });
+      if (!base) return json(res, 400, { ok: false, error: `Unknown provider "${provider}". Set a custom base URL.` });
       const endpoint = `${base}/chat/completions`;
       const t0 = Date.now();
       try {
@@ -5120,8 +5178,7 @@ async function handleApi(req, res, pathname) {
         const ms = Date.now() - t0;
         if (!testRes.ok) return json(res, 200, { ok: false, error: data.error?.message || data.error || `HTTP ${testRes.status}`, status: testRes.status, ms });
         const reply = data.choices?.[0]?.message?.content?.trim() || '';
-        const usedModel = data.model || model;
-        return json(res, 200, { ok: true, reply, model: usedModel, ms, provider, endpoint });
+        return json(res, 200, { ok: true, reply, model: data.model || model, ms, provider, endpoint });
       } catch (err) {
         return json(res, 200, { ok: false, error: String(err.message || err), ms: Date.now() - t0 });
       }

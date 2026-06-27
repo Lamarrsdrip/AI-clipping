@@ -2566,8 +2566,10 @@ function renderAdmin() {
           <div class="option-row">
             <label>AI Model</label>
             <select id="geminiModel" name="LLM_MODEL">
-              <option value="gemini-2.0-flash">Gemini 2.0 Flash (recommended — fastest, free)</option>
+              <option value="gemini-2.5-flash-lite">Gemini 2.5 Flash Lite (recommended — most available on free tier)</option>
               <option value="gemini-2.5-flash">Gemini 2.5 Flash (best reasoning, free)</option>
+              <option value="gemini-1.5-flash">Gemini 1.5 Flash (stable, free)</option>
+              <option value="gemini-1.5-flash-8b">Gemini 1.5 Flash 8B (smallest quota bucket)</option>
               <option value="gemini-2.5-pro">Gemini 2.5 Pro (most capable, paid)</option>
             </select>
           </div>
@@ -2597,7 +2599,7 @@ function renderAdmin() {
           <div class="option-row">
             <label>Provider</label>
             <select id="llmProvider" name="LLM_PROVIDER">
-              <option value="gemini">Google — Gemini (via OpenAI-compat layer)</option>
+              <option value="gemini">Google — Gemini (native SDK, free)</option>
               <option value="xai">xAI — Grok</option>
               <option value="openai">OpenAI — GPT-4o-mini (+ Whisper transcription)</option>
               <option value="groq">Groq — Llama 3.3 70B (free tier)</option>
@@ -2714,16 +2716,26 @@ function renderAdmin() {
 
   // Provider → hint + model auto-fill
   const PROVIDER_HINTS = {
+    gemini:   { hint:'Get key at <b>aistudio.google.com/app/apikey</b> — free (starts with AIza...)', model:'gemini-2.5-flash-lite', isGemini: true },
     xai:      { hint:'Get key at <b>console.x.ai</b> — free tier available', model:'grok-3-mini' },
-    openai:   { hint:'Get key at <b>platform.openai.com</b>', model:'gpt-4o-mini' },
+    openai:   { hint:'Get key at <b>platform.openai.com</b> — enables Whisper word-level captions', model:'gpt-4o-mini' },
     groq:     { hint:'Get key at <b>console.groq.com</b> — generous free tier', model:'llama-3.3-70b-versatile' },
-    together: { hint:'Get key at <b>api.together.xyz</b> — free credits on signup', model:'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo' }
+    together: { hint:'Get key at <b>api.together.xyz</b> — free credits on signup', model:'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo' },
   };
   function applyProviderHint() {
-    const p=$('#llmProvider')?.value||'xai';
-    const h=PROVIDER_HINTS[p]||PROVIDER_HINTS.xai;
-    if ($('#llmKeyHint')) $('#llmKeyHint').innerHTML=h.hint;
-    if ($('#llmModel')&&!$('#llmModel').value) $('#llmModel').value=h.model;
+    const p = $('#llmProvider')?.value || 'xai';
+    const h = PROVIDER_HINTS[p] || PROVIDER_HINTS.xai;
+    if ($('#llmKeyHint')) $('#llmKeyHint').innerHTML = h.hint;
+    if ($('#llmModel') && !$('#llmModel').value) $('#llmModel').value = h.model;
+    // Show/hide model row — for Gemini show model selector, not free-text
+    const modelRow = $('#llmModelRow');
+    if (modelRow) modelRow.style.display = 'block';
+    const llmModelInput = $('#llmModel');
+    if (llmModelInput && h.isGemini) {
+      // For Gemini: replace free-text with common model names via placeholder
+      llmModelInput.placeholder = 'gemini-2.5-flash-lite';
+      if (!llmModelInput.value || !llmModelInput.value.startsWith('gemini')) llmModelInput.value = 'gemini-2.5-flash-lite';
+    }
   }
   $('#llmProvider')?.addEventListener('change', applyProviderHint);
   applyProviderHint();
@@ -2766,11 +2778,11 @@ function renderAdmin() {
   $('#geminiConfigForm')?.addEventListener('submit', async e => {
     e.preventDefault();
     const key=$('#geminiApiKey')?.value||'';
-    const model=$('#geminiModel')?.value||'gemini-2.0-flash';
+    const model=$('#geminiModel')?.value||'gemini-2.5-flash-lite';
     const settings={
       GEMINI_API_KEY:key,
+      GEMINI_MODEL:model,
       AI_PROVIDER:key?'gemini':'',
-      LLM_MODEL:model,
     };
     try {
       await api('/api/admin/settings',{method:'PATCH',body:JSON.stringify({settings})});
@@ -2802,14 +2814,17 @@ function renderAdmin() {
       })});
       if (res.ok) {
         resultEl.innerHTML=`<div class="verify-ok">✓ Connected — model <b>${esc(res.model)}</b> replied in ${res.ms}ms: "<i>${esc(res.reply)}</i>"</div>`;
-        badgeEl.innerHTML=`<span class="pill ok">✓ Verified</span>`;
+        if (badgeEl) badgeEl.innerHTML=`<span class="pill ok">✓ Verified</span>`;
       } else {
-        resultEl.innerHTML=`<div class="verify-fail">✗ Failed — ${esc(res.error)}</div>`;
-        badgeEl.innerHTML=`<span class="pill error">✗ Failed</span>`;
+        const quotaNote = res.isQuota
+          ? `<br><span style="font-size:.78rem">Quota issue — all free-tier models exhausted. Wait a minute or check <a href="https://aistudio.google.com/app/apikey" target="_blank">aistudio.google.com</a>.</span>`
+          : '';
+        resultEl.innerHTML=`<div class="verify-fail">✗ ${esc(res.error)}${quotaNote}</div>`;
+        if (badgeEl) badgeEl.innerHTML=`<span class="pill error">✗ Failed</span>`;
       }
     } catch(e) {
       resultEl.innerHTML=`<div class="verify-fail">✗ ${esc(e.message)}</div>`;
-      badgeEl.innerHTML=`<span class="pill error">✗ Error</span>`;
+      if (badgeEl) badgeEl.innerHTML=`<span class="pill error">✗ Error</span>`;
     }
     btn.disabled=false; btn.textContent='Test connection';
   });
@@ -2817,16 +2832,22 @@ function renderAdmin() {
   // Save LLM config
   $('#llmConfigForm')?.addEventListener('submit', async e => {
     e.preventDefault();
-    const settings={
-      LLM_PROVIDER:$('#llmProvider')?.value||'xai',
-      LLM_API_KEY:$('#llmApiKey')?.value||'',
-      LLM_MODEL:$('#llmModel')?.value||'grok-3-mini'
-    };
+    const provider = $('#llmProvider')?.value || 'xai';
+    const apiKey   = $('#llmApiKey')?.value   || '';
+    const model    = $('#llmModel')?.value     || '';
+    const settings = { LLM_PROVIDER: provider, LLM_API_KEY: apiKey, LLM_MODEL: model };
+    // When saving Gemini as LLM provider, also persist GEMINI_API_KEY + GEMINI_MODEL
+    if (provider === 'gemini') {
+      if (apiKey && apiKey.startsWith('AIza')) settings.GEMINI_API_KEY = apiKey;
+      if (model && model.startsWith('gemini')) settings.GEMINI_MODEL = model;
+      settings.AI_PROVIDER = 'gemini';
+    }
     try {
       await api('/api/admin/settings',{method:'PATCH',body:JSON.stringify({settings})});
-      state.studioStatus=null; // force re-fetch
-      const btn=e.target.querySelector('button[type=submit]');
-      btn.textContent='Saved ✓'; setTimeout(()=>{ btn.textContent='Save & apply'; },2000);
+      state.studioStatus = null;
+      const btn = e.target.querySelector('button[type=submit]');
+      btn.textContent = 'Saved ✓';
+      setTimeout(() => { btn.textContent = 'Save & apply'; }, 2000);
     } catch(err) { alert(err.message); }
   });
 
