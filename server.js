@@ -4644,26 +4644,30 @@ async function handleApi(req, res, pathname) {
     }
     if (pathname === '/api/studio/status') {
       const db = loadDb();
-      const llmReady = settingReady(db, 'LLM_API_KEY');
+      // Gemini is the primary AI brain — features are available when either is configured
+      const geminiReady = settingReady(db, 'GEMINI_API_KEY');
+      const llmReady    = settingReady(db, 'LLM_API_KEY');
+      const aiReady     = geminiReady || llmReady;
+      const whisperReady = llmReady; // Whisper needs OpenAI-compat key specifically
       const ffmpegReady = await hasCommand(FFMPEG);
       const canDraw = ffmpegReady ? await drawtextSupported() : false;
       const mediaReady = aiMediaReady(db);
       return json(res, 200, {
         features: {
-          transcription:   { available: llmReady,   label: 'AI Transcription',            description: 'Requires LLM API key (OpenAI Whisper compatible)' },
-          viralDetection:  { available: llmReady,   label: 'Viral Moment Detection',       description: 'AI scores every moment across 6 dimensions' },
-          hookGeneration:  { available: llmReady,   label: '6-Style Hook Generation',      description: 'Curiosity, Shock, Value, Story, Controversy, Sales' },
-          platformContent: { available: llmReady,   label: 'Platform Content Generation',  description: 'TikTok, YouTube, Instagram, X, LinkedIn, Facebook posts' },
-          captions:        { available: canDraw,    label: 'Styled Captions',              description: 'Hormozi, Karaoke, Minimal, Luxury, Neon styles' },
-          thumbnails:      { available: canDraw,    label: 'Thumbnail Generation',         description: '3 styles: Viral Bold, Luxury Clean, Neon Pop' },
-          brollSuggestions:{ available: llmReady,   label: 'B-Roll Keyword Extraction',    description: 'AI suggests stock footage keywords per transcript section' },
-          facelessContent: { available: llmReady,   label: 'Faceless Content Mode',        description: 'AI writes complete script + scene directions for faceless videos' },
-          aiImageGen:      { available: mediaReady, label: 'AI Image Generation',          description: 'FLUX 1.1 Pro, Ideogram 3.0, Higgsfield — text-to-image', setupKey: 'MUAPI_API_KEY' },
-          aiVideoGen:      { available: mediaReady, label: 'AI Video / B-Roll Studio',     description: 'Kling 2.1, Seedance, Wan2.1, Higgsfield — text-to-video & image-to-video', setupKey: 'MUAPI_API_KEY' },
-          lipSync:         { available: mediaReady, label: 'Lip Sync Studio',              description: 'Sync any voice-over to a video clip with Wav2Lip', setupKey: 'MUAPI_API_KEY' },
-          aiVoice:         { available: !!(settingValue(db,'ELEVENLABS_API_KEY') || (settingValue(db,'LLM_PROVIDER')==='openai' && settingValue(db,'LLM_API_KEY'))), label: 'AI Voiceover (TTS)', description: 'ElevenLabs or OpenAI TTS — type text, pick a voice, get instant audio', setupKey: 'ELEVENLABS_API_KEY' },
-          translation:     { available: llmReady,   label: 'Caption Translation',           description: 'Translate captions to 10+ languages via LLM' },
-          socialPosting:   { available: false,      label: 'Direct Social Posting',         description: 'Configure TikTok/Instagram OAuth credentials', setupKey: 'TIKTOK_CLIENT_ID' }
+          transcription:   { available: aiReady,     label: 'AI Transcription',            description: geminiReady ? 'Powered by Gemini (add LLM_API_KEY for Whisper word-level timing)' : 'Requires LLM API key (OpenAI Whisper compatible)' },
+          viralDetection:  { available: aiReady,     label: 'Viral Moment Detection',       description: geminiReady ? 'Powered by Gemini — watches actual video' : 'AI scores every moment across 6 dimensions' },
+          hookGeneration:  { available: aiReady,     label: '6-Style Hook Generation',      description: 'Curiosity, Shock, Value, Story, Controversy, Sales' },
+          platformContent: { available: aiReady,     label: 'Platform Content Generation',  description: 'TikTok, YouTube, Instagram, X, LinkedIn, Facebook posts' },
+          captions:        { available: canDraw,     label: 'Styled Captions',              description: 'Hormozi, Karaoke, Minimal, Luxury, Neon styles' },
+          thumbnails:      { available: canDraw,     label: 'Thumbnail Generation',         description: '3 styles: Viral Bold, Luxury Clean, Neon Pop' },
+          brollSuggestions:{ available: aiReady,     label: 'B-Roll Keyword Extraction',    description: 'AI suggests stock footage keywords per transcript section' },
+          facelessContent: { available: aiReady,     label: 'Faceless Content Mode',        description: 'AI writes complete script + scene directions for faceless videos' },
+          aiImageGen:      { available: mediaReady,  label: 'AI Image Generation',          description: 'FLUX 1.1 Pro, Ideogram 3.0, Higgsfield — text-to-image', setupKey: 'MUAPI_API_KEY' },
+          aiVideoGen:      { available: mediaReady,  label: 'AI Video / B-Roll Studio',     description: 'Kling 2.1, Seedance, Wan2.1, Higgsfield — text-to-video & image-to-video', setupKey: 'MUAPI_API_KEY' },
+          lipSync:         { available: mediaReady,  label: 'Lip Sync Studio',              description: 'Sync any voice-over to a video clip with Wav2Lip', setupKey: 'MUAPI_API_KEY' },
+          aiVoice:         { available: !!(settingValue(db,'ELEVENLABS_API_KEY') || (settingValue(db,'LLM_PROVIDER')==='openai' && llmReady)), label: 'AI Voiceover (TTS)', description: 'ElevenLabs or OpenAI TTS — type text, pick a voice, get instant audio', setupKey: 'ELEVENLABS_API_KEY' },
+          translation:     { available: aiReady,     label: 'Caption Translation',           description: 'Translate captions to 10+ languages via LLM' },
+          socialPosting:   { available: false,       label: 'Direct Social Posting',         description: 'Configure TikTok/Instagram OAuth credentials', setupKey: 'TIKTOK_CLIENT_ID' }
         }
       });
     }
@@ -5132,14 +5136,13 @@ async function handleApi(req, res, pathname) {
       requireAdmin(req, db);
       const body = await readJson(req);
       const provider = body.provider || settingValue(db, 'LLM_PROVIDER') || 'xai';
-      const apiKey   = body.apiKey   || settingValue(db, 'LLM_API_KEY');
       const model    = body.model    || settingValue(db, 'LLM_MODEL') || 'grok-3-mini';
-      if (!apiKey) return json(res, 400, { ok: false, error: 'No API key provided.' });
 
       // ── Gemini: use native SDK path, not OpenAI-compat ──────────────────────
       if (provider === 'gemini') {
-        const geminiKey = body.apiKey || settingValue(db, 'GEMINI_API_KEY') || apiKey;
+        const geminiKey = body.apiKey || settingValue(db, 'GEMINI_API_KEY');
         const geminiMdl = body.model  || geminiModel(db);
+        if (!geminiKey) return json(res, 400, { ok: false, error: 'No Gemini API key. Add it in Admin → Gemini AI section, or paste it here.' });
         console.log(`[Gemini] LLM verify — model: ${geminiMdl}`);
         const t0 = Date.now();
         try {
@@ -5157,6 +5160,8 @@ async function handleApi(req, res, pathname) {
       }
 
       // ── OpenAI-compatible providers ──────────────────────────────────────────
+      const apiKey = body.apiKey || settingValue(db, 'LLM_API_KEY');
+      if (!apiKey) return json(res, 400, { ok: false, error: 'No API key provided.' });
       const customBase = body.baseUrl || settingValue(db, 'LLM_BASE_URL');
       const providerBases = {
         xai: 'https://api.x.ai/v1', grok: 'https://api.x.ai/v1',

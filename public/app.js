@@ -2412,7 +2412,7 @@ function _renderSettings() {
         const fd = new FormData();
         fd.append('brandKitId', saved.id);
         fd.append('logo', logoFile);
-        const r = await fetch('/api/brand-kit/logo', {method:'POST', credentials:'include', body:fd});
+        const r = await fetch('/api/brand-kit/logo', {method:'POST', headers:{'x-user-id':uid()}, body:fd});
         const rd = await r.json();
         if (!r.ok) throw new Error(rd.error || 'Logo upload failed');
         state.brandKits = state.brandKits.map(bk => bk.id === rd.kit.id ? rd.kit : bk);
@@ -2552,7 +2552,7 @@ function renderAdmin() {
             <h2>Google Gemini <span style="font-size:.7em;font-weight:400;color:#7be57b">FREE</span></h2>
             <p class="muted" style="margin:4px 0 0;font-size:.82rem">Powers: viral clip detection · direct video understanding · hooks · titles · hashtags · thumbnail ideas · B-roll · sound effects · QA review · transcription fallback</p>
           </div>
-          <div id="geminiStatusBadge" style="flex-shrink:0">${state.tools?.gemini ? '<span style="color:#7be57b;font-size:.85rem">● Connected</span>' : '<span style="color:#f87272;font-size:.85rem">○ Not configured</span>'}</div>
+          <div id="geminiStatusBadge" style="flex-shrink:0">${state.session?.tools?.gemini ? '<span style="color:#7be57b;font-size:.85rem">● Connected</span>' : '<span style="color:#f87272;font-size:.85rem">○ Not configured</span>'}</div>
         </div>
         <form id="geminiConfigForm" class="stack" style="max-width:540px">
           <div>
