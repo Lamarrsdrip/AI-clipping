@@ -1395,7 +1395,7 @@ async function addWatchedChannel(payload) {
   const existing = db.watchedChannels.find(item => item.sourceUrl === parsed.canonical);
   const watch = existing || {
     id: randomUUID(),
-    userId: 'user_demo',
+    userId: payload.userId || 'user_demo',
     sourceUrl: parsed.canonical,
     status: 'active',
     createdAt: new Date().toISOString(),
@@ -4421,7 +4421,9 @@ async function handleApi(req, res, pathname) {
     }
     if (pathname === '/api/watch-channel' && req.method === 'POST') {
       const body = await readJson(req);
-      const watch = await addWatchedChannel(body);
+      const db = loadDb();
+      const user = requireUser(req, db);
+      const watch = await addWatchedChannel({ ...body, userId: user.id });
       if (body.checkNow) {
         setTimeout(() => pollWatchedChannel(watch.id).catch(() => {}), 10);
       }
@@ -4551,12 +4553,6 @@ async function handleApi(req, res, pathname) {
       if (CREDITS_ENABLED && user.role !== 'admin' && user.credits < FACELESS_COST) {
         throw new Error(`Not enough credits. Faceless script generation costs ${FACELESS_COST} credits.`);
       }
-      if (CREDITS_ENABLED && user.role !== 'admin') {
-        const userIdx = db.users.findIndex(u => u.id === user.id);
-        db.users[userIdx].credits -= FACELESS_COST;
-        db.creditTransactions.unshift({ id: randomUUID(), userId: user.id, amount: -FACELESS_COST, reason: `Faceless script — ${body.topic}`, createdAt: new Date().toISOString() });
-        saveDb(db);
-      }
       const result = await generateFacelessScript(db, String(body.topic), {
         style:           String(body.style || 'documentary'),
         targetSeconds:   Number(body.duration || 45),
@@ -4569,10 +4565,25 @@ async function handleApi(req, res, pathname) {
         storytellingMode:String(body.storytellingMode || 'revelation')
       });
       if (result.ok) {
-        if (!Array.isArray(db.studioGenerations)) db.studioGenerations = [];
-        db.studioGenerations.unshift({ id: randomUUID(), userId: user.id, type: 'faceless_script', topic: body.topic, style: body.style, result, createdAt: new Date().toISOString() });
-        db.studioGenerations = db.studioGenerations.slice(0, 50);
-        saveDb(db);
+        // Deduct credits only on success — no charge for Gemini outages
+        if (CREDITS_ENABLED && user.role !== 'admin') {
+          const freshDb = loadDb();
+          const userIdx = freshDb.users.findIndex(u => u.id === user.id);
+          if (userIdx !== -1) {
+            freshDb.users[userIdx].credits -= FACELESS_COST;
+            freshDb.creditTransactions.unshift({ id: randomUUID(), userId: user.id, amount: -FACELESS_COST, reason: `Faceless script — ${body.topic}`, createdAt: new Date().toISOString() });
+          }
+          if (!Array.isArray(freshDb.studioGenerations)) freshDb.studioGenerations = [];
+          freshDb.studioGenerations.unshift({ id: randomUUID(), userId: user.id, type: 'faceless_script', topic: body.topic, style: body.style, result, createdAt: new Date().toISOString() });
+          freshDb.studioGenerations = freshDb.studioGenerations.slice(0, 50);
+          saveDb(freshDb);
+        } else {
+          const freshDb = loadDb();
+          if (!Array.isArray(freshDb.studioGenerations)) freshDb.studioGenerations = [];
+          freshDb.studioGenerations.unshift({ id: randomUUID(), userId: user.id, type: 'faceless_script', topic: body.topic, style: body.style, result, createdAt: new Date().toISOString() });
+          freshDb.studioGenerations = freshDb.studioGenerations.slice(0, 50);
+          saveDb(freshDb);
+        }
       }
       return json(res, 200, result);
     }
