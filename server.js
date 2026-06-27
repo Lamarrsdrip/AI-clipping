@@ -6,6 +6,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import Busboy from 'busboy';
+import {
+  GEMINI_COMPAT_BASE, GEMINI_FLASH,
+  geminiUploadFile, geminiDeleteFile, geminiGenerateWithFile, geminiGenerateText, geminiTranscribeFile,
+} from './ai/providers/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -273,14 +277,16 @@ function defaultPlans() {
 
 const API_SETTING_META = [
   ['YOUTUBE_API_KEY', 'YouTube Data API key'],
-  ['LLM_PROVIDER', 'LLM provider'],
-  ['LLM_API_KEY', 'LLM API key'],
-  ['LLM_BASE_URL', 'LLM OpenAI-compatible base URL'],
-  ['LLM_MODEL', 'LLM model'],
-  ['LLM_FALLBACK_PROVIDER', 'Fallback LLM provider'],
-  ['LLM_FALLBACK_API_KEY', 'Fallback LLM API key'],
-  ['LLM_FALLBACK_BASE_URL', 'Fallback LLM base URL'],
-  ['LLM_FALLBACK_MODEL', 'Fallback LLM model'],
+  ['GEMINI_API_KEY', 'Google Gemini API key — free at aistudio.google.com (powers viral detection, hooks, titles, hashtags, QA, and direct video analysis)'],
+  ['AI_PROVIDER', 'Primary AI brain: gemini | openai | groq | xai | emergent (default: gemini when GEMINI_API_KEY is set)'],
+  ['LLM_PROVIDER', 'Fallback LLM provider (openai | groq | xai | together | emergent) — used when Gemini is unavailable'],
+  ['LLM_API_KEY', 'Fallback LLM API key — also used for Whisper transcription if set'],
+  ['LLM_BASE_URL', 'Fallback LLM OpenAI-compatible base URL'],
+  ['LLM_MODEL', 'Fallback LLM model'],
+  ['LLM_FALLBACK_PROVIDER', 'Secondary fallback LLM provider'],
+  ['LLM_FALLBACK_API_KEY', 'Secondary fallback LLM API key'],
+  ['LLM_FALLBACK_BASE_URL', 'Secondary fallback LLM base URL'],
+  ['LLM_FALLBACK_MODEL', 'Secondary fallback LLM model'],
   ['MUAPI_API_KEY', 'Muapi.ai API key (text-to-video, image-to-video, FLUX, Kling, Seedance)'],
   ['HIGGSFIELD_API_KEY', 'Higgsfield AI API key (cinematic video & image generation)'],
   ['ELEVENLABS_API_KEY', 'ElevenLabs API key (AI voiceover / TTS)'],
@@ -1023,6 +1029,171 @@ function unlinkQuiet(filePath) {
   } catch {}
 }
 
+// ─── Gemini transcription fallback (no Whisper key needed) ───────────────────
+async function transcribeWithGemini(db, mediaPath, videoId, geminiKey) {
+  const audioPath = path.join(STORAGE_DIR, 'originals', `${videoId}_audio.mp3`);
+  try {
+    await run(FFMPEG, ['-y', '-i', mediaPath, '-vn', '-ar', '16000', '-ac', '1', '-b:a', '96k', '-t', '600', audioPath],
+      { timeoutMs: 3 * 60 * 1000, label: 'extract audio for gemini transcription' });
+    if (!existsSync(audioPath) || statSync(audioPath).size < 512) return [];
+
+    const text = await geminiTranscribeFile(geminiKey, audioPath, 'audio/mpeg');
+    if (!text || text.length < 10) return [];
+
+    // Split into ~4-second segments (no word timing available from Gemini transcript)
+    const words = text.split(/\s+/).filter(Boolean);
+    const WORDS_PER_SEG = 12;
+    const segs = [];
+    for (let i = 0; i < words.length; i += WORDS_PER_SEG) {
+      const chunk = words.slice(i, i + WORDS_PER_SEG).join(' ');
+      const t = i / Math.max(1, words.length) * (words.length / 2.5);
+      segs.push({ start: t, end: t + WORDS_PER_SEG / 2.5, text: chunk });
+    }
+    importLog('log', 'Gemini transcription succeeded', { videoId, segments: segs.length });
+    return segs;
+  } catch (err) {
+    importLog('warn', 'Gemini transcription error', { videoId, error: String(err.message || err).slice(0, 300) });
+    return [];
+  } finally {
+    unlinkQuiet(audioPath);
+  }
+}
+
+// ─── Gemini video analysis — direct video understanding ──────────────────────
+// Upload the source video to Gemini File API, ask it to identify viral moments
+// with full visual context (expressions, energy, props, speaker changes).
+async function geminiVideoViralAnalysis(geminiKey, mediaPath, video, segments, options = {}) {
+  const desiredCount = Math.max(1, Math.min(10, Number(options.clipCount || 3)));
+  const targetDurations = options.targetDurations || Array(desiredCount).fill(60);
+  const videoDuration = Number(video.durationSeconds || 0);
+  const minGap = Math.max(30, videoDuration * 0.15);
+
+  const transcript = segments.map(s => `[${Math.round(s.start)}-${Math.round(s.end)}s] ${s.text}`).join('\n').slice(0, 20000);
+
+  const prompt = `You are a world-class viral short-form video editor. Analyze this video visually and aurally.
+Watch for: facial expressions, emotional peaks, hand gestures, energy shifts, surprising moments, speaker changes, visual props, viewer retention patterns.
+
+Video title: "${video.title}"
+Total duration: ${videoDuration}s
+Request: ${desiredCount} clips
+Target durations: ${targetDurations.map((d, i) => `Clip ${i + 1}: ${d}s`).join(', ')}
+
+MANDATORY rules:
+- Clips must start at least ${Math.round(minGap)}s apart — cover DIFFERENT sections
+- Each clip must have a strong hook in the FIRST 3 SECONDS
+- Each clip must feel like a COMPLETE story: setup → tension → payoff
+- NEVER cut mid-sentence or before the punchline
+- Avoid filler, intros/outros, or meandering sections
+- Prefer emotional, surprising, funny, controversial, or high-retention moments
+
+Transcript reference (use for precise timestamp matching):
+${transcript}
+
+Return ONLY this JSON (no markdown, no extra keys):
+{"moments":[{"start":number,"end":number,"overallScore":number,"hookStrength":number,"emotionalPunch":number,"voiceEnergy":number,"controversy":number,"usefulness":number,"storytelling":number,"shareability":number,"retentionScore":number,"dropoffRisk":"low|medium|high","reason":"laugh|revelation|shock|emotion|value|argument|reaction|story|inspiration|confession","rationale":"2-3 sentences why a top TikTok editor would cut this exact moment","hooks":{"curiosity":"hook under 96 chars","shock":"hook under 96 chars","value":"hook under 96 chars","story":"hook under 96 chars","controversy":"hook under 96 chars","sales":"hook under 96 chars"},"title":"viral clip title under 60 chars","tiktok_description":"TikTok caption under 300 chars","reels_description":"Instagram Reels caption under 220 chars","hashtags":["#tag1","#tag2","#tag3","#tag4","#tag5","#tag6","#tag7","#tag8"],"thumbnail_idea":"1-sentence thumbnail description","brollKeywords":["keyword1","keyword2","keyword3"],"soundEffectSuggestions":["sfx1","sfx2"],"captionStyle":"hormozi|mrbeast|karaoke|tiktok|viral|neon|fire|hype|reels|podcast|minimal|luxury|finance|bold","framingNotes":"ideal framing for this moment","bestPlatform":"TikTok|Instagram Reels|YouTube Shorts|X|LinkedIn","contentWarning":"none|mild|mature"}]}`;
+
+  const { uri, name: fileName } = await geminiUploadFile(geminiKey, mediaPath, 'video/mp4');
+  try {
+    const { text, usage } = await geminiGenerateWithFile({
+      apiKey: geminiKey, fileUri: uri, mimeType: 'video/mp4', prompt, model: GEMINI_FLASH, temperature: 0.3,
+    });
+    recordAiLog({ provider: 'gemini', model: GEMINI_FLASH, purpose: 'viral video analysis (video upload)', ok: true, ...usage });
+    return text;
+  } finally {
+    geminiDeleteFile(geminiKey, fileName); // async privacy cleanup — don't await
+  }
+}
+
+// ─── Gemini clip metadata generation ─────────────────────────────────────────
+// After viral moments are selected, generate rich per-clip content in one call.
+async function geminiGenerateClipMetadata(db, video, moment) {
+  try {
+    const geminiKey = settingValue(db, 'GEMINI_API_KEY');
+    if (!geminiKey) return {};
+
+    const clipText = (moment.text || moment.hook || '').slice(0, 800);
+    const prompt = `Video: "${video.title}"
+Clip content: "${clipText}"
+Clip reason: ${moment.reason || 'educational'}
+Target platforms: TikTok, Instagram Reels, YouTube Shorts
+
+Generate rich metadata. Return ONLY this JSON:
+{
+  "title": "engaging clip title under 60 chars",
+  "youtube_title": "YouTube Shorts title with SEO, under 70 chars",
+  "tiktok_description": "TikTok caption, conversational, under 2200 chars",
+  "reels_description": "Instagram Reels caption under 220 chars",
+  "shorts_description": "YouTube Shorts description under 500 chars",
+  "x_caption": "X/Twitter caption under 250 chars",
+  "linkedin_caption": "Professional LinkedIn caption under 700 chars",
+  "hashtags_tiktok": ["#tag1","#tag2","#tag3","#tag4","#tag5","#tag6","#tag7","#tag8","#tag9","#tag10"],
+  "hashtags_instagram": ["#tag1","#tag2","#tag3","#tag4","#tag5"],
+  "hashtags_youtube": ["#tag1","#tag2","#tag3"],
+  "seo_keywords": ["keyword1","keyword2","keyword3","keyword4"],
+  "thumbnail_idea": "vivid 1-sentence thumbnail description with text overlay suggestion",
+  "broll_suggestions": ["specific search query 1","specific search query 2","specific search query 3"],
+  "sound_effect_suggestions": ["sound effect 1","sound effect 2"],
+  "cta": "short call-to-action to end the video",
+  "best_posting_time": "day and time recommendation e.g. Tuesday 7pm EST"
+}`;
+
+    const { text, usage } = await geminiGenerateText({
+      apiKey: geminiKey, prompt,
+      systemPrompt: 'You are an expert social media strategist and viral content writer. Return only valid JSON.',
+      model: GEMINI_FLASH, temperature: 0.6,
+    });
+    recordAiLog({ provider: 'gemini', model: GEMINI_FLASH, purpose: 'clip metadata generation', ok: true, ...usage });
+    return extractJsonObject(text) || {};
+  } catch { return {}; }
+}
+
+// ─── Gemini QA review ─────────────────────────────────────────────────────────
+// After export, runs a quick AI quality check on the clip metadata and render report.
+async function geminiQAReview(db, clip, renderReport = {}) {
+  try {
+    const geminiKey = settingValue(db, 'GEMINI_API_KEY');
+    if (!geminiKey) return null;
+
+    const prompt = `You are a QA expert for short-form viral video clips. Review this exported clip and identify any issues.
+
+Clip metadata:
+- Title: ${clip.title || clip.hook || 'Untitled'}
+- Duration: ${Math.round((clip.endTime || 60) - (clip.startTime || 0))}s
+- Caption style: ${clip.captionStyle || 'none'}
+- Platform: ${clip.bestPlatform || 'TikTok'}
+- Clip reason/type: ${clip.reason || 'educational'}
+
+Render report:
+- Dimensions: ${renderReport.width || 1080}x${renderReport.height || 1920}
+- Has audio: ${renderReport.hasAudio !== false}
+- File size KB: ${Math.round((renderReport.fileSizeBytes || 0) / 1024)}
+- Issues detected: ${(renderReport.issues || []).join(', ') || 'none'}
+- Quality scores: framing=${renderReport.scores?.framing || 88}, audio=${renderReport.scores?.audioSync || 95}
+
+Assess the clip quality. Return ONLY this JSON:
+{
+  "qa_pass": true|false,
+  "overall_quality": "excellent|good|acceptable|poor",
+  "issues": ["list of specific issues if any"],
+  "caption_sync_ok": true|false,
+  "framing_ok": true|false,
+  "audio_ok": true|false,
+  "platform_ready": true|false,
+  "corrections": ["specific correction instruction per module if qa_pass is false"],
+  "viral_potential": "high|medium|low",
+  "estimated_watch_rate": "percentage of viewers likely to watch to the end"
+}`;
+
+    const { text, usage } = await geminiGenerateText({
+      apiKey: geminiKey, prompt,
+      systemPrompt: 'You are a strict QA reviewer for short-form video content. Be precise. Return only valid JSON.',
+      model: GEMINI_FLASH, temperature: 0.2,
+    });
+    recordAiLog({ provider: 'gemini', model: GEMINI_FLASH, purpose: 'clip QA review', ok: true, ...usage });
+    return extractJsonObject(text) || null;
+  } catch { return null; }
+}
+
 function cleanupOldSourcesForNewUpload(db) {
   const clipVideoIds = new Set(db.clips.map(clip => clip.videoId).filter(Boolean));
   const keepJobIds = new Set(db.clips.map(clip => clip.jobId).filter(Boolean));
@@ -1291,6 +1462,13 @@ async function downloadVideo(video, jobId = '') {
 async function transcribeAudioWithWhisper(db, mediaPath, videoId) {
   const apiKey = settingValue(db, 'LLM_API_KEY');
   const provider = settingValue(db, 'LLM_PROVIDER') || 'openai';
+  const geminiKey = settingValue(db, 'GEMINI_API_KEY');
+
+  // If no Whisper-compatible key but Gemini is available, use Gemini audio transcription.
+  // Gemini gives segment-level timing; word-level timing will be estimated from segments.
+  if (!apiKey && geminiKey) {
+    return transcribeWithGemini(db, mediaPath, videoId, geminiKey);
+  }
   if (!apiKey) return [];
   const audioPath = path.join(STORAGE_DIR, 'originals', `${videoId}_audio.mp3`);
   try {
@@ -3035,6 +3213,7 @@ async function processVideo(payload) {
           clipCount: targetDurations.length,
           clipLength: targetDurations[0],
           targetDurations,
+          mediaPath,  // gives Gemini direct video access for superior analysis
         })
       : fallbackMomentsForVideo(video, { ...clipOptions, targetDurations });
     const moments = rawMoments.map(m => ({ ...m, brandKitId: m.brandKitId || clipOptions.brandKitId || null }));
@@ -3051,6 +3230,57 @@ async function processVideo(payload) {
       rendered.push(await renderClip(db, video, mediaPath, moments[i], i, job.id));
     }
     if (!rendered.length || rendered.some(clip => !clip.outputPath)) throw new Error('Rendering failed: no clips were saved.');
+
+    // ── Gemini post-render enrichment (async, non-blocking) ──
+    // Generate rich per-clip metadata and run QA for each rendered clip
+    const geminiKey = settingValue(db, 'GEMINI_API_KEY');
+    if (geminiKey) {
+      Promise.all(rendered.map(async (clip, i) => {
+        const moment = moments[i] || {};
+        try {
+          // Rich metadata: titles, descriptions, hashtags, thumbnail ideas
+          const meta = await geminiGenerateClipMetadata(db, video, { ...moment, ...clip });
+          if (meta && Object.keys(meta).length) {
+            const db2 = loadDb();
+            const dbClip = db2.clips.find(c => c.id === clip.id);
+            if (dbClip) {
+              Object.assign(dbClip, {
+                aiTitle:              meta.title              || dbClip.aiTitle,
+                youtubeTitle:         meta.youtube_title      || '',
+                tiktokDescription:    meta.tiktok_description || '',
+                reelsDescription:     meta.reels_description  || '',
+                shortsDescription:    meta.shorts_description || '',
+                xCaption:             meta.x_caption          || '',
+                linkedinCaption:      meta.linkedin_caption   || '',
+                hashtagsTikTok:       meta.hashtags_tiktok    || [],
+                hashtagsInstagram:    meta.hashtags_instagram || [],
+                hashtagsYouTube:      meta.hashtags_youtube   || [],
+                seoKeywords:          meta.seo_keywords       || [],
+                thumbnailIdea:        meta.thumbnail_idea     || dbClip.thumbnailIdea || '',
+                brollSuggestions:     meta.broll_suggestions  || dbClip.brollKeywords || [],
+                soundEffects:         meta.sound_effect_suggestions || [],
+                cta:                  meta.cta                || '',
+                bestPostingTime:      meta.best_posting_time  || '',
+                metaEnrichedAt:       new Date().toISOString(),
+              });
+              saveDb(db2);
+            }
+          }
+        } catch {}
+
+        // QA review
+        try {
+          const renderReport = clip.validation || {};
+          const qa = await geminiQAReview(db, { ...clip, ...moment }, renderReport);
+          if (qa) {
+            const db3 = loadDb();
+            const dbClip = db3.clips.find(c => c.id === clip.id);
+            if (dbClip) { dbClip.geminiQA = qa; saveDb(db3); }
+          }
+        } catch {}
+      })).catch(() => {});
+    }
+
     completeJobWithClips(job.id, video.id, rendered);
     if (downloadedPath) unlinkQuiet(downloadedPath);
     if (video.sourceKind === 'upload') {
@@ -3166,6 +3396,23 @@ function normalizeOpenAiBaseUrl(baseUrl) {
 }
 
 function aiConfig(db, fallback = false) {
+  // When not in fallback mode, check if Gemini is the primary provider
+  if (!fallback) {
+    const aiProvider = settingValue(db, 'AI_PROVIDER');
+    const geminiKey  = settingValue(db, 'GEMINI_API_KEY');
+    // If AI_PROVIDER=gemini (or unset and GEMINI_API_KEY is present), route to Gemini
+    if (geminiKey && (aiProvider === 'gemini' || !aiProvider)) {
+      const model = settingValue(db, 'LLM_MODEL') || GEMINI_FLASH;
+      return {
+        provider:      'gemini',
+        apiKey:        geminiKey,
+        baseUrl:       `${GEMINI_COMPAT_BASE}/chat/completions`,
+        model:         model.startsWith('gemini') ? model : GEMINI_FLASH,
+        customBaseUrl: false,
+      };
+    }
+  }
+
   const prefix = fallback ? 'LLM_FALLBACK_' : 'LLM_';
   const provider = settingValue(db, `${prefix}PROVIDER`) || (fallback ? '' : 'xai');
   const apiKey = settingValue(db, `${prefix}API_KEY`);
@@ -3176,16 +3423,22 @@ function aiConfig(db, fallback = false) {
     openai:   'https://api.openai.com/v1',
     groq:     'https://api.groq.com/openai/v1',
     together: 'https://api.together.xyz/v1',
-    emergent: 'https://api.emergent.sh/v1'
+    emergent: 'https://api.emergent.sh/v1',
+    gemini:   GEMINI_COMPAT_BASE,
   };
   const providerModels = {
     xai: 'grok-3-mini', grok: 'grok-3-mini',
     openai: 'gpt-4o-mini', groq: 'llama-3.3-70b-versatile',
-    together: 'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo'
+    together: 'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo',
+    gemini: GEMINI_FLASH,
   };
+  // For the gemini provider in LLM_PROVIDER slot, use GEMINI_API_KEY
+  const resolvedApiKey = (provider === 'gemini' && !apiKey)
+    ? settingValue(db, 'GEMINI_API_KEY')
+    : apiKey;
   const baseUrl = customBaseUrl ? normalizeOpenAiBaseUrl(customBaseUrl) : (providerDefaults[provider] || '');
   const model = settingValue(db, `${prefix}MODEL`) || providerModels[provider] || 'grok-3-mini';
-  return { provider, apiKey, baseUrl, model, customBaseUrl: Boolean(customBaseUrl) };
+  return { provider, apiKey: resolvedApiKey, baseUrl, model, customBaseUrl: Boolean(customBaseUrl) };
 }
 
 // ── Higgsfield / Muapi AI media generation ────────────────────────
@@ -3489,7 +3742,25 @@ async function detectViralMoments(db, video, segments, options = {}) {
   const fallbackMoments = scoreMoments(segments, videoDuration)
     .slice(0, desiredCount)
     .map(m => ({ ...m, framingMode }));
-  const transcript = segments.map(seg => `[${Math.round(seg.start)}-${Math.round(seg.end)}s] ${seg.text}`).join('\n').slice(0, 18000);
+
+  // ── Gemini video analysis path (superior — Gemini watches the actual video) ──
+  const geminiKey  = settingValue(db, 'GEMINI_API_KEY');
+  const mediaPath  = options.mediaPath;  // set by processVideo when available
+  const useVideoAI = geminiKey && mediaPath && existsSync(mediaPath) && videoDuration < 3600;
+  if (useVideoAI) {
+    try {
+      const rawText = await geminiVideoViralAnalysis(geminiKey, mediaPath, video, segments, { ...options, clipCount: desiredCount, targetDurations });
+      const parsed = extractJsonObject(rawText);
+      if (parsed?.moments?.length) {
+        return postProcessMoments(parsed.moments, { desiredCount, desiredLength, targetDurations, framingMode, videoDuration, minGap, fallbackMoments, segments, video, options, source: 'gemini-video' });
+      }
+    } catch (err) {
+      importLog('warn', 'Gemini video analysis failed — falling back to transcript analysis', { error: String(err.message || err).slice(0, 300) });
+    }
+  }
+
+  // ── Transcript text analysis (works with Gemini text OR other LLM providers) ──
+  const transcript = segments.map(seg => `[${Math.round(seg.start)}-${Math.round(seg.end)}s] ${seg.text}`).join('\n').slice(0, 20000);
   try {
     const result = await aiChat(db, {
       purpose: 'viral moment detection',
@@ -3540,80 +3811,94 @@ Return exactly this JSON (no extra fields, no markdown):
       ]
     });
     const parsed = extractJsonObject(result.content);
-    const moments = (parsed?.moments || [])
-      .map(item => {
-        const start = Math.max(0, Number(item.start || 0));
-        const end = Math.min(Number(video.durationSeconds || start + desiredLength), Number(item.end || start + desiredLength));
-        const text = segments.filter(seg => seg.end >= start && seg.start <= end).map(seg => seg.text).join(' ');
-        const hooks = item.hooks || {};
-        const primaryHook = hooks.curiosity || hooks.shock || hooks.value || buildCaptionText(text);
-        // Hard-enforce minimum 60s: if AI returned a short clip, push end out
-        const minEnd = Math.min(Number(video.durationSeconds || end), start + desiredLength);
-        const clampedEnd = end - start < 55 ? minEnd : end;
-        return {
-          start,
-          end: clampedEnd,
-          score: Math.max(1, Math.min(100, Number(item.overallScore || item.score || 75))),
-          hookStrength:   Number(item.hookStrength || 7),
-          emotionalPunch: Number(item.emotionalPunch || 7),
-          voiceEnergy:    Number(item.voiceEnergy || 7),
-          controversy:    Number(item.controversy || 5),
-          usefulness:     Number(item.usefulness || 7),
-          storytelling:   Number(item.storytelling || 6),
-          shareability:   Number(item.shareability || 7),
-          reason: item.reason || 'educational',
-          hook: primaryHook.slice(0, 96),
-          hooks: {
-            curiosity: (hooks.curiosity || primaryHook).slice(0, 96),
-            shock: (hooks.shock || primaryHook).slice(0, 96),
-            value: (hooks.value || primaryHook).slice(0, 96),
-            story: (hooks.story || primaryHook).slice(0, 96),
-            controversy: (hooks.controversy || primaryHook).slice(0, 96),
-            sales: (hooks.sales || primaryHook).slice(0, 96)
-          },
-          brollKeywords: Array.isArray(item.brollKeywords) ? item.brollKeywords.slice(0, 8) : [],
-          bestPlatform: item.bestPlatform || 'TikTok',
-          captionStyle: item.captionStyle || 'viral',
-          framingMode: options.framingMode || 'dynamic',
-          brandKitId: options.brandKitId || null,
-          rationale: item.rationale || 'AI-selected viral moment.',
-          retentionScore: Number(item.retentionScore || 7),
-          dropoffRisk: item.dropoffRisk || 'medium',
-          contentWarning: item.contentWarning || 'none',
-          text: text || primaryHook || video.title
-        };
-      })
-      .filter(item => item.end > item.start && item.end - item.start >= 55 && item.end - item.start <= 610);
-
-    // Enforce temporal diversity: pick top-scored non-overlapping clips
-    const diverse = [];
-    for (const m of moments.sort((a, b) => b.score - a.score)) {
-      if (diverse.every(d => Math.abs(d.start - m.start) >= minGap)) {
-        diverse.push(m);
-        if (diverse.length >= desiredCount) break;
-      }
+    if (parsed?.moments?.length) {
+      return postProcessMoments(parsed.moments, { desiredCount, desiredLength, targetDurations, framingMode, videoDuration, minGap, fallbackMoments, segments, video, options, source: 'text-ai' });
     }
-    // Fill remaining slots from scoreMoments fallback if AI didn't return enough diverse clips
-    for (const fb of fallbackMoments) {
-      if (diverse.length >= desiredCount) break;
-      if (diverse.every(d => Math.abs(d.start - fb.start) >= minGap)) {
-        diverse.push({ ...fb });
-      }
-    }
-
-    // Sort chronologically, then assign target durations and ensure minimum length
-    const sorted = diverse.sort((a, b) => a.start - b.start);
-    sorted.forEach((m, i) => {
-      const targetLen = targetDurations[i] || desiredLength;
-      if (m.end - m.start < targetLen - 5) {
-        m.end = Math.min(videoDuration || m.start + targetLen, m.start + targetLen);
-      }
-      m.framingMode = framingMode;
-    });
-    return sorted.length ? sorted : fallbackMoments;
+    return fallbackMoments;
   } catch {
     return fallbackMoments;
   }
+}
+
+// ── Shared moment post-processor — used by both Gemini video + text paths ────
+function postProcessMoments(rawItems, ctx) {
+  const { desiredCount, desiredLength, targetDurations, framingMode, videoDuration,
+          minGap, fallbackMoments, segments, video, options } = ctx;
+
+  const moments = rawItems
+    .map(item => {
+      const start = Math.max(0, Number(item.start || 0));
+      const end = Math.min(Number(videoDuration || start + desiredLength), Number(item.end || start + desiredLength));
+      const text = segments.filter(seg => seg.end >= start && seg.start <= end).map(seg => seg.text).join(' ');
+      const hooks = item.hooks || {};
+      const primaryHook = hooks.curiosity || hooks.shock || hooks.value || buildCaptionText(text);
+      const minEnd = Math.min(Number(videoDuration || end), start + desiredLength);
+      const clampedEnd = end - start < 55 ? minEnd : end;
+      return {
+        start,
+        end: clampedEnd,
+        score: Math.max(1, Math.min(100, Number(item.overallScore || item.viral_score || item.score || 75))),
+        hookStrength:   Number(item.hookStrength || item.hook_strength || 7),
+        emotionalPunch: Number(item.emotionalPunch || item.emotional_punch || 7),
+        voiceEnergy:    Number(item.voiceEnergy || item.voice_energy || 7),
+        controversy:    Number(item.controversy || 5),
+        usefulness:     Number(item.usefulness || 7),
+        storytelling:   Number(item.storytelling || 6),
+        shareability:   Number(item.shareability || 7),
+        reason: item.reason || 'educational',
+        hook: primaryHook.slice(0, 96),
+        hooks: {
+          curiosity:   (hooks.curiosity   || primaryHook).slice(0, 96),
+          shock:       (hooks.shock       || primaryHook).slice(0, 96),
+          value:       (hooks.value       || primaryHook).slice(0, 96),
+          story:       (hooks.story       || primaryHook).slice(0, 96),
+          controversy: (hooks.controversy || primaryHook).slice(0, 96),
+          sales:       (hooks.sales       || primaryHook).slice(0, 96),
+        },
+        brollKeywords:          Array.isArray(item.brollKeywords)            ? item.brollKeywords.slice(0, 8)            : (Array.isArray(item.broll_suggestions) ? item.broll_suggestions.slice(0, 8) : []),
+        soundEffectSuggestions: Array.isArray(item.soundEffectSuggestions)   ? item.soundEffectSuggestions.slice(0, 5)   : (Array.isArray(item.sound_effect_suggestions) ? item.sound_effect_suggestions.slice(0, 5) : []),
+        bestPlatform:    item.bestPlatform    || item.best_platform    || 'TikTok',
+        captionStyle:    item.captionStyle    || item.caption_style    || 'viral',
+        framingMode:     options.framingMode  || 'dynamic',
+        brandKitId:      options.brandKitId   || null,
+        rationale:       item.rationale || 'AI-selected viral moment.',
+        retentionScore:  Number(item.retentionScore || item.retention_score || 7),
+        dropoffRisk:     item.dropoffRisk     || item.dropoff_risk     || 'medium',
+        contentWarning:  item.contentWarning  || item.content_warning  || 'none',
+        // Rich Gemini-generated metadata (populated when using video analysis)
+        title:                item.title                || '',
+        tiktokDescription:    item.tiktok_description  || '',
+        reelsDescription:     item.reels_description   || '',
+        hashtags:             Array.isArray(item.hashtags) ? item.hashtags : [],
+        thumbnailIdea:        item.thumbnail_idea || item.thumbnailIdea || '',
+        framingNotes:         item.framingNotes   || item.framing_notes || '',
+        text: text || primaryHook || video.title,
+      };
+    })
+    .filter(item => item.end > item.start && item.end - item.start >= 55 && item.end - item.start <= 610);
+
+  // Enforce temporal diversity
+  const diverse = [];
+  for (const m of moments.sort((a, b) => b.score - a.score)) {
+    if (diverse.every(d => Math.abs(d.start - m.start) >= minGap)) {
+      diverse.push(m);
+      if (diverse.length >= desiredCount) break;
+    }
+  }
+  // Fill remaining slots from keyword-score fallback
+  for (const fb of fallbackMoments) {
+    if (diverse.length >= desiredCount) break;
+    if (diverse.every(d => Math.abs(d.start - fb.start) >= minGap)) diverse.push({ ...fb });
+  }
+
+  // Chronological sort + assign target durations
+  const sorted = diverse.sort((a, b) => a.start - b.start);
+  sorted.forEach((m, i) => {
+    const targetLen = targetDurations[i] || desiredLength;
+    if (m.end - m.start < targetLen - 5) m.end = Math.min(videoDuration || m.start + targetLen, m.start + targetLen);
+    m.framingMode = framingMode;
+  });
+  return sorted.length ? sorted : fallbackMoments;
 }
 
 async function generateMultipleHooks(db, video, moment) {
@@ -3858,6 +4143,8 @@ async function handleApi(req, res, pathname) {
         ffmpegError: ffmpegStatus.error || '',
         youtubeApi: settingReady(db, 'YOUTUBE_API_KEY'),
         llm: settingReady(db, 'LLM_API_KEY'),
+        gemini: settingReady(db, 'GEMINI_API_KEY'),
+        aiProvider: settingValue(db, 'AI_PROVIDER') || (settingReady(db, 'GEMINI_API_KEY') ? 'gemini' : (settingReady(db, 'LLM_API_KEY') ? settingValue(db, 'LLM_PROVIDER') || 'openai' : 'none')),
         postgres: settingReady(db, 'DATABASE_URL'),
         memory: memorySnapshot(),
         maxUploadMb: Math.round(MAX_UPLOAD_BYTES / 1024 / 1024),
@@ -3898,10 +4185,20 @@ async function handleApi(req, res, pathname) {
             action: tools.ffmpeg ? tools.ffmpegVersion : `Install FFmpeg on Render. Startup error: ${tools.ffmpegError}`
           },
           {
+            id: 'gemini',
+            label: 'Gemini AI (primary brain)',
+            ready: tools.gemini,
+            action: tools.gemini
+              ? `Active — provider: ${tools.aiProvider} — powers viral detection, hooks, titles, hashtags, QA, and direct video understanding`
+              : 'Get a free API key at aistudio.google.com — set GEMINI_API_KEY in Settings. Enables video-native AI analysis (Gemini watches the video, not just the transcript).'
+          },
+          {
             id: 'llm',
-            label: 'AI provider',
+            label: 'Fallback LLM (Whisper + backup chat)',
             ready: tools.llm,
-            action: 'Set LLM_PROVIDER, LLM_API_KEY, and LLM_MODEL. Emergent uses https://api.emergent.sh/v1 by default.'
+            action: tools.llm
+              ? 'Active — used for Whisper transcription and fallback chat when Gemini is unavailable.'
+              : 'Optional. Set LLM_PROVIDER + LLM_API_KEY for Whisper word-level transcription (better caption timing) and chat fallback.'
           },
           {
             id: 'postgres',
@@ -4737,6 +5034,33 @@ async function handleApi(req, res, pathname) {
       requireAdmin(req, db);
       const result = await testAiConnection(db);
       return json(res, 200, result);
+    }
+    // ── Gemini-specific test endpoint ──
+    if (pathname === '/api/admin/gemini-test' && req.method === 'POST') {
+      const db = loadDb();
+      requireAdmin(req, db);
+      const body = await readJson(req).catch(() => ({}));
+      const apiKey = body.apiKey || settingValue(db, 'GEMINI_API_KEY');
+      if (!apiKey) throw new Error('GEMINI_API_KEY is not configured. Set it in Admin → Settings.');
+      try {
+        const { text, usage } = await geminiGenerateText({
+          apiKey,
+          prompt: 'Reply with exactly: {"status":"ok","message":"Gemini is connected and working","model":"gemini-2.0-flash"}',
+          systemPrompt: 'You are a connectivity test. Return only valid JSON.',
+          model: GEMINI_FLASH,
+          temperature: 0,
+        });
+        const parsed = extractJsonObject(text) || { status: 'ok', raw: text.slice(0, 200) };
+        recordAiLog({ provider: 'gemini', model: GEMINI_FLASH, purpose: 'gemini connection test', ok: true, ...usage });
+        return json(res, 200, {
+          ok: true, provider: 'gemini', model: GEMINI_FLASH,
+          usage, reply: parsed,
+          compatBase: GEMINI_COMPAT_BASE,
+          features: ['viral-detection', 'video-analysis', 'hooks', 'titles', 'hashtags', 'thumbnail-ideas', 'broll-suggestions', 'qa-review', 'transcription-fallback'],
+        });
+      } catch (err) {
+        return json(res, 200, { ok: false, provider: 'gemini', error: err.message });
+      }
     }
     if (pathname === '/api/admin/payments') {
       const db = loadDb();

@@ -2544,12 +2544,52 @@ function renderAdmin() {
         <div class="stat-card"><div class="stat-num">${failed.length}</div><div class="stat-label">Failed</div></div>
       </div>
 
-      <!-- ── LLM / Grok config ── -->
+      <!-- ── Gemini AI (Primary Brain) ── -->
+      <section class="panel" style="margin-top:16px;border:2px solid var(--accent)">
+        <div class="panel-head" style="margin-bottom:16px">
+          <div>
+            <span class="eyebrow" style="color:var(--accent)">PRIMARY AI BRAIN</span>
+            <h2>Google Gemini <span style="font-size:.7em;font-weight:400;color:#7be57b">FREE</span></h2>
+            <p class="muted" style="margin:4px 0 0;font-size:.82rem">Powers: viral clip detection · direct video understanding · hooks · titles · hashtags · thumbnail ideas · B-roll · sound effects · QA review · transcription fallback</p>
+          </div>
+          <div id="geminiStatusBadge" style="flex-shrink:0">${state.tools?.gemini ? '<span style="color:#7be57b;font-size:.85rem">● Connected</span>' : '<span style="color:#f87272;font-size:.85rem">○ Not configured</span>'}</div>
+        </div>
+        <form id="geminiConfigForm" class="stack" style="max-width:540px">
+          <div>
+            <label>Gemini API Key <span class="muted">— free at aistudio.google.com/app/apikey</span></label>
+            <div style="display:flex;gap:8px">
+              <input id="geminiApiKey" name="GEMINI_API_KEY" type="password" placeholder="AIza..." autocomplete="off" style="flex:1">
+              <button type="button" id="geminiReveal" class="ghost" style="flex-shrink:0;padding:10px 14px">Show</button>
+            </div>
+            <p class="muted" style="margin-top:4px;font-size:.78rem">Free tier: 15 req/min · 1,500 req/day · No credit card needed · Gemini 2.0 Flash model</p>
+          </div>
+          <div class="option-row">
+            <label>AI Model</label>
+            <select id="geminiModel" name="LLM_MODEL">
+              <option value="gemini-2.0-flash">Gemini 2.0 Flash (recommended — fastest, free)</option>
+              <option value="gemini-2.5-flash">Gemini 2.5 Flash (best reasoning, free)</option>
+              <option value="gemini-2.5-pro">Gemini 2.5 Pro (most capable, paid)</option>
+            </select>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button type="button" id="geminiTestBtn" class="ghost">Test Gemini connection</button>
+            <button type="submit">Save &amp; activate Gemini</button>
+          </div>
+          <div id="geminiTestResult"></div>
+        </form>
+        <div style="margin-top:16px;padding:12px 16px;background:var(--bg2);border-radius:8px;font-size:.8rem;color:var(--fg2)">
+          <b>Privacy note:</b> When GEMINI_API_KEY is set, uploaded videos are sent to Google's File API for analysis and automatically deleted after processing.
+          Sensitive content should use transcript-only mode (set AI_PROVIDER=openai with LLM_API_KEY instead).
+        </div>
+      </section>
+
+      <!-- ── LLM / Fallback config ── -->
       <section class="panel" style="margin-top:16px">
         <div class="panel-head" style="margin-bottom:16px">
           <div>
-            <span class="eyebrow">AI Brain</span>
-            <h2>Grok / LLM Configuration</h2>
+            <span class="eyebrow">FALLBACK / WHISPER</span>
+            <h2>LLM Configuration</h2>
+            <p class="muted" style="margin:4px 0 0;font-size:.82rem">Used for Whisper word-level transcription (better caption timing) and as chat fallback when Gemini is unavailable.</p>
           </div>
           <div id="llmVerifyBadge"></div>
         </div>
@@ -2557,8 +2597,9 @@ function renderAdmin() {
           <div class="option-row">
             <label>Provider</label>
             <select id="llmProvider" name="LLM_PROVIDER">
-              <option value="xai">xAI — Grok (recommended)</option>
-              <option value="openai">OpenAI — GPT-4o-mini</option>
+              <option value="gemini">Google — Gemini (via OpenAI-compat layer)</option>
+              <option value="xai">xAI — Grok</option>
+              <option value="openai">OpenAI — GPT-4o-mini (+ Whisper transcription)</option>
               <option value="groq">Groq — Llama 3.3 70B (free tier)</option>
               <option value="together">Together AI — Llama 3.1 70B</option>
             </select>
@@ -2567,9 +2608,9 @@ function renderAdmin() {
             <label>API Key</label>
             <div style="display:flex;gap:8px">
               <input id="llmApiKey" name="LLM_API_KEY" type="password" placeholder="Paste your API key here" autocomplete="off" style="flex:1">
-              <button type="button" id="llmReveal" class="ghost" style="flex-shrink:0;padding:10px 14px">👁</button>
+              <button type="button" id="llmReveal" class="ghost" style="flex-shrink:0;padding:10px 14px">Show</button>
             </div>
-            <p class="muted" id="llmKeyHint" style="margin-top:6px;font-size:.78rem">xAI Grok: get key at <b>console.x.ai</b> → free tier available</p>
+            <p class="muted" id="llmKeyHint" style="margin-top:6px;font-size:.78rem">OpenAI key enables Whisper word-level timestamps for perfect caption sync</p>
           </div>
           <div>
             <label>Model <span class="muted">(auto-filled per provider)</span></label>
@@ -2687,7 +2728,60 @@ function renderAdmin() {
   $('#llmProvider')?.addEventListener('change', applyProviderHint);
   applyProviderHint();
 
-  // Reveal toggle
+  // ── Gemini handlers ───────────────────────────────────────────────────────
+  $('#geminiReveal')?.addEventListener('click', () => {
+    const inp=$('#geminiApiKey');
+    inp.type=inp.type==='password'?'text':'password';
+    $('#geminiReveal').textContent=inp.type==='password'?'Show':'Hide';
+  });
+
+  $('#geminiTestBtn')?.addEventListener('click', async () => {
+    const btn=$('#geminiTestBtn');
+    const res=$('#geminiTestResult');
+    const badge=$('#geminiStatusBadge');
+    btn.disabled=true; btn.textContent='Testing Gemini…';
+    res.innerHTML='';
+    try {
+      const data=await api('/api/admin/gemini-test',{method:'POST',body:JSON.stringify({
+        apiKey:$('#geminiApiKey')?.value||undefined
+      })});
+      if (data.ok) {
+        const features=(data.features||[]).join(' · ');
+        res.innerHTML=`<div class="verify-ok" style="margin-top:8px">
+          <b>Gemini connected</b> — model: ${esc(data.model)}<br>
+          <span style="font-size:.78rem;color:var(--fg2)">Features: ${esc(features)}</span>
+        </div>`;
+        badge.innerHTML='<span style="color:#7be57b;font-size:.85rem">● Connected</span>';
+      } else {
+        res.innerHTML=`<div class="verify-fail" style="margin-top:8px">✗ ${esc(data.error)}</div>`;
+        badge.innerHTML='<span style="color:#f87272;font-size:.85rem">○ Failed</span>';
+      }
+    } catch(e) {
+      res.innerHTML=`<div class="verify-fail" style="margin-top:8px">✗ ${esc(e.message)}</div>`;
+      badge.innerHTML='<span style="color:#f87272;font-size:.85rem">○ Error</span>';
+    }
+    btn.disabled=false; btn.textContent='Test Gemini connection';
+  });
+
+  $('#geminiConfigForm')?.addEventListener('submit', async e => {
+    e.preventDefault();
+    const key=$('#geminiApiKey')?.value||'';
+    const model=$('#geminiModel')?.value||'gemini-2.0-flash';
+    const settings={
+      GEMINI_API_KEY:key,
+      AI_PROVIDER:key?'gemini':'',
+      LLM_MODEL:model,
+    };
+    try {
+      await api('/api/admin/settings',{method:'PATCH',body:JSON.stringify({settings})});
+      state.studioStatus=null;
+      const btn=e.target.querySelector('button[type=submit]');
+      btn.textContent='Saved ✓ — Gemini is now the primary AI brain';
+      setTimeout(()=>{ btn.textContent='Save & activate Gemini'; renderAdmin(); },2500);
+    } catch(err) { alert(err.message); }
+  });
+
+  // ── LLM fallback handlers ─────────────────────────────────────────────────
   $('#llmReveal')?.addEventListener('click', () => {
     const inp=$('#llmApiKey');
     inp.type=inp.type==='password'?'text':'password';
