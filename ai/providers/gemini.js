@@ -31,22 +31,39 @@ export const GEMINI_FLASH = GEMINI_MODEL_CASCADE[0];
 export const GEMINI_FLASH_THINK = 'gemini-2.5-flash';
 export const GEMINI_PRO         = 'gemini-2.5-pro';
 
-// ─── 429 quota error parsing ──────────────────────────────────────────────────
+// ─── Retryable error parsing ──────────────────────────────────────────────────
+
 export function parseGemini429(err) {
   const msg = String(err?.message || err || '');
   if (!msg.includes('429') && !msg.includes('quota')) return null;
 
-  // Extract retry delay — e.g. "retryDelay":"21s" or "Please retry in 21.3s"
-  let retryMs = 30_000; // default 30s
+  let retryMs = 30_000;
   const delayMatch = msg.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/) ||
                      msg.match(/retry in (\d+(?:\.\d+)?)s/i);
-  if (delayMatch) retryMs = Math.ceil(parseFloat(delayMatch[1])) * 1000 + 2000; // +2s buffer
+  if (delayMatch) retryMs = Math.ceil(parseFloat(delayMatch[1])) * 1000 + 2000;
 
-  // Extract which model hit the quota
   const modelMatch = msg.match(/"model"\s*:\s*"([^"]+)"/);
   const model = modelMatch?.[1] || 'unknown';
 
   return { isQuota: true, retryMs, model, raw: msg.slice(0, 600) };
+}
+
+// Returns true for 503 / UNAVAILABLE — transient overload, safe to retry on next model
+export function isGemini503(err) {
+  const msg = String(err?.message || err || '');
+  return msg.includes('503') || msg.includes('UNAVAILABLE') || msg.includes('high demand') || msg.includes('overloaded');
+}
+
+// Human-readable error for the UI
+export function geminiUserMessage(err) {
+  if (parseGemini429(err)) {
+    const q = parseGemini429(err);
+    return `Gemini quota exceeded — retry after ${Math.ceil(q.retryMs / 1000)}s. All free-tier models are temporarily exhausted.`;
+  }
+  if (isGemini503(err)) {
+    return 'Gemini is experiencing high demand right now. Tried all available models. Please wait 30–60 seconds and try again.';
+  }
+  return String(err?.message || err || 'Gemini request failed');
 }
 
 // ─── Gemini generate with automatic model fallback ───────────────────────────
@@ -150,18 +167,17 @@ export async function geminiGenerateWithFile({ apiKey, fileUri, mimeType = 'vide
         },
       };
     } catch (err) {
-      const q429 = parseGemini429(err);
-      if (q429) {
-        console.warn(`[Gemini] video analysis quota exceeded on ${m} — trying next model`);
+      if (parseGemini429(err) || isGemini503(err)) {
+        const label = isGemini503(err) ? '503 overloaded' : 'quota exceeded';
+        console.warn(`[Gemini] video analysis ${label} on ${m} — trying next model`);
         lastErr = err;
-        await new Promise(r => setTimeout(r, 1500));
+        await new Promise(r => setTimeout(r, 2000));
         continue;
       }
       throw err;
     }
   }
-  const q = parseGemini429(lastErr);
-  throw Object.assign(new Error(`Gemini quota exceeded on all models. Retry after ${Math.ceil((q?.retryMs || 30000) / 1000)}s.`), { isGeminiQuota: true, retryMs: q?.retryMs || 30000 });
+  throw Object.assign(new Error(geminiUserMessage(lastErr)), { isGeminiRetryable: true });
 }
 
 // ─── Text generation with model cascade ──────────────────────────────────────
@@ -193,18 +209,17 @@ export async function geminiGenerateText({ apiKey, prompt, systemPrompt = '', mo
         },
       };
     } catch (err) {
-      const q429 = parseGemini429(err);
-      if (q429) {
-        console.warn(`[Gemini] text quota exceeded on ${m} (retry: ${q429.retryMs}ms) — trying next`);
+      if (parseGemini429(err) || isGemini503(err)) {
+        const label = isGemini503(err) ? '503 overloaded' : `quota (retry ${parseGemini429(err)?.retryMs}ms)`;
+        console.warn(`[Gemini] text ${label} on ${m} — trying next`);
         lastErr = err;
-        await new Promise(r => setTimeout(r, 1500));
+        await new Promise(r => setTimeout(r, 2000));
         continue;
       }
       throw err;
     }
   }
-  const q = parseGemini429(lastErr);
-  throw Object.assign(new Error(`Gemini quota exceeded. Retry after ${Math.ceil((q?.retryMs || 30000) / 1000)}s.`), { isGeminiQuota: true, retryMs: q?.retryMs || 30000 });
+  throw Object.assign(new Error(geminiUserMessage(lastErr)), { isGeminiRetryable: true });
 }
 
 // ─── Transcription fallback ───────────────────────────────────────────────────

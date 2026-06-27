@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 import Busboy from 'busboy';
 import {
   GEMINI_COMPAT_BASE, GEMINI_FLASH, GEMINI_MODEL_CASCADE,
-  parseGemini429,
+  parseGemini429, isGemini503, geminiUserMessage,
   geminiUploadFile, geminiDeleteFile, geminiGenerateWithFile, geminiGenerateText, geminiTranscribeFile,
 } from './ai/providers/index.js';
 
@@ -3716,7 +3716,17 @@ async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat
         });
         clearTimeout(timeout);
         const text = await response.text();
-        if (!response.ok) throw new Error(`${response.status} ${text.slice(0, 500)}`);
+        if (!response.ok) {
+          const errMsg = `${response.status} ${text.slice(0, 600)}`;
+          // 503 from Gemini = overloaded, retryable — log and continue to next attempt
+          if (response.status === 503 || (response.status === 429)) {
+            console.warn(`[aiChat] ${config.provider}/${config.model} ${response.status} — retrying`);
+            recordAiLog({ ...config, baseUrl: endpoint, purpose, ok: false, error: errMsg.slice(0, 200) });
+            lastError = new Error(errMsg);
+            continue;
+          }
+          throw new Error(errMsg);
+        }
         const data = JSON.parse(text);
         const content = data.choices?.[0]?.message?.content || '';
         recordAiLog({
@@ -3732,9 +3742,14 @@ async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat
       } catch (error) {
         clearTimeout(timeout);
         lastError = error;
-        recordAiLog({ ...config, baseUrl: endpoint, purpose, ok: false, error: error.name === 'AbortError' ? `AI request timed out after ${Math.round(AI_TIMEOUT_MS / 1000)}s` : error.message });
+        recordAiLog({ ...config, baseUrl: endpoint, purpose, ok: false, error: error.name === 'AbortError' ? `AI request timed out after ${Math.round(AI_TIMEOUT_MS / 1000)}s` : error.message.slice(0, 200) });
       }
     }
+  }
+  // Produce a friendly error for Gemini overload / quota
+  const finalMsg = lastError?.message || 'LLM request failed.';
+  if (parseGemini429(lastError) || isGemini503(lastError) || finalMsg.includes('503') || finalMsg.includes('UNAVAILABLE') || finalMsg.includes('high demand')) {
+    throw new Error(geminiUserMessage(lastError));
   }
   throw lastError || new Error('LLM request failed.');
 }

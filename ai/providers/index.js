@@ -4,6 +4,6 @@
  */
 export {
   GEMINI_COMPAT_BASE, GEMINI_FLASH, GEMINI_MODEL_CASCADE,
-  parseGemini429,
+  parseGemini429, isGemini503, geminiUserMessage,
   geminiUploadFile, geminiDeleteFile, geminiGenerateWithFile, geminiGenerateText, geminiTranscribeFile,
 } from './gemini.js';
