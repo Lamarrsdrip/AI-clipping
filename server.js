@@ -3681,12 +3681,22 @@ async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat
   const primaryConfig = aiConfig(db, false);
   const fallbackConfig = aiConfig(db, true);
 
+  // Models actually available on Gemini's OpenAI-compat endpoint (verified).
+  // 1.5-flash and 1.5-flash-8b return 404 on the compat endpoint — native SDK only.
+  const GEMINI_COMPAT_MODELS = [
+    'gemini-2.5-flash-lite',
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-2.0-flash-lite',
+  ];
+
   // When primary provider is Gemini, build a model cascade over the compat endpoint.
   // Each model gets its own attempt so 503/429 on one rolls to the next.
   const attempts = [];
   if (primaryConfig.provider === 'gemini' && primaryConfig.apiKey) {
-    const configuredModel = primaryConfig.model || GEMINI_MODEL_CASCADE[0];
-    const cascade = [configuredModel, ...GEMINI_MODEL_CASCADE.filter(m => m !== configuredModel)];
+    const configuredModel = primaryConfig.model || GEMINI_COMPAT_MODELS[0];
+    const compatModel = GEMINI_COMPAT_MODELS.includes(configuredModel) ? configuredModel : GEMINI_COMPAT_MODELS[0];
+    const cascade = [compatModel, ...GEMINI_COMPAT_MODELS.filter(m => m !== compatModel)];
     for (const model of cascade) {
       attempts.push({ ...primaryConfig, model });
     }
@@ -3741,8 +3751,10 @@ async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat
         const text = await response.text();
         if (!response.ok) {
           const errMsg = `${response.status} ${text.slice(0, 600)}`;
-          if (response.status === 503 || response.status === 429) {
-            console.warn(`[aiChat] ${config.provider}/${config.model} ${response.status} — trying next model`);
+          const isModelNotFound = response.status === 404 && text.includes('not found');
+          if (response.status === 503 || response.status === 429 || isModelNotFound) {
+            const label = isModelNotFound ? '404 model-not-found' : response.status;
+            console.warn(`[aiChat] ${config.provider}/${config.model} ${label} — trying next model`);
             recordAiLog({ ...config, baseUrl: endpoint, purpose, ok: false, error: errMsg.slice(0, 200) });
             lastError = new Error(errMsg);
             break; // move to next model immediately — no delay
@@ -3772,9 +3784,9 @@ async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat
       }
     }
   }
-  // Convert Gemini overload / quota errors to friendly messages
+  // Convert Gemini overload / quota / cascade errors to friendly messages
   const finalMsg = lastError?.message || '';
-  if (finalMsg.includes('503') || finalMsg.includes('UNAVAILABLE') || finalMsg.includes('high demand') || finalMsg.includes('overloaded') || parseGemini429(lastError)) {
+  if (finalMsg.includes('503') || finalMsg.includes('UNAVAILABLE') || finalMsg.includes('high demand') || finalMsg.includes('overloaded') || finalMsg.includes('Please try again') || parseGemini429(lastError)) {
     throw new Error(geminiUserMessage(lastError));
   }
   throw lastError || new Error('AI request failed — no provider responded successfully.');
