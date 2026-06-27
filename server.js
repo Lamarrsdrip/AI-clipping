@@ -2431,7 +2431,7 @@ function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920,
   // bgFilterDynamic(xExpr, wExpr): FFmpeg filter for per-frame evaluated crop.
   // Used in non-EDL path where crop position changes every frame.
   const bgFilterDynamic = (xExpr, wExpr) =>
-    `crop=w='${wExpr}':h=${cropH}:x='${xExpr}':y=0:eval=frame,` +
+    `crop=w='${wExpr}':h=${cropH}:x='${xExpr}':y=0,` +
     `scale=${outW}:${outH}:force_original_aspect_ratio=increase:flags=lanczos,` +
     `crop=${outW}:${outH},` +
     `gblur=sigma=55,` +
@@ -2754,7 +2754,22 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   // ── Stage 4: Silence + filler removal (EDL) ──────────────────
   const silences = await detectSilences(mediaPath, effectiveStart, moment.end);
   const edlSegs  = buildEDL(wordTimings, silences, moment.start, moment.end, blackOffset);
-  const useEDL   = edlSegs.length > 1;
+
+  // ── Stage 5b: Brand kit / logo ────────────────────────────────
+  const brandKit = moment.brandKitId
+    ? (db.brandKits || []).find(bk => bk.id === moment.brandKitId)
+    : null;
+  const logoOverlay = buildLogoOverlay(brandKit, RW, RH, faceData);
+
+  // ── Stage 6: Filter complex ───────────────────────────────────
+  const framingMode = moment.framingMode || 'dynamic';
+  const pfObj = buildPortraitFilter(srcW, srcH, RW, RH, speakerSide, clipDuration, faceData, framingMode);
+  pfObj.momentStart = moment.start;
+
+  // Disable EDL for blurred clips with many segments — each segment requires a
+  // split→bg→fg→overlay chain (O(5n)), which times out at 600s on long clips.
+  // Non-EDL uses a single dynamic eval=frame crop expression, far faster.
+  const useEDL = edlSegs.length > 1 && !(pfObj.type === 'blurred' && edlSegs.length > 5);
 
   // ── Stage 5: ASS word-level captions ─────────────────────────
   const assWords = useEDL
@@ -2770,17 +2785,6 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   const assContent = buildASSFile(assWords, 0, totalOutDur, captionPreset, RW, RH, faceCyAvg);
   let hasASS = false;
   try { writeFileSync(assPath, assContent, 'utf8'); hasASS = true; } catch {}
-
-  // ── Stage 5b: Brand kit / logo ────────────────────────────────
-  const brandKit = moment.brandKitId
-    ? (db.brandKits || []).find(bk => bk.id === moment.brandKitId)
-    : null;
-  const logoOverlay = buildLogoOverlay(brandKit, RW, RH, faceData);
-
-  // ── Stage 6: Filter complex ───────────────────────────────────
-  const framingMode = moment.framingMode || 'dynamic';
-  const pfObj = buildPortraitFilter(srcW, srcH, RW, RH, speakerSide, clipDuration, faceData, framingMode);
-  pfObj.momentStart = moment.start;
 
   // loudnorm: broadcast-standard loudness (-14 LUFS), prevents clipping
   const audioF = 'acompressor=threshold=0.089:ratio=4:attack=5:release=50,loudnorm=I=-14:TP=-1.5:LRA=11';
@@ -2866,7 +2870,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     } else if (pfObj.type === 'fill') {
       filterComplex =
         `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,` +
-        `crop=w='${wExpr}':h=${pfObj.cropH}:x='${xExpr}':y=0:eval=frame,` +
+        `crop=w='${wExpr}':h=${pfObj.cropH}:x='${xExpr}':y=0,` +
         `scale=${RW}:${RH}:flags=lanczos,setsar=1${qualityF}${capF}${preCapLabel};` +
         `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
     } else {
@@ -2874,7 +2878,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
       filterComplex =
         `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,split[_dvbg][_dvfg];` +
         `[_dvbg]${dynBgF}[_dbbg];` +
-        `[_dvfg]crop=w='${wExpr}':h=${pfObj.cropH}:x='${xExpr}':y=0:eval=frame,` +
+        `[_dvfg]crop=w='${wExpr}':h=${pfObj.cropH}:x='${xExpr}':y=0,` +
         `scale=${RW}:${pfObj.scaledH}:flags=lanczos,setsar=1${qualityF}[_dbfg];` +
         `[_dbbg][_dbfg]overlay=x=0:y=(H-h)/2${capF}${preCapLabel};` +
         `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
@@ -2911,15 +2915,17 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
       ...encodeArgs, output,
     ], { jobId, label: 'render-v5', timeoutMs: PROCESS_TIMEOUT_MS });
   } catch (renderErr) {
-    console.warn('[render:v5-fallback]', { clipId, err: String(renderErr.message||renderErr).slice(0,300) });
+    const errStr = String(renderErr.message||renderErr);
+    // Log the LAST 400 chars — FFmpeg errors appear at end of stderr, after the version banner
+    console.warn('[render:v5-fallback]', { clipId, err: errStr.length > 400 ? '...' + errStr.slice(-400) : errStr });
     try { if (existsSync(output)) unlinkSync(output); } catch {}
     // Fallback: single-pass, static global crop, no EDL, no logo (most robust)
+    // Always use segFillFilter for blurred type — it guarantees RW×RH (1080×1920).
+    // Using only segBlurFilter.fg in the fallback would produce wrong height (scaledH).
     const staticX = pfObj.portraitFill ? 0 : pfObj.globalCropX;
     const fallbackVF = pfObj.portraitFill
       ? pfObj.portraitFill
-      : pfObj.type === 'fill'
-        ? segFillFilter(staticX)
-        : `${segBlurFilter(staticX).fg}`;
+      : segFillFilter(staticX);
     const fallbackAssF = hasASS ? `,ass='${assPath}'` : '';
     await run(FFMPEG, [
       '-y', '-ss', String(effectiveStart), '-to', String(moment.end), '-i', mediaPath,
@@ -4028,22 +4034,24 @@ async function generateAllPlatformContent(db, video, clip) {
 
 async function generateThumbnailOptions(clipId, clipPath, hook, title, canDraw) {
   if (!canDraw) return [];
+  // Thumbnails are portrait 9:16 (540×960) — clips are already 1080×1920 portrait.
+  // Text Y positions are relative to h=960.
   const styles = [
-    { name: 'viral', label: 'Viral Bold', textColor: 'white', boxColor: 'black@0.85', fontSize: 52, textY: 'h-280', titleY: '60' },
-    { name: 'luxury', label: 'Luxury Clean', textColor: 'white', boxColor: 'black@0.60', fontSize: 42, textY: 'h-320', titleY: '80' },
-    { name: 'neon', label: 'Neon Pop', textColor: '#00ffcc', boxColor: 'black@0.90', fontSize: 48, textY: 'h-260', titleY: '70' }
+    { name: 'viral',   label: 'Viral Bold',    textColor: 'white',    boxColor: 'black@0.85', fontSize: 46, textY: 'h-200', titleY: '48' },
+    { name: 'luxury',  label: 'Luxury Clean',  textColor: 'white',    boxColor: 'black@0.60', fontSize: 38, textY: 'h-230', titleY: '60' },
+    { name: 'neon',    label: 'Neon Pop',      textColor: '#00ffcc',  boxColor: 'black@0.90', fontSize: 42, textY: 'h-215', titleY: '54' },
   ];
   const results = [];
   for (const style of styles) {
     const outPath = path.join(STORAGE_DIR, 'thumbnails', `thumb_${clipId}_${style.name}.jpg`);
     try {
-      const hookSafe = ffmpegText(hook.slice(0, 52));
-      const titleSafe = ffmpegText(title.slice(0, 36));
+      const hookSafe  = ffmpegText(hook.slice(0, 50));
+      const titleSafe = ffmpegText(title.slice(0, 32));
+      // Scale portrait clip to 540×960 (exact 9:16 half resolution)
       const filters = [
-        'scale=1280:720:force_original_aspect_ratio=increase',
-        'crop=1280:720',
-        `drawtext=text='${titleSafe}':x=(w-text_w)/2:y=${style.titleY}:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=14`,
-        `drawtext=text='${hookSafe}':x=(w-text_w)/2:y=${style.textY}:fontsize=${style.fontSize}:fontcolor=${style.textColor}:box=1:boxcolor=${style.boxColor}:boxborderw=22`
+        'scale=540:960:flags=lanczos',
+        `drawtext=text='${titleSafe}':x=(w-text_w)/2:y=${style.titleY}:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=10`,
+        `drawtext=text='${hookSafe}':x=(w-text_w)/2:y=${style.textY}:fontsize=${style.fontSize}:fontcolor=${style.textColor}:box=1:boxcolor=${style.boxColor}:boxborderw=18`,
       ].join(',');
       await run(FFMPEG, ['-y', '-ss', '1', '-i', clipPath, '-frames:v', '1', '-vf', filters, '-q:v', '2', outPath], { timeoutMs: 15_000, label: 'thumbnail gen' });
       if (existsSync(outPath)) {
