@@ -1,21 +1,72 @@
-# ClipForge AI — v2.0.0 (2026 Rebuild)
+# ClipForge AI — v3.0.0
 
-AI-powered video clipping SaaS. Upload a video or paste a YouTube link → AI finds the best viral moments → renders 9:16 vertical clips with captions → you download and post.
+AI-powered video clipping SaaS powered by **Google Gemini**. Upload a video or paste a YouTube link → Gemini watches the actual video and finds the best viral moments → FFmpeg renders 9:16 vertical clips with professional captions → download and post.
 
 No auto-posting. No fake demo clips. Every clip is a real rendered MP4.
+
+---
+
+## AI Brain: Google Gemini (Free)
+
+ClipForge AI uses **Google Gemini 2.0 Flash** as the primary AI provider.
+
+**Why Gemini:**
+- **Free tier** — 1,500 requests/day, 15 req/min, no credit card required
+- **Video understanding** — Gemini watches the actual video file (not just text transcript)
+- **1M token context** — can analyze full transcripts without truncation
+- **Structured JSON output** — guaranteed parseable responses every time
+- **Multimodal** — understands faces, expressions, energy, visual props
+
+**What Gemini powers:**
+| Feature | How Gemini helps |
+|---|---|
+| Viral clip detection | Watches the video directly — sees facial expressions, energy, speaker changes |
+| Clip selection (3 different sections) | Enforces temporal diversity across the full video |
+| Hook generation | 6-style hooks per clip (curiosity, shock, value, story, controversy, sales) |
+| Title generation | Platform-optimized titles for TikTok, YouTube, Instagram |
+| Descriptions | Native captions for every major platform |
+| Hashtag generation | Platform-specific hashtag sets |
+| Thumbnail ideas | Vivid visual description + text overlay suggestion |
+| B-roll suggestions | Specific search queries for stock footage |
+| Sound effect suggestions | Mood-matched audio cues |
+| Transcript fallback | Audio transcription when no Whisper key is available |
+| QA review | Post-render quality check for every exported clip |
+
+---
+
+## Getting your free Gemini API key
+
+1. Go to **[aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)**
+2. Sign in with your Google account
+3. Click **Create API key**
+4. Copy the key (starts with `AIza...`)
+5. Paste it in the admin dashboard → **Gemini AI** section, or add it to `.env`:
+   ```
+   GEMINI_API_KEY=AIzaSy...
+   AI_PROVIDER=gemini
+   ```
+
+**Free tier limits (as of 2025):**
+- 15 requests per minute
+- 1,500 requests per day
+- 1,000,000 tokens per minute
+- No credit card required
+
+**Important — privacy notice:** When Gemini video analysis is enabled, uploaded videos are temporarily sent to Google's File API for analysis and **automatically deleted** after processing (48-hour maximum TTL). Do not use Gemini video analysis for sensitive/private content unless you have user consent. You can disable video analysis and use transcript-only mode by setting `AI_PROVIDER=openai` with a fallback LLM key.
 
 ---
 
 ## What it does
 
 1. **Upload a video file** (mp4, mov, webm, m4v) or paste a YouTube URL
-2. AI analyzes the video and finds the best viral moments (transcript + LLM, or heuristic fallback)
+2. Gemini analyzes the video (or transcript) and finds the best viral moments
 3. FFmpeg renders each moment as a 9:16 vertical clip with:
-   - Title text overlay
-   - Hook caption overlay
-   - Proper aspect ratio crop
-4. Each clip gets a virality score, rationale, hooks, captions, hashtags, and platform upload guide
-5. Download any clip with one click
+   - Professional karaoke captions (word-by-word, emphasis detection)
+   - Face-tracked framing with natural composition
+   - Optional brand watermark
+4. Gemini generates rich metadata: titles, descriptions, hashtags, thumbnail ideas
+5. Gemini QA reviews each clip for quality and platform readiness
+6. Download any clip with one click
 
 ---
 
@@ -43,7 +94,9 @@ cp .env.example .env
 ```
 
 Edit `.env` and fill in at minimum:
-- `LLM_API_KEY` — your OpenAI or Emergent API key (for viral moment detection)
+- `GEMINI_API_KEY` — your free Google Gemini key from [aistudio.google.com](https://aistudio.google.com/app/apikey)
+
+Everything else is optional. Gemini handles viral detection, hooks, titles, hashtags, and QA without any other API key.
 
 Then start:
 
@@ -58,14 +111,15 @@ Default login: `ava@clipforge.local` / `demo12345`
 
 ## Full pipeline requirements
 
-| Requirement | Used for | How to install |
+| Requirement | Used for | How to get |
 |---|---|---|
 | **FFmpeg** | Rendering 9:16 clips, thumbnails, audio extraction | `brew install ffmpeg` |
 | **yt-dlp** | Downloading YouTube videos for processing | `pip install yt-dlp` |
-| **LLM API key** | AI viral moment detection, hooks, captions, hashtags | Set `LLM_API_KEY` |
-| **YouTube API key** | Better metadata for YouTube imports (optional) | Set `YOUTUBE_API_KEY` |
+| **GEMINI_API_KEY** | Viral detection, hooks, titles, hashtags, QA, video analysis | Free at [aistudio.google.com](https://aistudio.google.com/app/apikey) |
+| **LLM_API_KEY** (optional) | Whisper word-level transcription (better caption timing) | OpenAI or Groq key |
+| **YOUTUBE_API_KEY** (optional) | Better metadata for YouTube imports | Google Cloud Console |
 
-File upload works without yt-dlp. Clip rendering requires FFmpeg.
+File upload works without yt-dlp. Clip rendering requires FFmpeg. Gemini is free and replaces all paid LLM providers for the AI reasoning layer.
 
 ---
 
@@ -98,14 +152,30 @@ File upload works without yt-dlp. Clip rendering requires FFmpeg.
 
 ## Environment variables
 
-See `.env.example` for full documentation. Critical ones:
+Copy `.env.example` to `.env` and configure:
 
+```bash
+# ── PRIMARY AI BRAIN (free) ──────────────────────────────────
+GEMINI_API_KEY=AIzaSy...      # Get free key at aistudio.google.com/app/apikey
+AI_PROVIDER=gemini             # Use gemini as the primary AI brain
+
+# ── OPTIONAL: Whisper transcription (better caption word timing) ──
+LLM_PROVIDER=openai            # openai | groq | xai | emergent
+LLM_API_KEY=sk-...             # OpenAI key enables Whisper word-level timestamps
+LLM_MODEL=gpt-4o-mini          # Model for fallback chat (Gemini handles most tasks)
+
+# ── TOOLS ────────────────────────────────────────────────────
+FFMPEG_PATH=ffmpeg             # Path to ffmpeg binary
+YTDLP_PATH=yt-dlp              # Path to yt-dlp binary
+YOUTUBE_API_KEY=               # Optional: YouTube Data API v3
+
+# ── MEDIA GENERATION (optional paid features) ────────────────
+MUAPI_API_KEY=                 # muapi.ai — Kling, Seedance, FLUX, Wav2Lip
+HIGGSFIELD_API_KEY=            # higgsfield.ai — cinematic video
+ELEVENLABS_API_KEY=            # ElevenLabs — AI voiceover
 ```
-LLM_API_KEY=           # Required: OpenAI or Emergent key
-LLM_PROVIDER=openai    # openai or emergent
-FFMPEG_PATH=ffmpeg     # Path to ffmpeg binary
-YTDLP_PATH=yt-dlp      # Path to yt-dlp binary
-```
+
+**Note:** `GEMINI_API_KEY` is the only key needed for full AI functionality. All other keys are optional enhancements.
 
 ---
 
