@@ -290,6 +290,7 @@ const API_SETTING_META = [
   ['LLM_FALLBACK_BASE_URL', 'Secondary fallback LLM base URL'],
   ['LLM_FALLBACK_MODEL', 'Secondary fallback LLM model'],
   ['MUAPI_API_KEY', 'Muapi.ai API key (text-to-video, image-to-video, FLUX, Kling, Seedance)'],
+  ['DIGITAL_HUMAN_STUDIO_URL', 'Digital Human Studio URL (default: http://localhost:4200)'],
   ['HIGGSFIELD_API_KEY', 'Higgsfield AI API key (cinematic video & image generation)'],
   ['ELEVENLABS_API_KEY', 'ElevenLabs API key (AI voiceover / TTS)'],
   ['STRIPE_SECRET_KEY', 'Stripe secret key'],
@@ -4595,6 +4596,44 @@ async function handleApi(req, res, pathname) {
       }
       return json(res, 200, result);
     }
+    // ── Digital Human Studio integration ─────────────────────────────
+    // Proxies requests to the local Digital Human Studio server (port 4200).
+    // This lets ClipForge users generate AI presenter / talking-head videos
+    // without leaving the ClipForge interface.
+    if (pathname.startsWith('/api/digital-human/') && (req.method === 'POST' || req.method === 'GET')) {
+      const db = loadDb();
+      const user = requireUser(req, db);
+      const DHS_URL = (settingValue(db, 'DIGITAL_HUMAN_STUDIO_URL') || 'http://localhost:4200').replace(/\/$/, '');
+      const dhPath  = pathname.replace('/api/digital-human', '/api');
+      const dhHeaders = { 'content-type': 'application/json', 'x-user-id': user.id };
+      let fetchOpts = { method: req.method, headers: dhHeaders, signal: AbortSignal.timeout(60_000) };
+      if (req.method === 'POST') {
+        const body = await readJson(req);
+        fetchOpts.body = JSON.stringify(body);
+      }
+      try {
+        const r = await fetch(`${DHS_URL}${dhPath}`, fetchOpts);
+        const data = await r.json();
+        return json(res, r.status, data);
+      } catch (e) {
+        throw new Error(`Digital Human Studio unreachable. Make sure it is running at ${DHS_URL}. Error: ${e.message}`);
+      }
+    }
+
+    // Quick status check — is Digital Human Studio running?
+    if (pathname === '/api/digital-human-status') {
+      const db = loadDb();
+      requireUser(req, db);
+      const DHS_URL = (settingValue(db, 'DIGITAL_HUMAN_STUDIO_URL') || 'http://localhost:4200').replace(/\/$/, '');
+      try {
+        const r = await fetch(`${DHS_URL}/api/setup/check`, { signal: AbortSignal.timeout(5_000) });
+        const data = await r.json();
+        return json(res, 200, { connected: true, url: DHS_URL, ...data });
+      } catch {
+        return json(res, 200, { connected: false, url: DHS_URL, error: 'Digital Human Studio not running. Start it with: cd ~/digital-human-studio && npm start' });
+      }
+    }
+
     // ── AI Media Generation (Higgsfield / Muapi) ─────────────────────
     if (pathname === '/api/ai/models') {
       const db = loadDb();
@@ -4739,7 +4778,8 @@ async function handleApi(req, res, pathname) {
           lipSync:         { available: mediaReady,  label: 'Lip Sync Studio',              description: 'Sync any voice-over to a video clip with Wav2Lip', setupKey: 'MUAPI_API_KEY' },
           aiVoice:         { available: !!(settingValue(db,'ELEVENLABS_API_KEY') || (settingValue(db,'LLM_PROVIDER')==='openai' && llmReady)), label: 'AI Voiceover (TTS)', description: 'ElevenLabs or OpenAI TTS — type text, pick a voice, get instant audio', setupKey: 'ELEVENLABS_API_KEY' },
           translation:     { available: aiReady,     label: 'Caption Translation',           description: 'Translate captions to 10+ languages via LLM' },
-          socialPosting:   { available: false,       label: 'Direct Social Posting',         description: 'Configure TikTok/Instagram OAuth credentials', setupKey: 'TIKTOK_CLIENT_ID' }
+          socialPosting:   { available: false,       label: 'Direct Social Posting',         description: 'Configure TikTok/Instagram OAuth credentials', setupKey: 'TIKTOK_CLIENT_ID' },
+          digitalHuman:    { available: true,        label: 'AI Digital Human Studio',        description: 'Generate talking-head videos with lip sync, voice & captions (requires Digital Human Studio running on port 4200)', setupKey: 'DIGITAL_HUMAN_STUDIO_URL' }
         }
       });
     }
