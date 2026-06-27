@@ -3697,8 +3697,18 @@ async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat
     attempts.push(fallbackConfig);
   }
 
+  // Hard budget: total cascade must finish well within Cloudflare's 30s tunnel limit
+  const CASCADE_BUDGET_MS = 22_000;
+  // Per-attempt timeout for Gemini cascade models (503s return instantly, no need for 45s)
+  const GEMINI_CASCADE_TIMEOUT_MS = 12_000;
+  const cascadeStart = Date.now();
+
   let lastError;
   for (const config of attempts) {
+    if (Date.now() - cascadeStart > CASCADE_BUDGET_MS) {
+      lastError = new Error('Gemini is currently overloaded across all models. Please try again in 30–60 seconds.');
+      break;
+    }
     if (!config.apiKey) {
       lastError = new Error(`${config.provider || 'LLM'} API key is not configured.`);
       recordAiLog({ ...config, purpose, ok: false, error: lastError.message });
@@ -3709,9 +3719,11 @@ async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat
       recordAiLog({ ...config, purpose, ok: false, error: lastError.message });
       continue;
     }
+    // Use shorter timeout per attempt when cascading Gemini models
+    const perAttemptMs = (config.provider === 'gemini' && attempts.length > 1) ? GEMINI_CASCADE_TIMEOUT_MS : AI_TIMEOUT_MS;
     for (const endpoint of aiEndpointCandidates(config)) {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
+      const timeout = setTimeout(() => controller.abort(), perAttemptMs);
       try {
         const body = { model: config.model, messages, temperature };
         if (responseFormat) body.response_format = { type: responseFormat };
@@ -3733,12 +3745,17 @@ async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat
             console.warn(`[aiChat] ${config.provider}/${config.model} ${response.status} — trying next model`);
             recordAiLog({ ...config, baseUrl: endpoint, purpose, ok: false, error: errMsg.slice(0, 200) });
             lastError = new Error(errMsg);
-            await new Promise(r => setTimeout(r, 1500));
-            break; // break inner endpoint loop, outer loop moves to next model
+            break; // move to next model immediately — no delay
           }
           throw new Error(errMsg);
         }
-        const data = JSON.parse(text);
+        let data;
+        try { data = JSON.parse(text); } catch {
+          // Unexpected non-JSON from a 200 response — treat as transient failure
+          lastError = new Error(`Unexpected response from ${config.provider}/${config.model}`);
+          recordAiLog({ ...config, baseUrl: endpoint, purpose, ok: false, error: 'non-JSON 200 response' });
+          break;
+        }
         const content = data.choices?.[0]?.message?.content || '';
         console.log(`[aiChat] ${purpose} — provider: ${config.provider} model: ${config.model}`);
         recordAiLog({
@@ -3751,7 +3768,7 @@ async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat
       } catch (error) {
         clearTimeout(timeout);
         lastError = error;
-        recordAiLog({ ...config, baseUrl: endpoint, purpose, ok: false, error: error.name === 'AbortError' ? `timed out after ${Math.round(AI_TIMEOUT_MS / 1000)}s` : error.message.slice(0, 200) });
+        recordAiLog({ ...config, baseUrl: endpoint, purpose, ok: false, error: error.name === 'AbortError' ? `timed out after ${Math.round(perAttemptMs / 1000)}s` : error.message.slice(0, 200) });
       }
     }
   }

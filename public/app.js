@@ -34,7 +34,16 @@ const when = d => { if(!d) return ''; const ms=Date.now()-new Date(d).getTime();
 function uid() { return localStorage.getItem('clipforge:userId') || ''; }
 function api(path, opts = {}) {
   return fetch(path, { ...opts, headers: { 'content-type': 'application/json', 'x-user-id': uid(), ...(opts.headers || {}) } })
-    .then(r => r.json().then(d => { if (d.error) throw new Error(d.error); return d; }));
+    .then(r => r.text().then(text => {
+      let d;
+      try { d = JSON.parse(text); } catch {
+        // Non-JSON response — Cloudflare timeout, server crash, or HTML error page
+        if (r.status === 524 || r.status === 503 || r.status === 502) throw new Error('Server is temporarily unavailable. Please try again in a moment.');
+        throw new Error('Service temporarily unavailable. Please try again.');
+      }
+      if (d.error) throw new Error(d.error);
+      return d;
+    }));
 }
 function empty(msg) { return `<div class="empty-state"><div class="empty-icon">✦</div><p>${esc(msg)}</p></div>`; }
 function pill(label, cls='') { return `<span class="pill ${cls}">${esc(label)}</span>`; }
@@ -2413,7 +2422,7 @@ function _renderSettings() {
         fd.append('brandKitId', saved.id);
         fd.append('logo', logoFile);
         const r = await fetch('/api/brand-kit/logo', {method:'POST', headers:{'x-user-id':uid()}, body:fd});
-        const rd = await r.json();
+        const rd = await r.text().then(t=>{try{return JSON.parse(t);}catch{throw new Error('Logo upload failed — invalid response');}});
         if (!r.ok) throw new Error(rd.error || 'Logo upload failed');
         state.brandKits = state.brandKits.map(bk => bk.id === rd.kit.id ? rd.kit : bk);
       }
@@ -2929,7 +2938,7 @@ $('#authForm').addEventListener('submit', async e => {
       const name=$('#authName')?.value?.trim();
       if (name) body.name=name;
     }
-    const data=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
+    const data=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}).then(r=>r.text().then(t=>{try{return JSON.parse(t);}catch{throw new Error('Service unavailable. Please try again.');}}));
     if (data.error) throw new Error(data.error);
     localStorage.setItem('clipforge:userId',data.user.id);
     hideAuth();
