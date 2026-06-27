@@ -3678,9 +3678,24 @@ function extractJsonObject(text) {
 }
 
 async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat = 'json_object', fallback = true }) {
-  const attempts = [aiConfig(db, false)];
+  const primaryConfig = aiConfig(db, false);
   const fallbackConfig = aiConfig(db, true);
-  if (fallback && fallbackConfig.provider && fallbackConfig.apiKey && fallbackConfig.baseUrl) attempts.push(fallbackConfig);
+
+  // When primary provider is Gemini, build a model cascade over the compat endpoint.
+  // Each model gets its own attempt so 503/429 on one rolls to the next.
+  const attempts = [];
+  if (primaryConfig.provider === 'gemini' && primaryConfig.apiKey) {
+    const configuredModel = primaryConfig.model || GEMINI_MODEL_CASCADE[0];
+    const cascade = [configuredModel, ...GEMINI_MODEL_CASCADE.filter(m => m !== configuredModel)];
+    for (const model of cascade) {
+      attempts.push({ ...primaryConfig, model });
+    }
+  } else {
+    attempts.push(primaryConfig);
+  }
+  if (fallback && fallbackConfig.provider && fallbackConfig.apiKey && fallbackConfig.baseUrl) {
+    attempts.push(fallbackConfig);
+  }
 
   let lastError;
   for (const config of attempts) {
@@ -3698,11 +3713,7 @@ async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
       try {
-        const body = {
-          model: config.model,
-          messages,
-          temperature
-        };
+        const body = { model: config.model, messages, temperature };
         if (responseFormat) body.response_format = { type: responseFormat };
         const response = await fetch(endpoint, {
           method: 'POST',
@@ -3718,22 +3729,20 @@ async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat
         const text = await response.text();
         if (!response.ok) {
           const errMsg = `${response.status} ${text.slice(0, 600)}`;
-          // 503 from Gemini = overloaded, retryable — log and continue to next attempt
-          if (response.status === 503 || (response.status === 429)) {
-            console.warn(`[aiChat] ${config.provider}/${config.model} ${response.status} — retrying`);
+          if (response.status === 503 || response.status === 429) {
+            console.warn(`[aiChat] ${config.provider}/${config.model} ${response.status} — trying next model`);
             recordAiLog({ ...config, baseUrl: endpoint, purpose, ok: false, error: errMsg.slice(0, 200) });
             lastError = new Error(errMsg);
-            continue;
+            await new Promise(r => setTimeout(r, 1500));
+            break; // break inner endpoint loop, outer loop moves to next model
           }
           throw new Error(errMsg);
         }
         const data = JSON.parse(text);
         const content = data.choices?.[0]?.message?.content || '';
+        console.log(`[aiChat] ${purpose} — provider: ${config.provider} model: ${config.model}`);
         recordAiLog({
-          ...config,
-          baseUrl: endpoint,
-          purpose,
-          ok: true,
+          ...config, baseUrl: endpoint, purpose, ok: true,
           promptTokens: data.usage?.prompt_tokens,
           completionTokens: data.usage?.completion_tokens,
           totalTokens: data.usage?.total_tokens
@@ -3742,16 +3751,16 @@ async function aiChat(db, { purpose, messages, temperature = 0.4, responseFormat
       } catch (error) {
         clearTimeout(timeout);
         lastError = error;
-        recordAiLog({ ...config, baseUrl: endpoint, purpose, ok: false, error: error.name === 'AbortError' ? `AI request timed out after ${Math.round(AI_TIMEOUT_MS / 1000)}s` : error.message.slice(0, 200) });
+        recordAiLog({ ...config, baseUrl: endpoint, purpose, ok: false, error: error.name === 'AbortError' ? `timed out after ${Math.round(AI_TIMEOUT_MS / 1000)}s` : error.message.slice(0, 200) });
       }
     }
   }
-  // Produce a friendly error for Gemini overload / quota
-  const finalMsg = lastError?.message || 'LLM request failed.';
-  if (parseGemini429(lastError) || isGemini503(lastError) || finalMsg.includes('503') || finalMsg.includes('UNAVAILABLE') || finalMsg.includes('high demand')) {
+  // Convert Gemini overload / quota errors to friendly messages
+  const finalMsg = lastError?.message || '';
+  if (finalMsg.includes('503') || finalMsg.includes('UNAVAILABLE') || finalMsg.includes('high demand') || finalMsg.includes('overloaded') || parseGemini429(lastError)) {
     throw new Error(geminiUserMessage(lastError));
   }
-  throw lastError || new Error('LLM request failed.');
+  throw lastError || new Error('AI request failed — no provider responded successfully.');
 }
 
 async function testAiConnection(db) {
