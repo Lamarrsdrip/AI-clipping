@@ -243,21 +243,21 @@ function closeClipModal() {
   }
 }
 
-/* ── Nav (4 core items only) ─────────────────────────────────────── */
+/* ── Nav (4 core items — clean on mobile) ────────────────────────── */
 const NAV = [
-  { id:'home',          icon:'⌂', label:'Home'          },
-  { id:'create',        icon:'✦', label:'Create'        },
-  { id:'clips',         icon:'▶', label:'Clips'         },
-  { id:'faceless',      icon:'◈', label:'Faceless'      },
-  { id:'digitalHuman',  icon:'🧑', label:'Digital Human' }
+  { id:'home',     icon:'⌂', label:'Home'     },
+  { id:'create',   icon:'✦', label:'Create'   },
+  { id:'clips',    icon:'▶', label:'Clips'    },
+  { id:'faceless', icon:'◈', label:'Faceless' },
 ];
 
 const MENU_ITEMS = [
-  { id:'scheduler',  icon:'◷', label:'Schedule',          desc:'Plan and post your content' },
-  { id:'studio',     icon:'⚡', label:'AI Studio',          desc:'B-roll, thumbnails, AI video' },
-  { id:'transcript', icon:'◑', label:'Transcripts',         desc:'Full video transcripts' },
-  { id:'billing',    icon:'◇', label:'Credits & Billing',   desc:'Plans and usage' },
-  { id:'settings',   icon:'⚙', label:'Settings',            desc:'Profile and preferences' }
+  { id:'digitalHuman', icon:'🧑', label:'Digital Human Studio', desc:'AI twin & synthetic human video generation' },
+  { id:'scheduler',  icon:'◷', label:'Schedule',               desc:'Plan and post your content' },
+  { id:'studio',     icon:'⚡', label:'AI Studio',              desc:'B-roll, thumbnails, AI video' },
+  { id:'transcript', icon:'◑', label:'Transcripts',            desc:'Full video transcripts' },
+  { id:'billing',    icon:'◇', label:'Credits & Billing',      desc:'Plans and usage' },
+  { id:'settings',   icon:'⚙', label:'Settings',               desc:'Profile and preferences' },
 ];
 const MENU_ITEMS_ADMIN = [
   { id:'admin', icon:'◈', label:'Admin panel', desc:'Users, logs, API keys' }
@@ -548,10 +548,6 @@ function renderHome() {
             <div class="pa-icon">◈</div>
             <div><b>Faceless content</b><small>AI-written scripts for faceless videos</small></div>
           </button>
-          <button class="primary-action" data-view="digitalHuman" style="background:linear-gradient(135deg,rgba(124,92,252,.18),rgba(6,182,212,.12));border-color:rgba(124,92,252,.35)">
-            <div class="pa-icon" style="background:linear-gradient(135deg,#7c5cfc,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent">🧑</div>
-            <div><b style="background:linear-gradient(135deg,#a78bfa,#67e8f9);-webkit-background-clip:text;-webkit-text-fill-color:transparent">AI Digital Human</b><small>Generate talking-head videos with lip sync</small></div>
-          </button>
           <button class="primary-action" data-view="clips">
             <div class="pa-icon">▶</div>
             <div><b>My clips</b><small>${doneClips.length} clip${doneClips.length!==1?'s':''} ready to download</small></div>
@@ -560,6 +556,27 @@ function renderHome() {
             <div class="pa-icon">◇</div>
             <div><b>Credits & billing</b><small>${(user.credits??0) >= 9999 ? 'Unlimited' : (user.credits??0)+' credits remaining'}</small></div>
           </button>
+        </div>
+
+        <!-- Digital Human Studio — full-width featured section -->
+        <div class="dh-home-banner" data-view="digitalHuman" role="button" tabindex="0">
+          <div class="dh-home-banner-left">
+            <div class="dh-home-badge">
+              <span class="dh-pulse"></span>AI Digital Human Studio
+            </div>
+            <h2 class="dh-home-title">Create AI Twins &amp; Synthetic Humans</h2>
+            <p class="dh-home-desc">Your face · your voice · any scene. Generate talking-head videos, luxury ads, presenter content — powered by real AI or cloud video providers.</p>
+            <div class="dh-home-pills">
+              <span class="dh-pill">🧑 AI Twin</span>
+              <span class="dh-pill">✨ Synthetic Human</span>
+              <span class="dh-pill">🎬 Scene Prompts</span>
+              <span class="dh-pill">🗺 Storyboard AI</span>
+            </div>
+          </div>
+          <div class="dh-home-cta">
+            <button class="primary dh-home-btn" data-view="digitalHuman">Open Studio →</button>
+            <div class="dh-home-sub">Runway · Kling · Pika · Luma supported</div>
+          </div>
         </div>
 
         ${doneClips.length ? `
@@ -2073,8 +2090,36 @@ const _dhState = {
   status: null, humans: [], jobs: [], selectedHuman: null,
   generating: false, jobPollTimer: null, view: 'home', // home | create | generate | jobs
   script: '', prompt: '', mode: 'talking_head', tone: 'professional', duration: 30,
+  // Advanced mode fields
+  scene: '', action: '', product: '', cameraStyle: 'cinematic',
+  advancedMode: false, plan: null, planLoading: false,
   consentDone: false, dhName: '', dhType: 'self',
+  // Quality level helpers
+  qualityLevel: 1, videoProvider: 'static',
 };
+
+function dhQualityBadge(level) {
+  const meta = {
+    1: { cls: 'dh-ql-1', label: 'Level 1: Static Fallback' },
+    2: { cls: 'dh-ql-2', label: 'Level 2: Talking Head' },
+    3: { cls: 'dh-ql-3', label: 'Level 3: AI Motion' },
+    4: { cls: 'dh-ql-4', label: 'Level 4: Full Scene AI' },
+    5: { cls: 'dh-ql-5', label: 'Level 5: Custom GPU' },
+  }[level] || { cls: 'dh-ql-1', label: 'Static' };
+  return `<span class="dh-ql-badge ${meta.cls}">${meta.label}</span>`;
+}
+
+function dhStatusBadge(status) {
+  const map = {
+    ready:                { cls: 'dh-status-ok',   label: '✓ Ready' },
+    draft:                { cls: 'dh-status-warn',  label: '⚠ Draft' },
+    needs_face:           { cls: 'dh-status-warn',  label: '📷 Needs face' },
+    needs_image_provider: { cls: 'dh-status-info',  label: '🖼 Needs image provider' },
+    taken_down:           { cls: 'dh-status-err',   label: '✕ Taken down' },
+  };
+  const s = map[status] || { cls: 'dh-status-warn', label: status };
+  return `<span class="dh-status-badge ${s.cls}">${s.label}</span>`;
+}
 
 async function dhApi(path, opts = {}) {
   return api('/api/digital-human' + path, opts);
@@ -2146,226 +2191,332 @@ function renderDHHome(el) {
   const jobs   = _dhState.jobs;
   const active = jobs.filter(j => j.status === 'processing' || j.status === 'queued');
   const done   = jobs.filter(j => j.status === 'complete');
+  const ql = _dhState.status?.activeQualityLevel || 1;
+  const vp = _dhState.status?.videoProvider || 'static';
 
   el.innerHTML = `
-  <div class="fl-wrap">
-    <div class="fl-form-col" style="max-width:900px">
+  <div class="dh-page">
 
-      <!-- Header banner -->
-      <div style="background:linear-gradient(135deg,rgba(124,92,252,.15),rgba(6,182,212,.1));border:1px solid rgba(124,92,252,.3);border-radius:16px;padding:28px 32px;margin-bottom:28px;display:flex;align-items:center;justify-content:space-between;gap:24px">
-        <div>
-          <div style="display:inline-flex;align-items:center;gap:8px;background:rgba(124,92,252,.2);border:1px solid rgba(124,92,252,.4);border-radius:20px;padding:4px 14px;font-size:.72rem;font-weight:700;color:#a78bfa;text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px">
-            <span style="width:6px;height:6px;border-radius:50%;background:#22c55e;display:inline-block"></span>
-            Studio Online
-          </div>
-          <h2 style="font-size:1.7rem;font-weight:800;margin:0 0 6px;background:linear-gradient(135deg,#a78bfa,#67e8f9);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text">AI Digital Human Studio</h2>
-          <p style="color:#888;margin:0;font-size:.9rem">Generate talking-head videos — your face, your voice, your script. No camera needed.</p>
-        </div>
-        <button class="primary" style="flex-shrink:0;padding:14px 24px;font-size:.95rem;white-space:nowrap" onclick="_dhState.view='generate';renderDigitalHuman()">
-          🎬 Generate Video
-        </button>
-      </div>
-
-      <!-- Stats row -->
-      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:28px">
-        ${[
-          ['🧑','Digital Humans', humans.length, 'Ready to use'],
-          ['✅','Videos Made',    done.length,   'Completed'],
-          ['⏳','In Queue',       active.length, 'Processing now'],
-          ['⚙️','Workers',       _dhState.status?.ffmpeg ? 'Active' : 'Partial', 'FFmpeg + Python'],
-        ].map(([icon,label,val,sub]) => `
-        <div style="background:#1a1a24;border:1px solid #2a2a3a;border-radius:12px;padding:18px;text-align:center">
-          <div style="font-size:1.5rem;margin-bottom:6px">${icon}</div>
-          <div style="font-size:.72rem;color:#6b6b8a;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">${label}</div>
-          <div style="font-size:1.6rem;font-weight:800;color:#f8f8ff">${val}</div>
-          <div style="font-size:.72rem;color:#6b6b8a;margin-top:2px">${sub}</div>
-        </div>`).join('')}
-      </div>
-
-      <!-- Digital Humans -->
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
-        <h3 style="font-size:1rem;font-weight:700">Your Digital Humans</h3>
-        <button class="ghost" onclick="_dhState.view='create';renderDigitalHuman()">+ New Digital Human</button>
-      </div>
-
-      ${humans.length === 0 ? `
-      <div style="background:#111118;border:2px dashed #2a2a3a;border-radius:12px;padding:48px;text-align:center;margin-bottom:28px">
-        <div style="font-size:2.5rem;margin-bottom:12px">🧑</div>
-        <div style="font-weight:600;color:#888;margin-bottom:16px">No digital humans yet. Create one to start generating videos.</div>
-        <button class="primary" onclick="_dhState.view='create';renderDigitalHuman()">Create Your First Digital Human</button>
-      </div>` : `
-      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px;margin-bottom:28px">
-        ${humans.slice(0, 6).map(dh => `
-        <div style="background:#1a1a24;border:1px solid ${_dhState.selectedHuman===dh.id?'rgba(124,92,252,.8)':'#2a2a3a'};border-radius:12px;overflow:hidden;cursor:pointer;transition:all .2s"
-          onclick="_dhState.selectedHuman='${dh.id}';renderDigitalHuman()" data-dhcard>
-          <div style="height:130px;background:linear-gradient(135deg,#232330,#1a1a24);display:flex;align-items:center;justify-content:center;font-size:3rem">
-            ${{self:'🧑',male:'👨',female:'👩',brand:'🏢',presenter:'🎤',teacher:'📚',salesperson:'💼',influencer:'⭐'}[dh.type]||'🧑'}
-          </div>
-          <div style="padding:12px">
-            <div style="font-weight:700;font-size:.88rem;margin-bottom:4px">${esc(dh.name)}</div>
-            <div style="font-size:.72rem;color:#6b6b8a;margin-bottom:8px">${dh.type}</div>
-            <span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:.68rem;font-weight:600;background:${dh.status==='ready'?'rgba(34,197,94,.15)':'rgba(234,179,8,.15)'};color:${dh.status==='ready'?'#22c55e':'#eab308'}">${dh.status}</span>
-          </div>
-        </div>`).join('')}
-        <div style="background:#111118;border:2px dashed #2a2a3a;border-radius:12px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;cursor:pointer;padding:32px 16px;color:#6b6b8a;min-height:200px;transition:all .2s"
-          onclick="_dhState.view='create';renderDigitalHuman()">
-          <div style="font-size:2rem">+</div>
-          <div style="font-size:.8rem;font-weight:600">New Digital Human</div>
-        </div>
-      </div>`}
-
-      <!-- Action cards row -->
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px">
-        <div style="background:#1a1a24;border:1px solid #2a2a3a;border-radius:12px;padding:20px">
-          <div style="font-size:1.5rem;margin-bottom:10px">🎬</div>
-          <div style="font-weight:700;margin-bottom:6px">Generate a Video</div>
-          <p style="color:#888;font-size:.82rem;margin-bottom:14px">Type a script or topic → AI generates voice + lip sync + captions in 9:16 portrait format</p>
-          <button class="primary" onclick="_dhState.view='generate';renderDigitalHuman()">Start Generating →</button>
-        </div>
-        <div style="background:#1a1a24;border:1px solid #2a2a3a;border-radius:12px;padding:20px">
-          <div style="font-size:1.5rem;margin-bottom:10px">📋</div>
-          <div style="font-weight:700;margin-bottom:6px">Video Jobs</div>
-          <p style="color:#888;font-size:.82rem;margin-bottom:14px">${jobs.length} job${jobs.length!==1?'s':''} · ${active.length} active · ${done.length} complete</p>
-          <button class="ghost" onclick="_dhState.view='jobs';renderDigitalHuman()">View All Jobs →</button>
+    <!-- Header -->
+    <div class="dh-hero">
+      <div class="dh-hero-text">
+        <div class="dh-online-pill"><span class="dh-pulse"></span>Studio Online</div>
+        <h2 class="dh-hero-title">AI Digital Human Studio</h2>
+        <p class="dh-hero-desc">AI Twin · Synthetic Human · Scene Prompts · Storyboard planning</p>
+        <div class="dh-quality-row">
+          ${dhQualityBadge(ql)}
+          <span class="dh-provider-label">via ${esc(vp)}</span>
+          ${ql === 1 ? `<span class="dh-warn-inline">⚠ Static only — add provider key in settings for real AI</span>` : ''}
         </div>
       </div>
+      <button class="primary dh-hero-btn" onclick="_dhState.view='generate';renderDigitalHuman()">🎬 Generate</button>
+    </div>
 
-      <!-- Recent jobs -->
-      ${done.length ? `
-      <h3 style="font-size:1rem;font-weight:700;margin-bottom:14px">Recent Videos</h3>
-      <div style="display:flex;flex-direction:column;gap:10px">
-        ${done.slice(0,3).map(j => `
-        <div style="background:#1a1a24;border:1px solid #2a2a3a;border-radius:10px;padding:14px 18px;display:flex;align-items:center;justify-content:space-between;gap:16px">
-          <div>
-            <div style="font-weight:600;font-size:.88rem">${j.mode?.replace(/_/g,' ')||'video'}</div>
-            <div style="font-size:.75rem;color:#6b6b8a;margin-top:2px">${new Date(j.createdAt).toLocaleDateString()}</div>
-          </div>
-          <div style="display:flex;gap:8px">
-            ${j.outputPath ? `<a href="${DHS_URL_BASE}${j.outputPath}" target="_blank" class="ghost" style="padding:6px 14px;font-size:.78rem">⬇ Download</a>` : ''}
-            <span style="padding:3px 10px;border-radius:10px;font-size:.7rem;font-weight:600;background:rgba(34,197,94,.15);color:#22c55e">complete</span>
-          </div>
-        </div>`).join('')}
-      </div>` : ''}
+    <!-- Stats grid — 2×2 on mobile, 4 columns on desktop -->
+    <div class="dh-stats">
+      ${[
+        ['🧑', humans.length,      'Digital Humans'],
+        ['✅', done.length,        'Videos done'],
+        ['⏳', active.length,      'In queue'],
+        ['⚙',  ql,                 'Quality level'],
+      ].map(([icon,val,label]) => `
+      <div class="dh-stat-card">
+        <div class="dh-stat-icon">${icon}</div>
+        <div class="dh-stat-val">${val}</div>
+        <div class="dh-stat-label">${label}</div>
+      </div>`).join('')}
+    </div>
 
-      <div style="margin-top:24px;padding-top:20px;border-top:1px solid #2a2a3a;text-align:center">
-        <a href="${DHS_URL_BASE}" target="_blank" style="color:#a78bfa;font-size:.82rem;font-weight:600">Open Digital Human Studio in full window →</a>
+    <!-- Digital Humans section -->
+    <div class="dh-section-head">
+      <h3>Your Digital Humans</h3>
+      <button class="ghost" onclick="_dhState.view='create';renderDigitalHuman()">+ New</button>
+    </div>
+
+    ${humans.length === 0 ? `
+    <div class="dh-empty-state">
+      <div class="dh-empty-icon">🧑</div>
+      <p>No digital humans yet. Create your AI Twin or a synthetic human to start.</p>
+      <div class="dh-empty-btns">
+        <button class="primary" onclick="_dhState.view='create';_dhState.createType='twin';renderDigitalHuman()">🎥 Create AI Twin</button>
+        <button class="ghost" onclick="_dhState.view='create';_dhState.createType='fictional';renderDigitalHuman()">✨ Create Synthetic</button>
       </div>
+    </div>` : `
+    <div class="dh-humans-grid">
+      ${humans.slice(0,6).map(dh => `
+      <div class="dh-human-card ${_dhState.selectedHuman===dh.id?'selected':''}" onclick="_dhState.selectedHuman='${dh.id}';renderDigitalHuman()">
+        <div class="dh-human-avatar">
+          ${{self:'🧑',fictional:'✨',male:'👨',female:'👩',brand:'🏢',presenter:'🎤',teacher:'📚',salesperson:'💼',influencer:'⭐'}[dh.isFictional?'fictional':dh.type]||'🧑'}
+        </div>
+        <div class="dh-human-info">
+          <div class="dh-human-name">${esc(dh.name)}</div>
+          <div class="dh-human-type">${dh.isFictional ? 'Synthetic' : 'AI Twin'}</div>
+          ${dhStatusBadge(dh.status)}
+        </div>
+      </div>`).join('')}
+      <div class="dh-human-card dh-add-card" onclick="_dhState.view='create';renderDigitalHuman()">
+        <div class="dh-add-plus">+</div>
+        <div class="dh-add-label">New Human</div>
+      </div>
+    </div>`}
+
+    <!-- Quick actions -->
+    <div class="dh-actions">
+      <div class="dh-action-card">
+        <div class="dh-action-icon">🎬</div>
+        <div class="dh-action-title">Generate Video</div>
+        <p class="dh-action-desc">Simple or advanced — scene prompts, storyboard AI, full pipeline</p>
+        <button class="primary" onclick="_dhState.view='generate';renderDigitalHuman()">Start →</button>
+      </div>
+      <div class="dh-action-card">
+        <div class="dh-action-icon">📋</div>
+        <div class="dh-action-title">Video Jobs</div>
+        <p class="dh-action-desc">${jobs.length} job${jobs.length!==1?'s':''} · ${active.length} active · ${done.length} done</p>
+        <button class="ghost" onclick="_dhState.view='jobs';renderDigitalHuman()">View →</button>
+      </div>
+    </div>
+
+    <!-- Recent videos -->
+    ${done.length ? `
+    <div class="dh-section-head" style="margin-top:24px"><h3>Recent Videos</h3></div>
+    <div class="dh-jobs-list">
+      ${done.slice(0,3).map(j => `
+      <div class="dh-job-row">
+        <div class="dh-job-left">
+          <div class="dh-job-title">${j.mode?.replace(/_/g,' ')||'video'}</div>
+          <div class="dh-job-meta">${dhQualityBadge(j.qualityLevel||1)} · ${new Date(j.createdAt).toLocaleDateString()}</div>
+          ${j.staticFallbackWarning ? `<div class="dh-static-warn">⚠ Static fallback — configure a video provider for real AI</div>` : ''}
+        </div>
+        <div class="dh-job-actions">
+          ${j.outputPath ? `<a href="${DHS_URL_BASE}${j.outputPath}" target="_blank" class="ghost dh-dl-btn">⬇</a>` : ''}
+          <span class="dh-status-badge dh-status-ok">done</span>
+        </div>
+      </div>`).join('')}
+    </div>` : ''}
+
+    <div class="dh-footer-link">
+      <a href="${DHS_URL_BASE}" target="_blank">Open full Digital Human Studio ↗</a>
     </div>
   </div>`;
 }
 
 function renderDHGenerate(el) {
   const humans = _dhState.humans;
+  const ql = _dhState.status?.activeQualityLevel || 1;
   const MODES = [
     {id:'talking_head',icon:'💬',name:'Talking Head',cost:5},
-    {id:'presenter',icon:'🎤',name:'Presenter',cost:8},
-    {id:'ad_video',icon:'📢',name:'Ad Video',cost:10},
-    {id:'intro',icon:'▶️',name:'Intro Clip',cost:3},
-    {id:'outro',icon:'⏹️',name:'Outro Clip',cost:3},
-    {id:'influencer',icon:'⭐',name:'Influencer',cost:8},
+    {id:'ad_video',    icon:'📢',name:'Ad Video',    cost:10},
+    {id:'presenter',   icon:'🎤',name:'Presenter',   cost:8},
+    {id:'influencer',  icon:'⭐',name:'Influencer',  cost:8},
+    {id:'intro',       icon:'▶',name:'Intro',        cost:3},
+    {id:'outro',       icon:'⏹',name:'Outro',        cost:3},
   ];
 
   el.innerHTML = `
-  <div class="fl-wrap">
-    <div class="fl-form-col" style="max-width:720px">
-      <div class="fl-form-head">
-        <button class="ghost" style="margin-bottom:16px;padding:6px 14px;font-size:.8rem" onclick="_dhState.view='home';renderDigitalHuman()">← Back</button>
-        <div class="fl-badge">Digital Human Studio</div>
-        <h2>Generate a Video</h2>
-        <p>Choose your digital human, pick a mode, write a script — we handle the rest.</p>
+  <div class="dh-page">
+    <div class="dh-subpage-head">
+      <button class="ghost dh-back-btn" onclick="_dhState.view='home';renderDigitalHuman()">← Back</button>
+      <h2>Generate Video</h2>
+      <p>Choose a digital human, write a script or scene prompt — AI handles the rest.</p>
+    </div>
+
+    <!-- Active quality level -->
+    <div class="dh-ql-info">
+      <span>Active output:</span> ${dhQualityBadge(ql)}
+      ${ql===1?`<button class="ghost dh-settings-link" onclick="setView('settings')">Configure provider →</button>`:''}
+    </div>
+    ${ql===1?`<div class="dh-static-warn dh-warn-block">⚠ Level 1 Static Fallback active — your video will be a still image + audio, NOT real AI motion. Add a Runway, Kling, or Pika API key in Settings for cinematic AI video.</div>`:''}
+
+    ${humans.length === 0 ? `
+    <div class="dh-empty-state">
+      <p>You need a Digital Human first.</p>
+      <button class="primary" onclick="_dhState.view='create';renderDigitalHuman()">Create One →</button>
+    </div>` : `
+
+    <!-- Advanced mode toggle -->
+    <div class="dh-adv-toggle-row">
+      <button class="dh-adv-toggle ${_dhState.advancedMode?'on':''}" id="dhAdvToggle">
+        ${_dhState.advancedMode?'◉':'○'} Advanced / Scene Prompt
+      </button>
+      <span class="dh-adv-hint">${_dhState.advancedMode?'London · Ferrari · Cinematic AI':'Simple script mode'}</span>
+    </div>
+
+    <form id="dhGenForm" class="dh-form">
+
+      <!-- Digital Human picker -->
+      <div class="dh-field">
+        <label class="dh-label">Digital Human</label>
+        <div class="dh-human-picker">
+          ${humans.map(dh => `
+          <div class="dh-pick-card ${_dhState.selectedHuman===dh.id?'active':''} ${dh.status!=='ready'?'dh-pick-blocked':''}"
+            onclick="_dhState.selectedHuman='${dh.id}';renderDHGenerate(document.getElementById('digitalHuman'))">
+            <div class="dh-pick-avatar">${dh.isFictional?'✨':'🧑'}</div>
+            <div class="dh-pick-name">${esc(dh.name)}</div>
+            ${dhStatusBadge(dh.status)}
+          </div>`).join('')}
+        </div>
       </div>
 
-      ${humans.length === 0 ? `
-      <div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);border-radius:12px;padding:20px;text-align:center">
-        <p style="color:#ef4444;margin-bottom:12px">You need a Digital Human first.</p>
-        <button class="primary" onclick="_dhState.view='create';renderDigitalHuman()">Create Digital Human</button>
-      </div>` : `
-      <form id="dhGenForm" class="fl-form">
-        <div class="fl-field">
-          <label class="fl-label">Digital Human</label>
-          <select id="dhSelHuman" class="fl-select">
-            ${humans.map(dh => `<option value="${dh.id}" ${_dhState.selectedHuman===dh.id?'selected':''}>${esc(dh.name)} (${dh.type})</option>`).join('')}
+      <!-- Mode selector -->
+      <div class="dh-field">
+        <label class="dh-label">Video Mode</label>
+        <div class="dh-modes">
+          ${MODES.map(m => `
+          <div class="dh-mode-card ${_dhState.mode===m.id?'active':''}"
+            onclick="_dhState.mode='${m.id}';renderDHGenerate(document.getElementById('digitalHuman'))">
+            <div class="dh-mode-icon">${m.icon}</div>
+            <div class="dh-mode-name">${m.name}</div>
+            <div class="dh-mode-cost">${m.cost} cr</div>
+          </div>`).join('')}
+        </div>
+      </div>
+
+      <!-- Script -->
+      <div class="dh-field">
+        <label class="dh-label">Script <span class="dh-label-hint">(spoken words)</span></label>
+        <textarea id="dhScript" class="fl-input" rows="4" placeholder="Enter the exact words your digital human will speak…">${esc(_dhState.script)}</textarea>
+      </div>
+
+      <!-- Prompt / Tone row -->
+      <div class="dh-row2">
+        <div class="dh-field">
+          <label class="dh-label">Topic (AI writes script)</label>
+          <input id="dhPrompt" class="fl-input" type="text" placeholder="e.g. Introduce my luxury brand" value="${esc(_dhState.prompt)}">
+        </div>
+        <div class="dh-field">
+          <label class="dh-label">Tone</label>
+          <select id="dhTone" class="fl-select">
+            ${['professional','casual','energetic','calm','motivational','luxury'].map(t=>`<option value="${t}" ${_dhState.tone===t?'selected':''}>${t.charAt(0).toUpperCase()+t.slice(1)}</option>`).join('')}
           </select>
         </div>
+      </div>
 
-        <div class="fl-field">
-          <label class="fl-label">Video Mode</label>
-          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:6px">
-            ${MODES.map(m => `
-            <div style="border:2px solid ${_dhState.mode===m.id?'rgba(124,92,252,.8)':'#2a2a3a'};border-radius:10px;padding:14px 10px;cursor:pointer;text-align:center;transition:all .15s;background:${_dhState.mode===m.id?'rgba(124,92,252,.12)':'transparent'}"
-              onclick="_dhState.mode='${m.id}';renderDHGenerate(document.getElementById('digitalHuman'))">
-              <div style="font-size:1.4rem;margin-bottom:6px">${m.icon}</div>
-              <div style="font-size:.78rem;font-weight:600">${m.name}</div>
-              <div style="font-size:.68rem;color:#6b6b8a;margin-top:2px">${m.cost} cr</div>
+      <!-- Advanced fields -->
+      ${_dhState.advancedMode ? `
+      <div class="dh-adv-section">
+        <div class="dh-adv-label">🎬 Scene Prompt</div>
+        <div class="dh-row2">
+          <div class="dh-field">
+            <label class="dh-label">Scene</label>
+            <input id="dhScene" class="fl-input" type="text" placeholder="e.g. London city street" value="${esc(_dhState.scene)}">
+          </div>
+          <div class="dh-field">
+            <label class="dh-label">Action</label>
+            <input id="dhAction" class="fl-input" type="text" placeholder="e.g. driving a Ferrari" value="${esc(_dhState.action)}">
+          </div>
+        </div>
+        <div class="dh-row2">
+          <div class="dh-field">
+            <label class="dh-label">Product / Website</label>
+            <input id="dhProduct" class="fl-input" type="text" placeholder="e.g. Digital Human OS" value="${esc(_dhState.product)}">
+          </div>
+          <div class="dh-field">
+            <label class="dh-label">Camera Style</label>
+            <select id="dhCamera" class="fl-select">
+              ${['cinematic','documentary','studio','social media','vlog','luxury ad'].map(s=>`<option value="${s}" ${_dhState.cameraStyle===s?'selected':''}>${s.charAt(0).toUpperCase()+s.slice(1)}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+        <button type="button" id="dhPlanBtn" class="ghost dh-plan-btn" ${_dhState.planLoading?'disabled':''}>
+          ${_dhState.planLoading?'⏳ Planning…':'🧠 Plan with AI →'}
+        </button>
+        ${_dhState.plan ? `
+        <div class="dh-plan-card">
+          <div class="dh-plan-title">AI Storyboard</div>
+          <div class="dh-plan-script">"${esc((_dhState.plan.script||'').slice(0,160))}${(_dhState.plan.script||'').length>160?'…':''}"</div>
+          <div class="dh-plan-shots">
+            ${(_dhState.plan.shots||[]).map(s=>`
+            <div class="dh-plan-shot">
+              <span class="dh-plan-shot-num">Shot ${s.shot||'?'} · ${s.duration||'?'}s</span>
+              <span class="dh-plan-shot-desc">${esc(s.description||'')}</span>
             </div>`).join('')}
           </div>
-        </div>
+          ${(_dhState.plan.qualityLevelNeeded||2) > ql ? `
+          <div class="dh-static-warn">⚠ This scene needs Level ${_dhState.plan.qualityLevelNeeded} (${_dhState.status?.qualityLevels?.[_dhState.plan.qualityLevelNeeded]?.label||'Full Scene AI'}) but you're on Level ${ql}. Configure a provider in Settings.</div>` : ''}
+        </div>` : ''}
+      </div>` : ''}
 
-        <div class="fl-field">
-          <label class="fl-label">Script <span style="color:#6b6b8a;font-weight:400">(spoken words only)</span></label>
-          <textarea id="dhScript" class="fl-input" rows="5" placeholder="Enter the exact words your digital human will speak...">${esc(_dhState.script)}</textarea>
+      <!-- Duration + Format -->
+      <div class="dh-row2">
+        <div class="dh-field">
+          <label class="dh-label">Duration</label>
+          <select id="dhDur" class="fl-select">
+            ${[15,30,45,60].map(d=>`<option value="${d}" ${_dhState.duration===d?'selected':''}>${d}s</option>`).join('')}
+          </select>
         </div>
-
-        <div class="fl-row2">
-          <div class="fl-field">
-            <label class="fl-label">Or describe a topic (AI writes script)</label>
-            <input id="dhPrompt" class="fl-input" type="text" placeholder="e.g. Introduce my brand to new customers" value="${esc(_dhState.prompt)}">
-          </div>
-          <div class="fl-field">
-            <label class="fl-label">Tone</label>
-            <select id="dhTone" class="fl-select">
-              ${['professional','casual','energetic','calm','motivational','luxury'].map(t=>`<option value="${t}" ${_dhState.tone===t?'selected':''}>${t.charAt(0).toUpperCase()+t.slice(1)}</option>`).join('')}
-            </select>
-          </div>
+        <div class="dh-field">
+          <label class="dh-label">Format</label>
+          <select id="dhFormat" class="fl-select">
+            <option value="9:16">9:16 Portrait</option>
+            <option value="16:9">16:9 Landscape</option>
+            <option value="1:1">1:1 Square</option>
+          </select>
         </div>
+      </div>
 
-        <div class="fl-row2">
-          <div class="fl-field">
-            <label class="fl-label">Duration</label>
-            <select id="dhDur" class="fl-select">
-              ${[15,30,45,60].map(d=>`<option value="${d}" ${_dhState.duration===d?'selected':''}>${d} seconds</option>`).join('')}
-            </select>
-          </div>
-          <div class="fl-field">
-            <label class="fl-label">Format</label>
-            <select id="dhFormat" class="fl-select">
-              <option value="9:16">9:16 Portrait (TikTok/Reels)</option>
-              <option value="16:9">16:9 Landscape (YouTube)</option>
-              <option value="1:1">1:1 Square (Instagram)</option>
-            </select>
-          </div>
-        </div>
-
-        <button type="submit" class="primary" id="dhGenBtn" ${_dhState.generating?'disabled':''} style="padding:14px;font-size:1rem;font-weight:700">
-          ${_dhState.generating ? '⏳ Submitting…' : '🎬 Generate Video'}
-        </button>
-      </form>`}
-    </div>
+      <button type="submit" class="primary dh-gen-submit" ${_dhState.generating?'disabled':''}>
+        ${_dhState.generating ? '⏳ Submitting…' : '🎬 Generate Video'}
+      </button>
+    </form>`}
   </div>`;
+
+  document.getElementById('dhAdvToggle')?.addEventListener('click', () => {
+    _dhState.advancedMode = !_dhState.advancedMode;
+    renderDHGenerate(el);
+  });
+
+  document.getElementById('dhPlanBtn')?.addEventListener('click', async () => {
+    const dhId = document.getElementById('dhSelHuman')?.value || _dhState.selectedHuman;
+    _dhState.scene      = document.getElementById('dhScene')?.value.trim() || '';
+    _dhState.action     = document.getElementById('dhAction')?.value.trim() || '';
+    _dhState.product    = document.getElementById('dhProduct')?.value.trim() || '';
+    _dhState.cameraStyle= document.getElementById('dhCamera')?.value || 'cinematic';
+    _dhState.prompt     = document.getElementById('dhPrompt')?.value.trim() || '';
+    _dhState.planLoading = true; renderDHGenerate(el);
+    try {
+      const res = await dhApi('/videos/plan', { method:'POST', body: JSON.stringify({
+        digitalHumanId: dhId,
+        prompt: _dhState.prompt || `${_dhState.action} in ${_dhState.scene} for ${_dhState.product}`,
+        scene: _dhState.scene, action: _dhState.action, product: _dhState.product,
+        durationSec: Number(document.getElementById('dhDur')?.value || 30),
+        cameraStyle: _dhState.cameraStyle,
+      })});
+      _dhState.plan = res.plan;
+      if (res.plan?.script && !document.getElementById('dhScript')?.value.trim()) {
+        _dhState.script = res.plan.script;
+      }
+    } catch(e) { toast(e.message, 'error'); }
+    _dhState.planLoading = false; renderDHGenerate(el);
+  });
 
   document.getElementById('dhGenForm')?.addEventListener('submit', async e => {
     e.preventDefault();
-    _dhState.script   = document.getElementById('dhScript')?.value.trim() || '';
-    _dhState.prompt   = document.getElementById('dhPrompt')?.value.trim() || '';
-    _dhState.tone     = document.getElementById('dhTone')?.value || 'professional';
-    _dhState.duration = Number(document.getElementById('dhDur')?.value || 30);
-    const dhId        = document.getElementById('dhSelHuman')?.value;
-    const fmt         = document.getElementById('dhFormat')?.value || '9:16';
-    const dims        = {'9:16':[1080,1920],'16:9':[1920,1080],'1:1':[1080,1080]}[fmt];
+    _dhState.script      = document.getElementById('dhScript')?.value.trim() || '';
+    _dhState.prompt      = document.getElementById('dhPrompt')?.value.trim() || '';
+    _dhState.tone        = document.getElementById('dhTone')?.value || 'professional';
+    _dhState.duration    = Number(document.getElementById('dhDur')?.value || 30);
+    _dhState.scene       = document.getElementById('dhScene')?.value.trim() || '';
+    _dhState.action      = document.getElementById('dhAction')?.value.trim() || '';
+    _dhState.product     = document.getElementById('dhProduct')?.value.trim() || '';
+    _dhState.cameraStyle = document.getElementById('dhCamera')?.value || 'cinematic';
+    const dhId = document.getElementById('dhSelHuman')?.value || _dhState.selectedHuman || humans[0]?.id;
+    const fmt  = document.getElementById('dhFormat')?.value || '9:16';
+    const dims = {'9:16':[1080,1920],'16:9':[1920,1080],'1:1':[1080,1080]}[fmt];
 
-    if (!_dhState.script && !_dhState.prompt) { toast('Enter a script or topic.','error'); return; }
+    if (!_dhState.script && !_dhState.prompt && !_dhState.action) { toast('Enter a script, topic, or scene action.','error'); return; }
     _dhState.generating = true; renderDHGenerate(el);
     try {
       await dhApi('/videos/generate', { method:'POST', body: JSON.stringify({
         digitalHumanId: dhId, mode: _dhState.mode,
         script: _dhState.script, prompt: _dhState.prompt,
         tone: _dhState.tone, durationSec: _dhState.duration,
+        scene: _dhState.scene, action: _dhState.action,
+        product: _dhState.product, cameraStyle: _dhState.cameraStyle,
         outputW: dims[0], outputH: dims[1],
       })});
-      toast('Video job queued! Redirecting to jobs…','success');
-      _dhState.generating = false;
-      _dhState.view = 'jobs';
-      setTimeout(() => renderDigitalHuman(), 1000);
+      toast('Video job queued!','success');
+      _dhState.generating = false; _dhState.view = 'jobs';
+      setTimeout(() => renderDigitalHuman(), 800);
     } catch(err) { toast(err.message,'error'); _dhState.generating=false; renderDHGenerate(el); }
   });
 }
@@ -2375,38 +2526,42 @@ function renderDHJobs(el) {
   const active = jobs.some(j => j.status==='processing'||j.status==='queued');
 
   el.innerHTML = `
-  <div class="fl-wrap">
-    <div class="fl-form-col" style="max-width:800px">
-      <div class="fl-form-head">
-        <button class="ghost" style="margin-bottom:16px;padding:6px 14px;font-size:.8rem" onclick="_dhState.view='home';renderDigitalHuman()">← Back</button>
-        <div class="fl-badge">Digital Human Studio</div>
-        <h2>Video Jobs</h2>
-        <p>${jobs.length} total job${jobs.length!==1?'s':''}${active?' · Processing…':''}</p>
-      </div>
-      ${jobs.length===0 ? `<div style="text-align:center;padding:60px 20px;color:#6b6b8a"><div style="font-size:3rem;margin-bottom:12px;opacity:.4">📋</div><p>No jobs yet. Generate a video to see it here.</p><button class="primary" style="margin-top:16px" onclick="_dhState.view='generate';renderDigitalHuman()">Generate Video</button></div>`
-      : `<div style="display:flex;flex-direction:column;gap:12px">
-        ${jobs.slice(0,20).map(j => {
-          const pct = j.progress||0;
-          const color = j.status==='complete'?'#22c55e':j.status==='failed'?'#ef4444':'#7c5cfc';
-          return `<div style="background:#1a1a24;border:1px solid #2a2a3a;border-radius:12px;padding:16px 20px">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-              <div style="font-weight:600;font-size:.9rem">${j.mode?.replace(/_/g,' ')||'video'}</div>
-              <span style="padding:3px 10px;border-radius:10px;font-size:.7rem;font-weight:600;background:${color}22;color:${color}">${j.status}</span>
-            </div>
-            <div style="font-size:.75rem;color:#6b6b8a;margin-bottom:10px">Stage: ${j.stage||'—'} · ${new Date(j.createdAt).toLocaleDateString()}</div>
-            <div style="height:5px;background:#232330;border-radius:3px;overflow:hidden;margin-bottom:10px">
-              <div style="height:100%;width:${pct}%;background:${color};border-radius:3px;transition:width .4s"></div>
-            </div>
-            ${j.error?`<div style="color:#ef4444;font-size:.78rem;margin-bottom:8px">${esc(j.error)}</div>`:''}
-            <div style="display:flex;gap:8px">
-              ${j.outputPath?`<a href="${DHS_URL_BASE}${j.outputPath}" target="_blank" class="ghost" style="padding:6px 14px;font-size:.78rem">⬇ Download</a>`:''}
-              ${j.thumbnailPath?`<a href="${DHS_URL_BASE}${j.thumbnailPath}" target="_blank" class="ghost" style="padding:6px 14px;font-size:.78rem">🖼 Thumb</a>`:''}
-            </div>
-          </div>`;
-        }).join('')}
-      </div>`}
-      ${active?`<p style="text-align:center;color:#6b6b8a;font-size:.8rem;margin-top:16px">Auto-refreshing every 5 seconds…</p>`:''}
+  <div class="dh-page">
+    <div class="dh-subpage-head">
+      <button class="ghost dh-back-btn" onclick="_dhState.view='home';renderDigitalHuman()">← Back</button>
+      <h2>Video Jobs</h2>
+      <p>${jobs.length} job${jobs.length!==1?'s':''}${active?' · Processing…':''}</p>
     </div>
+
+    ${jobs.length===0 ? `
+    <div class="dh-empty-state">
+      <div class="dh-empty-icon">📋</div>
+      <p>No jobs yet. Generate a video to see it here.</p>
+      <button class="primary" onclick="_dhState.view='generate';renderDigitalHuman()">Generate Video</button>
+    </div>` : `
+    <div class="dh-jobs-list">
+      ${jobs.slice(0,20).map(j => `
+      <div class="dh-job-row">
+        <div class="dh-job-left">
+          <div class="dh-job-title">${esc(j.mode?.replace(/_/g,' ')||'video')}</div>
+          <div class="dh-job-meta">
+            ${dhQualityBadge(j.qualityLevel||1)}
+            <span>${j.stage||''}</span>
+            <span>${new Date(j.createdAt).toLocaleDateString()}</span>
+          </div>
+          ${j.staticFallbackWarning ? `<div class="dh-static-warn">⚠ Static fallback — not real AI motion video</div>` : ''}
+          ${j.status==='processing'||j.status==='queued' ? `
+          <div class="dh-progress-bar"><div class="dh-progress-fill" style="width:${j.progress||8}%"></div></div>` : ''}
+          ${j.error ? `<div class="dh-job-error">${esc(j.error.slice(0,240))}</div>` : ''}
+        </div>
+        <div class="dh-job-actions">
+          ${j.outputPath ? `<a href="${DHS_URL_BASE}${j.outputPath}" target="_blank" class="primary dh-dl-btn">⬇</a>` : ''}
+          ${j.thumbnailPath ? `<a href="${DHS_URL_BASE}${j.thumbnailPath}" target="_blank" class="ghost dh-dl-btn">🖼</a>` : ''}
+          <span class="dh-status-badge ${j.status==='complete'?'dh-status-ok':j.status==='failed'?'dh-status-err':'dh-status-info'}">${j.status}</span>
+        </div>
+      </div>`).join('')}
+    </div>
+    ${active ? `<p class="dh-poll-hint">Auto-refreshing every 5s…</p>` : ''}`}
   </div>`;
 
   if (active) { clearTimeout(_dhState.jobPollTimer); _dhState.jobPollTimer = setTimeout(() => renderDigitalHuman(), 5000); }
@@ -2414,60 +2569,82 @@ function renderDHJobs(el) {
 
 function renderDHCreate(el) {
   el.innerHTML = `
-  <div class="fl-wrap">
-    <div class="fl-form-col" style="max-width:680px">
-      <div class="fl-form-head">
-        <button class="ghost" style="margin-bottom:16px;padding:6px 14px;font-size:.8rem" onclick="_dhState.view='home';renderDigitalHuman()">← Back</button>
-        <div class="fl-badge">Digital Human Studio</div>
-        <h2>Create a Digital Human</h2>
-        <p>Set up your AI avatar — upload your face and confirm consent to get started.</p>
-      </div>
+  <div class="dh-page">
+    <div class="dh-subpage-head">
+      <button class="ghost dh-back-btn" onclick="_dhState.view='home';renderDigitalHuman()">← Back</button>
+      <h2>Create a Digital Human</h2>
+      <p>AI Twin (your face) or Synthetic Human (AI-generated). Consent required.</p>
+    </div>
 
-      <div style="background:rgba(124,92,252,.08);border:1px solid rgba(124,92,252,.25);border-radius:12px;padding:20px;margin-bottom:20px">
-        <div style="font-weight:700;color:#a78bfa;margin-bottom:8px">⚠ Consent Notice</div>
-        <p style="color:#888;font-size:.85rem;line-height:1.6">You must own or have written permission to use the face and voice you upload. Do not upload someone else's likeness without permission.</p>
+    <!-- Type chooser -->
+    <div class="dh-create-types">
+      <div class="dh-create-type ${(_dhState.createType||'twin')==='twin'?'active':''}" onclick="_dhState.createType='twin';renderDHCreate(el)">
+        <div class="dh-create-type-icon">🎥</div>
+        <div class="dh-create-type-name">AI Twin</div>
+        <div class="dh-create-type-desc">Your real face + voice. Upload a photo &amp; record or upload audio.</div>
       </div>
+      <div class="dh-create-type ${_dhState.createType==='fictional'?'active':''}" onclick="_dhState.createType='fictional';renderDHCreate(el)">
+        <div class="dh-create-type-icon">✨</div>
+        <div class="dh-create-type-name">Synthetic Human</div>
+        <div class="dh-create-type-desc">Fully AI-generated fictional person. No upload needed (requires image provider).</div>
+      </div>
+    </div>
 
-      <form id="dhCreateForm" class="fl-form">
-        <div class="fl-row2">
-          <div class="fl-field">
-            <label class="fl-label">Name</label>
-            <input id="dhcName" class="fl-input" type="text" placeholder="e.g. My Brand Avatar" required>
-          </div>
-          <div class="fl-field">
-            <label class="fl-label">Type</label>
-            <select id="dhcType" class="fl-select">
-              <option value="self">My Digital Twin (self)</option>
-              <option value="presenter">Presenter</option>
-              <option value="influencer">Influencer</option>
-              <option value="teacher">Teacher</option>
-              <option value="salesperson">Salesperson</option>
-              <option value="brand">Brand Ambassador</option>
-            </select>
-          </div>
+    <div class="dh-consent-notice">
+      <div class="dh-consent-title">⚠ Consent &amp; Usage Policy</div>
+      <p>You must own or have written permission for any face and voice you upload. No impersonation of real people. Violations result in immediate takedown.</p>
+    </div>
+
+    <form id="dhCreateForm" class="dh-form">
+      <div class="dh-row2">
+        <div class="dh-field">
+          <label class="dh-label">Name</label>
+          <input id="dhcName" class="fl-input" type="text" placeholder="${(_dhState.createType||'twin')==='fictional'?'e.g. Aria — Luxury Brand Host':'e.g. My Brand Avatar'}" required>
         </div>
-
-        <div class="fl-field">
-          <label class="fl-label">Consent Type</label>
-          <select id="dhcConsent" class="fl-select">
-            <option value="self">This is me — I appear in these videos</option>
-            <option value="licensed">I have written permission to use this person's likeness</option>
-            <option value="synthetic">Fully synthetic / fictional person</option>
+        <div class="dh-field">
+          <label class="dh-label">Role / Type</label>
+          <select id="dhcType" class="fl-select">
+            ${(_dhState.createType||'twin')==='fictional' ? `
+            <option value="presenter">Presenter</option>
+            <option value="influencer">Influencer</option>
+            <option value="teacher">Teacher</option>
+            <option value="salesperson">Salesperson</option>
+            <option value="brand">Brand Ambassador</option>` : `
+            <option value="self">My Digital Twin</option>
+            <option value="presenter">Presenter</option>
+            <option value="influencer">Influencer</option>
+            <option value="brand">Brand Ambassador</option>`}
           </select>
         </div>
-
-        <div style="display:flex;align-items:flex-start;gap:10px;margin-bottom:18px">
-          <input type="checkbox" id="dhcAgree" style="margin-top:3px;accent-color:#7c5cfc" required>
-          <label for="dhcAgree" style="font-size:.83rem;color:#b0b0cc;cursor:pointer">I confirm I own or have permission to use this face and voice. I agree not to use it for deception, impersonation, or any harmful purpose.</label>
-        </div>
-
-        <button type="submit" class="primary" id="dhcBtn">Create Digital Human</button>
-      </form>
-
-      <div style="margin-top:24px;padding:16px;background:#111118;border:1px solid #2a2a3a;border-radius:10px;text-align:center">
-        <p style="color:#6b6b8a;font-size:.82rem;margin-bottom:10px">After creating, you can upload your face photo and voice sample in the full Digital Human Studio.</p>
-        <a href="${DHS_URL_BASE}" target="_blank" style="color:#a78bfa;font-size:.82rem;font-weight:600">Open Full Studio →</a>
       </div>
+
+      ${_dhState.createType==='fictional' ? `
+      <div class="dh-field">
+        <label class="dh-label">Description (for AI face generation)</label>
+        <textarea id="dhcDesc" class="fl-input" rows="2" placeholder="e.g. Professional woman, 30s, dark hair, confident smile, studio lighting"></textarea>
+        <div class="dh-field-hint">Requires image provider (DALL-E / Stability / FAL) in Settings. Otherwise you can upload a face photo later.</div>
+      </div>` : ''}
+
+      <div class="dh-field">
+        <label class="dh-label">Consent</label>
+        <select id="dhcConsent" class="fl-select">
+          ${(_dhState.createType||'twin')==='fictional' ? `
+          <option value="synthetic">Fully synthetic / fictional — no real person</option>` : `
+          <option value="self">This is me — I appear in these videos</option>
+          <option value="licensed">I have written permission for this person's likeness</option>`}
+        </select>
+      </div>
+
+      <div class="dh-consent-check">
+        <input type="checkbox" id="dhcAgree" required>
+        <label for="dhcAgree">I confirm I own or have permission for any likeness used. I will not use this for deception, impersonation, or harmful purposes.</label>
+      </div>
+
+      <button type="submit" class="primary dh-gen-submit" id="dhcBtn">Create Digital Human</button>
+    </form>
+
+    <div class="dh-footer-link">
+      <a href="${DHS_URL_BASE}" target="_blank">Open full Digital Human Studio ↗</a>
     </div>
   </div>`;
 
@@ -2475,16 +2652,21 @@ function renderDHCreate(el) {
     e.preventDefault();
     const btn = document.getElementById('dhcBtn');
     btn.disabled=true; btn.textContent='Creating…';
+    const isFictional = _dhState.createType === 'fictional';
     try {
-      const res = await dhApi('/digital-humans', { method:'POST', body: JSON.stringify({
-        name: document.getElementById('dhcName')?.value.trim(),
-        type: document.getElementById('dhcType')?.value,
-        consentType: document.getElementById('dhcConsent')?.value,
-        consentConfirmed: true,
-        consentNote: 'Confirmed via ClipForge AI integration',
-        defaultVoice: 'en_US-amy-medium',
-      })});
-      toast(`Digital Human "${res.digitalHuman?.name}" created!`,'success');
+      const res = await dhApi(isFictional ? '/digital-humans/create-fictional' : '/digital-humans', {
+        method:'POST', body: JSON.stringify({
+          name: document.getElementById('dhcName')?.value.trim(),
+          type: document.getElementById('dhcType')?.value,
+          description: document.getElementById('dhcDesc')?.value?.trim() || '',
+          consentType: document.getElementById('dhcConsent')?.value,
+          consentConfirmed: true,
+          consentNote: 'Confirmed via ClipForge AI integration',
+          isFictional,
+          defaultVoice: 'en_US-amy-medium',
+        })
+      });
+      toast(`"${res.digitalHuman?.name}" created!`,'success');
       _dhState.humans.unshift(res.digitalHuman);
       _dhState.selectedHuman = res.digitalHuman?.id;
       _dhState.view = 'home';
