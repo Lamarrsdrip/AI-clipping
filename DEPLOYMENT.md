@@ -19,6 +19,26 @@ Use Docker on Render for this project. The repo includes a `Dockerfile` that ins
 - `ffmpeg`
 - `python3`
 - `yt-dlp`
+- `opencv-python-headless` + `mediapipe` (Reframe Engine v7 face tracking — see memory note below)
+
+### ⚠️ Memory plan: required before face tracking runs for real
+
+`face_track.py` now has its real dependencies (`opencv-python-headless`, `mediapipe`) available in
+the image. Previously these were missing, so every clip silently fell back to a static center crop —
+this is the fix that turns the app's actual differentiator on.
+
+**This has a real memory cost that the `render.yaml` `starter` plan (512MB) was not sized for.**
+`MAX_RSS_MB=420` only watches the Node process's own memory — it cannot see or protect against the
+separate Python subprocess `face_track.py` spawns per render job, which loads mediapipe's Face Mesh
+model and can add 150–300MB of RSS on top of Node's baseline. On a 512MB container that risks Render
+hard-killing the whole service (not a graceful in-app fallback) under load.
+
+**Before relying on this in production:** upgrade the Render plan to at least `standard` (2GB RAM,
+~$25/mo vs. `starter`'s ~$7/mo) in `render.yaml` (`plan: standard`) and in the Render dashboard. This
+is a recurring cost increase, so it's left as a manual decision rather than applied automatically.
+Until upgraded, the code is safe either way — `face_track.py` still degrades gracefully to a static
+crop if the dependencies fail to import — but a mid-render OOM kill under the old plan would surface
+as a failed job instead of that graceful fallback.
 
 Render settings:
 

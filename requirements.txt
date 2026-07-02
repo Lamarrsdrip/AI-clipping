@@ -1,1 +1,10 @@
 yt-dlp>=2026.1.1
+
+# Reframe Engine v7 (face tracking + dynamic crop) — face_track.py imports these and
+# silently falls back to a static center crop when they're missing. They were never
+# actually installed in the deployed container, so the app's real differentiator
+# never ran in production. See Dockerfile for required system libs, and README/
+# DEPLOYMENT.md for the Render memory-plan note before enabling this in prod.
+opencv-python-headless>=4.9.0
+mediapipe>=0.10.14
+numpy>=1.26.0

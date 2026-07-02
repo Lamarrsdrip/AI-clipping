@@ -31,9 +31,9 @@ function updateWmHint(val) {
 const fmt = n => Number(n) >= 1e6 ? (n/1e6).toFixed(1)+'M' : Number(n) >= 1e3 ? (n/1e3).toFixed(1)+'K' : String(n||0);
 const dur = s => { const n=Number(s||0); if(!n) return '--'; const m=Math.floor(n/60); return m>0?`${m}m ${n%60|0}s`:`${n|0}s`; };
 const when = d => { if(!d) return ''; const ms=Date.now()-new Date(d).getTime(); const m=Math.floor(ms/60000); return m<1?'just now':m<60?`${m}m ago`:m<1440?`${Math.floor(m/60)}h ago`:`${Math.floor(m/1440)}d ago`; };
-function uid() { return localStorage.getItem('clipforge:userId') || ''; }
+function token() { return localStorage.getItem('clipforge:token') || ''; }
 function api(path, opts = {}) {
-  return fetch(path, { ...opts, headers: { 'content-type': 'application/json', 'x-user-id': uid(), ...(opts.headers || {}) } })
+  return fetch(path, { ...opts, headers: { 'content-type': 'application/json', 'authorization': token() ? `Bearer ${token()}` : '', ...(opts.headers || {}) } })
     .then(r => r.text().then(text => {
       let d;
       try { d = JSON.parse(text); } catch {
@@ -50,16 +50,19 @@ function pill(label, cls='') { return `<span class="pill ${cls}">${esc(label)}</
 function scoreColor(n) { return n>=85?'ok':n>=70?'warn':''; }
 
 /* ── Path helper: convert absolute filesystem path → /media/… URL ─── */
+// /media/* now requires an owner-checked session token. <video src>/<a href> can't
+// set an Authorization header, so the token travels as a query param instead.
 function clipUrl(outputPath) {
   if (!outputPath) return '';
+  const t = token() ? `?token=${encodeURIComponent(token())}` : '';
   // If it's already a relative/absolute URL (starts with / but not /Users)
-  if (outputPath.startsWith('/') && !outputPath.startsWith('/Users')) return outputPath;
+  if (outputPath.startsWith('/') && !outputPath.startsWith('/Users')) return outputPath + t;
   // Extract everything after 'storage/'
   const idx = outputPath.indexOf('storage/');
-  if (idx !== -1) return '/media/' + outputPath.slice(idx + 'storage/'.length);
+  if (idx !== -1) return '/media/' + outputPath.slice(idx + 'storage/'.length) + t;
   // Fallback: just use the filename
   const filename = outputPath.split('/').pop();
-  return `/media/clips/${filename}`;
+  return `/media/clips/${filename}${t}`;
 }
 
 const PLATFORMS = ['TikTok','YouTube Shorts','Instagram Reels','X','LinkedIn','Facebook'];
@@ -185,7 +188,7 @@ function openClipModal(clipId) {
       <div class="clip-modal">
         <div class="clip-modal-video-col">
           <video id="modalVideoEl" src="${esc(url)}" controls autoplay playsinline
-            poster="${esc(c.thumbnailPath || '')}"
+            poster="${esc(clipUrl(c.thumbnailPath || ''))}"
             style="width:100%;height:100%;object-fit:contain;display:block">
           </video>
         </div>
@@ -340,7 +343,7 @@ function openMenu() {
   $('#drawerClose')?.addEventListener('click', closeMenu);
   $('#drawerBd')?.addEventListener('click', closeMenu);
   $('#drawerLogout')?.addEventListener('click', () => {
-    localStorage.removeItem('clipforge:userId'); location.reload();
+    localStorage.removeItem('clipforge:token'); location.reload();
   });
 }
 
@@ -622,7 +625,7 @@ function renderLogoQuickSetup() {
     // Kit selected and has a logo — show preview
     return `
       <div style="margin-top:10px;padding:10px 14px;background:var(--surface2);border-radius:10px;border:1px solid var(--accent);display:flex;align-items:center;gap:10px">
-        <img src="${esc(selected.logoUrl)}" style="height:32px;max-width:64px;object-fit:contain;border-radius:4px;background:#111">
+        <img src="${esc(clipUrl(selected.logoUrl))}" style="height:32px;max-width:64px;object-fit:contain;border-radius:4px;background:#111">
         <div style="flex:1">
           <b style="font-size:13px">${esc(selected.name)}</b>
           <div class="muted" style="font-size:11px">${esc(selected.logoPosition||'top-left')} · ${esc(selected.logoSize||'medium')} · ${Math.round((selected.logoOpacity??0.9)*100)}% opacity</div>
@@ -807,7 +810,7 @@ async function uploadSource(e) {
 function uploadWithProgress(form) {
   return new Promise((resolve,reject) => {
     const xhr=new XMLHttpRequest();
-    xhr.open('POST','/api/upload'); xhr.setRequestHeader('x-user-id',uid());
+    xhr.open('POST','/api/upload'); xhr.setRequestHeader('authorization', token() ? `Bearer ${token()}` : '');
     xhr.upload.onprogress=ev => {
       if (!ev.lengthComputable) return;
       state.uploadProgress=Math.max(1,Math.min(99,Math.round((ev.loaded/ev.total)*100)));
@@ -1028,6 +1031,7 @@ function jobCard(j) {
       </div>
       <div class="action-row">${actions}</div>
     </div>
+    ${j.status==='queued' && j.queuePosition?`<p class="muted" style="margin:4px 0 0;font-size:.78rem">Queued — waiting behind ${j.queuePosition-1} other${j.queuePosition-1===1?'':'s'}${j.queueActive?` (${j.queueActive} rendering now)`:''}</p>`:''}
     ${steps.length?`<div class="steps-row">${steps.map(s=>`<div class="step ${s.status}"><span></span><small>${esc(s.label)}</small></div>`).join('')}</div>`:''}
     ${isActive?`<div class="progress" style="margin-top:9px"><span style="width:${j.progress||0}%"></span></div>`:''}
     ${j.error?`<p class="error-text" style="margin-top:7px">${esc(j.error)}</p>`:''}
@@ -1050,7 +1054,7 @@ function clipCard(c) {
   const dashOffset = Math.round(175 - (score/100)*175);
 
   const thumbEl = c.thumbnailPath
-    ? `<img class="clip-thumb-img" src="${esc(c.thumbnailPath)}" alt="${esc(title)}" loading="lazy">`
+    ? `<img class="clip-thumb-img" src="${esc(clipUrl(c.thumbnailPath))}" alt="${esc(title)}" loading="lazy">`
     : `<div class="clip-thumb-skeleton skeleton" style="position:absolute;inset:0"></div>`;
 
   return `<article class="clip-card${isSelected?' selected':''}" data-clip-id="${c.id}">
@@ -1134,7 +1138,7 @@ function renderClipDetail() {
       <!-- Left: video + scores -->
       <section class="panel stack">
         <div class="phone-frame">
-          ${c.outputPath?`<video src="${clipUrl(c.outputPath)}" controls poster="${c.thumbnailPath||''}" playsinline></video>`:`<div class="demo-frame">${esc(c.hook)}</div>`}
+          ${c.outputPath?`<video src="${clipUrl(c.outputPath)}" controls poster="${esc(clipUrl(c.thumbnailPath||''))}" playsinline></video>`:`<div class="demo-frame">${esc(c.hook)}</div>`}
         </div>
         <div class="score-panel">
           <div class="big-score ${scoreColor(c.score)}">${c.score}<small>/100</small></div>
@@ -1463,14 +1467,14 @@ function genCard(g) {
   return `<div class="gen-card ${isPending?'pending':''}">
     ${isReady
       ? (isVideo
-          ? `<video src="${g.outputPath}" controls muted playsinline loop></video>`
-          : `<img src="${g.outputPath}" alt="Generated image">`)
+          ? `<video src="${clipUrl(g.outputPath)}" controls muted playsinline loop></video>`
+          : `<img src="${clipUrl(g.outputPath)}" alt="Generated image">`)
       : `<div class="gen-placeholder">${isPending?`<div class="gen-spinner">⟳</div><small>${esc(g.status)}</small>`:`<div class="error-text">${esc(g.error||'Failed')}</div>`}</div>`
     }
     <div class="gen-card-info">
       <p class="gen-prompt">${esc((g.prompt||'').slice(0,80))}</p>
       <div class="action-row">
-        ${isReady?`<a class="button ghost" href="${g.outputPath}" download>Download</a>`:''}
+        ${isReady?`<a class="button ghost" href="${clipUrl(g.outputPath)}" download>Download</a>`:''}
         <button class="ghost danger-btn" data-delete-gen="${g.id}">Delete</button>
       </div>
     </div>
@@ -2941,7 +2945,7 @@ function _renderSettings() {
     : state.brandKits.map(bk => `
         <div class="brand-kit-row" data-kit-id="${esc(bk.id)}" style="display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--border)">
           ${bk.logoUrl
-            ? `<img src="${esc(bk.logoUrl)}" style="height:44px;width:auto;max-width:100px;object-fit:contain;border-radius:6px;background:#111;padding:4px;flex-shrink:0">`
+            ? `<img src="${esc(clipUrl(bk.logoUrl))}" style="height:44px;width:auto;max-width:100px;object-fit:contain;border-radius:6px;background:#111;padding:4px;flex-shrink:0">`
             : `<div style="width:100px;height:44px;background:var(--surface2);border-radius:6px;display:flex;align-items:center;justify-content:center;flex-shrink:0"><span class="muted" style="font-size:11px">No logo file</span></div>`}
           <div style="flex:1;min-width:0">
             <b style="font-size:14px">${esc(bk.name)}</b>
@@ -3066,7 +3070,7 @@ function _renderSettings() {
         const fd = new FormData();
         fd.append('brandKitId', saved.id);
         fd.append('logo', logoFile);
-        const r = await fetch('/api/brand-kit/logo', {method:'POST', headers:{'x-user-id':uid()}, body:fd});
+        const r = await fetch('/api/brand-kit/logo', {method:'POST', headers:{'authorization': token() ? `Bearer ${token()}` : ''}, body:fd});
         const rd = await r.text().then(t=>{try{return JSON.parse(t);}catch{throw new Error('Logo upload failed — invalid response');}});
         if (!r.ok) throw new Error(rd.error || 'Logo upload failed');
         state.brandKits = state.brandKits.map(bk => bk.id === rd.kit.id ? rd.kit : bk);
@@ -3128,7 +3132,7 @@ function renderBrandKitForm() {
 
       <!-- SECONDARY: logo image -->
       <div style="padding:12px;background:var(--surface2);border-radius:8px;border:1px solid var(--border)">
-        ${kit.logoUrl ? `<img src="${esc(kit.logoUrl)}" style="height:36px;margin-bottom:8px;border-radius:4px;background:#111;display:block;padding:4px">` : ''}
+        ${kit.logoUrl ? `<img src="${esc(clipUrl(kit.logoUrl))}" style="height:36px;margin-bottom:8px;border-radius:4px;background:#111;display:block;padding:4px">` : ''}
         <input id="bkLogo" type="file" accept=".png,.jpg,.jpeg,.webp" style="font-size:12px">
         <small class="muted" style="display:block;margin-top:4px">PNG with transparent background recommended. Replaces text if uploaded.</small>
       </div>
@@ -3585,7 +3589,7 @@ $('#authForm').addEventListener('submit', async e => {
     }
     const data=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}).then(r=>r.text().then(t=>{try{return JSON.parse(t);}catch{throw new Error('Service unavailable. Please try again.');}}));
     if (data.error) throw new Error(data.error);
-    localStorage.setItem('clipforge:userId',data.user.id);
+    localStorage.setItem('clipforge:token',data.token);
     hideAuth();
     await boot();
   } catch(e2) {
@@ -3731,7 +3735,7 @@ function hideAuth() {
 
 /* ── Boot ─────────────────────────────────────────────────────────── */
 async function boot() {
-  if (!uid()) {
+  if (!token()) {
     $('#landingShell').classList.remove('hidden');
     $('#authShell').classList.add('hidden');
     $('#appShell').classList.add('hidden');
@@ -3741,7 +3745,7 @@ async function boot() {
   const user = state.session?.user;
   if (!user) {
     if (state.session !== null) {
-      localStorage.removeItem('clipforge:userId');
+      localStorage.removeItem('clipforge:token');
     }
     $('#landingShell').classList.remove('hidden');
     $('#authShell').classList.add('hidden');

@@ -9,6 +9,7 @@ ENV YTDLP_JS_RUNTIME=node
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip ca-certificates \
+       libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 

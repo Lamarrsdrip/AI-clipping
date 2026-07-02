@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -262,8 +262,26 @@ function buildViralIntelligence(video, moment, hook, index = 0) {
   };
 }
 
-function hashPassword(password = '') {
+// Legacy unsalted hash — kept only to verify passwords hashed before the scrypt migration.
+function hashPasswordLegacy(password = '') {
   return createHash('sha256').update(`clipforge:${password}`).digest('hex');
+}
+
+// scrypt with a random per-user salt. Format: "scrypt:<saltHex>:<hashHex>"
+function hashPassword(password = '', salt = randomBytes(16).toString('hex')) {
+  const hash = scryptSync(password, salt, 64).toString('hex');
+  return `scrypt:${salt}:${hash}`;
+}
+
+function verifyPassword(password, storedHash = '') {
+  if (storedHash.startsWith('scrypt:')) {
+    const [, salt, hash] = storedHash.split(':');
+    const candidate = scryptSync(password || '', salt, 64);
+    const stored = Buffer.from(hash, 'hex');
+    return candidate.length === stored.length && timingSafeEqual(candidate, stored);
+  }
+  // Legacy account — verify against the old unsalted hash for one last login.
+  return storedHash === hashPasswordLegacy(password);
 }
 
 function defaultPlans() {
@@ -351,6 +369,65 @@ function saveDb(db) {
   if (!Array.isArray(db.transcriptions)) db.transcriptions = [];
   if (!Array.isArray(db.brandKits)) db.brandKits = [];
   writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+}
+
+// db.json has no row-level locking. A handler that does `loadDb() → await someSlowCall() →
+// saveDb(db)` is writing back a snapshot that can already be stale if another request wrote
+// in between, silently clobbering that write (e.g. two concurrent renders each editing a
+// different clip's fields both save the *whole* file, so whichever finishes last wins and
+// the other request's change is lost even though they touched different records).
+// dbMutation() gives call sites a way to opt into a serialized critical section: only one
+// dbMutation() body runs at a time, and it always starts from the freshest on-disk state,
+// so a fetch-mutate-save spanning an await can no longer lose a concurrent write. This does
+// not replace a real database with row-level transactions (tracked as future work), but it
+// closes the specific lost-update class for any call site that adopts it.
+let _dbMutationChain = Promise.resolve();
+function dbMutation(fn) {
+  const run = _dbMutationChain.then(async () => {
+    const db = loadDb();
+    const result = await fn(db);
+    saveDb(db);
+    return result;
+  });
+  // Keep the chain alive even if this mutation throws, so later queued mutations still run.
+  _dbMutationChain = run.catch(() => {});
+  return run;
+}
+
+// ─── Session tokens ─────────────────────────────────────────────────────────
+// HMAC-signed bearer tokens replace the old unsigned x-user-id header, which let
+// anyone who obtained a user's UUID impersonate them. Secret is provided via
+// SESSION_SECRET, or auto-generated once and persisted in db.json (gitignored)
+// so tokens stay valid across restarts without requiring a new deploy env var.
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const SESSION_SECRET = (() => {
+  if (process.env.SESSION_SECRET) return process.env.SESSION_SECRET;
+  const db = loadDb();
+  if (!db.meta) db.meta = {};
+  if (!db.meta.sessionSecret) {
+    db.meta.sessionSecret = randomBytes(32).toString('hex');
+    saveDb(db);
+  }
+  return db.meta.sessionSecret;
+})();
+
+function signToken(userId) {
+  const payload = Buffer.from(JSON.stringify({ userId, exp: Date.now() + SESSION_TTL_MS })).toString('base64url');
+  const sig = createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function verifyToken(token = '') {
+  const [payload, sig] = String(token).split('.');
+  if (!payload || !sig) return null;
+  const expected = createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  const sigBuf = Buffer.from(sig), expBuf = Buffer.from(expected);
+  if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) return null;
+  try {
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    if (!data.userId || !data.exp || data.exp < Date.now()) return null;
+    return data;
+  } catch { return null; }
 }
 
 function json(res, status, payload) {
@@ -3322,8 +3399,18 @@ async function processVideo(payload) {
     if (failedVideo) {
       failedVideo.status = 'failed';
       failedVideo.lastError = cleanError;
-      saveDb(failedDb);
     }
+    // Refund the credits deducted at job start — a failed render shouldn't cost the user.
+    const failedJob = failedDb.jobs.find(item => item.id === job.id);
+    if (CREDITS_ENABLED && jobOwner.role !== 'admin' && failedJob && !failedJob.creditsRefunded) {
+      const owner = failedDb.users.find(u => u.id === jobOwner.id);
+      if (owner) {
+        owner.credits += CLIP_JOB_CREDIT_COST;
+        failedDb.creditTransactions.unshift({ id: randomUUID(), userId: owner.id, amount: CLIP_JOB_CREDIT_COST, reason: `Refund — clip job failed (${video.title || 'video'})`, createdAt: new Date().toISOString() });
+        failedJob.creditsRefunded = true;
+      }
+    }
+    saveDb(failedDb);
     if (downloadedPath) unlinkQuiet(downloadedPath);
     throw error;
   }
@@ -3355,10 +3442,15 @@ function mimeFor(file) {
 }
 
 function currentUser(req, db) {
-  const userId = (req.headers['x-user-id'] || '').trim() ||
-    new URL(req.url, `http://${req.headers.host}`).searchParams.get('userId') || '';
-  if (!userId) return null;
-  return db.users.find(user => user.id === userId) || null;
+  const auth = req.headers['authorization'] || '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const token = bearer ||
+    (req.headers['x-session-token'] || '').trim() ||
+    new URL(req.url, `http://${req.headers.host}`).searchParams.get('token') || '';
+  if (!token) return null;
+  const payload = verifyToken(token);
+  if (!payload) return null;
+  return db.users.find(user => user.id === payload.userId) || null;
 }
 
 function publicUser(user) {
@@ -4310,8 +4402,13 @@ async function handleApi(req, res, pathname) {
       const db = loadDb();
       let user = db.users.find(item => item.email.toLowerCase() === email);
       if (!user) throw new Error('No account found. Create an account first.');
-      if (password && user.passwordHash !== hashPassword(password)) throw new Error('Incorrect password.');
-      return json(res, 200, { user: publicUser(user) });
+      if (password && !verifyPassword(password, user.passwordHash)) throw new Error('Incorrect password.');
+      if (password && !user.passwordHash.startsWith('scrypt:')) {
+        // Migrate legacy unsalted hash to scrypt now that we know the plaintext.
+        user.passwordHash = hashPassword(password);
+        saveDb(db);
+      }
+      return json(res, 200, { user: publicUser(user), token: signToken(user.id) });
     }
     if (pathname === '/api/signup' && req.method === 'POST') {
       const body = await readJson(req);
@@ -4337,7 +4434,7 @@ async function handleApi(req, res, pathname) {
       db.subscriptions.push({ id: randomUUID(), userId: user.id, planId: 'free', status: 'active', currentPeriodEnd: null });
       db.creditTransactions.unshift({ id: randomUUID(), userId: user.id, amount: 20, reason: 'Signup credits', createdAt: new Date().toISOString() });
       saveDb(db);
-      return json(res, 200, { user: publicUser(user) });
+      return json(res, 200, { user: publicUser(user), token: signToken(user.id) });
     }
     if (pathname === '/api/billing/bank') {
       const db = loadDb();
@@ -4477,11 +4574,20 @@ async function handleApi(req, res, pathname) {
       });
       const myTranscriptions = isAdmin ? db.transcriptions : db.transcriptions.filter(t => myVideoIds.has(t.videoId));
       const myStudioGenerations = isAdmin ? db.studioGenerations : db.studioGenerations.filter(g => g.userId === user.id);
+      // Attach live queue position so a queued job shows "waiting behind N others" instead
+      // of an indistinguishable-from-stalled 0% progress bar.
+      const queuedJobIds = renderQueue.map(item => item.payload.jobId).filter(Boolean);
+      const myJobsWithQueue = myJobs.map(job => {
+        if (job.status !== 'queued') return job;
+        const idx = queuedJobIds.indexOf(job.id);
+        if (idx === -1) return job;
+        return { ...job, queuePosition: idx + 1, queueTotal: queuedJobIds.length, queueActive: activeRenderJobs };
+      });
       const scopedDb = {
         ...db,
         videos: myVideos,
         clips: myClips,
-        jobs: myJobs,
+        jobs: myJobsWithQueue,
         projects: myProjects,
         socialAccounts: mySocialAccounts,
         scheduledPosts: myScheduledPosts,
@@ -4513,8 +4619,10 @@ async function handleApi(req, res, pathname) {
       const video = clip ? db.videos.find(v => v.id === clip.videoId && v.userId === user.id) : null;
       if (!clip || !video) throw new Error('Clip not found.');
       const result = await generateMultipleHooks(db, video, clip);
-      clip.hooks = result.hooks;
-      saveDb(db);
+      await dbMutation(freshDb => {
+        const freshClip = freshDb.clips.find(c => c.id === clip.id);
+        if (freshClip) freshClip.hooks = result.hooks;
+      });
       return json(res, 200, result);
     }
     if (pathname === '/api/social/generate' && req.method === 'POST') {
@@ -4525,8 +4633,10 @@ async function handleApi(req, res, pathname) {
       const video = clip ? db.videos.find(v => v.id === clip.videoId && v.userId === user.id) : null;
       if (!clip || !video) throw new Error('Clip not found.');
       const result = await generateAllPlatformContent(db, video, clip);
-      clip.platformContent = result;
-      saveDb(db);
+      await dbMutation(freshDb => {
+        const freshClip = freshDb.clips.find(c => c.id === clip.id);
+        if (freshClip) freshClip.platformContent = result;
+      });
       return json(res, 200, result);
     }
     if (pathname === '/api/thumbnail/generate' && req.method === 'POST') {
@@ -4538,8 +4648,10 @@ async function handleApi(req, res, pathname) {
       const clipPath = path.join(STORAGE_DIR, 'clips', path.basename(clip.outputPath));
       const canDraw = await drawtextSupported();
       const options = await generateThumbnailOptions(clip.id, clipPath, clip.hook || clip.title, clip.title || '', canDraw);
-      clip.thumbnailOptions = options;
-      saveDb(db);
+      await dbMutation(freshDb => {
+        const freshClip = freshDb.clips.find(c => c.id === clip.id);
+        if (freshClip) freshClip.thumbnailOptions = options;
+      });
       return json(res, 200, { options });
     }
     if (pathname === '/api/broll/suggest' && req.method === 'POST') {
@@ -4881,8 +4993,10 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/job' && req.method === 'PATCH') {
       const body = await readJson(req);
       const db = loadDb();
+      const user = requireUser(req, db);
       const job = db.jobs.find(item => item.id === body.jobId);
       if (!job) throw new Error('Job not found.');
+      if (job.userId !== user.id && user.role !== 'admin') throw Object.assign(new Error('You do not have access to this job.'), { status: 403 });
       if (body.action === 'delete') {
         killActiveJobProcesses(job.id);
         db.jobs = db.jobs.filter(item => item.id !== body.jobId);
@@ -5019,18 +5133,20 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/schedule' && req.method === 'POST') {
       const body = await readJson(req);
       const db = loadDb();
-      requireUser(req, db);
+      const user = requireUser(req, db);
       const clip = db.clips.find(item => item.id === body.clipId);
       if (!clip) throw new Error('Clip not found.');
+      if (clip.userId !== user.id && user.role !== 'admin') throw Object.assign(new Error('You do not have access to this clip.'), { status: 403 });
       const platform = String(body.platform || '').trim();
       const scheduledFor = String(body.scheduledFor || '').trim();
       if (!PLATFORMS.includes(platform)) throw new Error('Choose a supported platform.');
       if (!scheduledFor) throw new Error('Choose a schedule date and time.');
-      const account = db.socialAccounts.find(item => item.platform === platform);
+      const account = db.socialAccounts.find(item => item.platform === platform && item.userId === user.id);
       if (!account) throw new Error(`Add a ${platform} posting account before scheduling.`);
       if (account.oauthStatus !== 'connected') throw new Error(`${platform} is not connected yet. Go to Social Accounts and connect OAuth before scheduling.`);
       const post = {
         id: randomUUID(),
+        userId: user.id,
         clipId: clip.id,
         platform,
         accountId: account.id,
@@ -5071,16 +5187,20 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/social-account/test' && req.method === 'POST') {
       const body = await readJson(req);
       const db = loadDb();
+      const user = requireUser(req, db);
       const account = db.socialAccounts.find(item => item.id === body.accountId);
       if (!account) throw new Error('Account not found.');
+      if (account.userId !== user.id && user.role !== 'admin') throw Object.assign(new Error('You do not have access to this account.'), { status: 403 });
       if (account.oauthStatus !== 'connected') throw new Error('OAuth is not connected for this account.');
       return json(res, 200, { ok: true, message: `${account.platform} connection is healthy.` });
     }
     if (pathname === '/api/social-account/disconnect' && req.method === 'POST') {
       const body = await readJson(req);
       const db = loadDb();
+      const user = requireUser(req, db);
       const account = db.socialAccounts.find(item => item.id === body.accountId);
       if (!account) throw new Error('Account not found.');
+      if (account.userId !== user.id && user.role !== 'admin') throw Object.assign(new Error('You do not have access to this account.'), { status: 403 });
       account.oauthStatus = 'not_connected';
       account.status = 'saved';
       account.permissions = [];
@@ -5091,10 +5211,13 @@ async function handleApi(req, res, pathname) {
     if (pathname === '/api/post-now' && req.method === 'POST') {
       const body = await readJson(req);
       const db = loadDb();
+      const user = requireUser(req, db);
       const clip = db.clips.find(item => item.id === body.clipId);
       const account = db.socialAccounts.find(item => item.id === body.accountId);
       if (!clip) throw new Error('Clip not found.');
+      if (clip.userId !== user.id && user.role !== 'admin') throw Object.assign(new Error('You do not have access to this clip.'), { status: 403 });
       if (!account) throw new Error('Posting account not found.');
+      if (account.userId !== user.id && user.role !== 'admin') throw Object.assign(new Error('You do not have access to this account.'), { status: 403 });
       if (account.oauthStatus !== 'connected') throw new Error(`${account.platform} is not connected.`);
       throw new Error(`Real ${account.platform} auto-posting needs approved OAuth credentials. The app saved the account and clip; connect the platform developer app before posting.`);
     }
@@ -5483,6 +5606,19 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname.startsWith('/media/')) {
     const file = path.normalize(path.join(STORAGE_DIR, url.pathname.replace('/media/', '')));
     if (!file.startsWith(STORAGE_DIR) || !existsSync(file)) return json(res, 404, { error: 'Media not found' });
+    const db = loadDb();
+    const user = currentUser(req, db);
+    if (!user) return json(res, 401, { error: 'Authentication required.' });
+    // Clip video/thumbnail files are named after the clip id — enforce per-user ownership,
+    // not just "logged in", since these are the assets an IDOR would actually expose.
+    const relative = url.pathname.replace('/media/', '');
+    const clipMatch = relative.match(/^(?:clips|thumbs)\/(?:clip_)?([^./]+)\./);
+    if (clipMatch) {
+      const clip = db.clips.find(c => c.id === clipMatch[1]);
+      if (clip && clip.userId !== user.id && user.role !== 'admin') {
+        return json(res, 403, { error: 'You do not have access to this clip.' });
+      }
+    }
     res.writeHead(200, { 'content-type': mimeFor(file), 'content-length': statSync(file).size });
     return res.end(readFileSync(file));
   }
