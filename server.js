@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { createHash, createHmac, randomUUID, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
-import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -43,6 +43,10 @@ const CLIP_JOB_CREDIT_COST = Number(process.env.CLIP_JOB_CREDIT_COST || 5);
 const MIN_CLIP_SOURCE_SECONDS = Number(process.env.MIN_CLIP_SOURCE_SECONDS || 15);
 const IMPORT_RATE_LIMIT_MS = Number(process.env.IMPORT_RATE_LIMIT_MS || 8000);
 const YTDLP_BLOCK_COOLDOWN_MS = Number(process.env.YTDLP_BLOCK_COOLDOWN_MS || 15 * 60 * 1000);
+const YTDLP_COOKIES_PATH = process.env.YTDLP_COOKIES_PATH || path.join(DATA_DIR, 'youtube_cookies.txt');
+// Clients tried, in order, when YouTube's bot-check blocks the default client. Each only
+// runs if the previous attempt failed specifically with a bot-check error (not other failures).
+const YOUTUBE_CLIENT_FALLBACKS = ['android_vr', 'ios', 'web_safari', 'tv_embedded'];
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 300 * 1024 * 1024);
 const MAX_CONCURRENT_RENDER_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_RENDER_JOBS || 1));
 const PROCESS_TIMEOUT_MS = Number(process.env.PROCESS_TIMEOUT_MS || 10 * 60 * 1000);
@@ -624,7 +628,37 @@ async function ytDlpBaseArgs() {
     if (await hasCommand(runtimeName)) args.push('--js-runtimes', runtime);
     else importLog('warn', 'yt-dlp JavaScript runtime not found', { runtime });
   }
+  if (existsSync(YTDLP_COOKIES_PATH)) args.push('--cookies', YTDLP_COOKIES_PATH);
   return args;
+}
+
+// Runs yt-dlp with the default client first; if YouTube's bot-check blocks that specific
+// attempt, retries with each fallback client in turn before giving up. Any non-bot-check
+// error (private video, unsupported URL, etc.) fails immediately without wasting retries.
+async function runYtDlpWithClientFallback(ytdlpCommand, extraArgs, runOptions = {}) {
+  const baseArgs = await ytDlpBaseArgs();
+  const attempts = [null, ...YOUTUBE_CLIENT_FALLBACKS];
+  let lastError;
+  for (let i = 0; i < attempts.length; i++) {
+    const client = attempts[i];
+    const clientArgs = client ? ['--extractor-args', `youtube:player_client=${client}`] : [];
+    const args = [...baseArgs, ...clientArgs, ...extraArgs];
+    try {
+      const result = await run(ytdlpCommand, args, runOptions);
+      if (i > 0) importLog('log', 'yt-dlp succeeded after client fallback', { client });
+      return result;
+    } catch (error) {
+      lastError = error;
+      const message = String(error?.message || error || '');
+      if (!ytDlpBlockedByYouTube(message)) throw error;
+      importLog('warn', 'yt-dlp attempt blocked by YouTube, trying next client', {
+        client: client || 'default',
+        remainingAttempts: attempts.length - i - 1
+      });
+    }
+  }
+  rememberYtDlpBlock(lastError);
+  throw lastError;
 }
 
 async function commandVersion(command) {
@@ -691,8 +725,11 @@ function ytDlpBlockedByYouTube(message = '') {
 
 function friendlyYtDlpError(error) {
   const text = String(error?.message || error || '');
-  if (/YouTube blocked server download/i.test(text)) return 'YouTube blocked server download. Upload the video file instead.';
-  if (ytDlpBlockedByYouTube(text)) return 'YouTube blocked server download. Upload the video file instead.';
+  if (/YouTube blocked server download/i.test(text) || ytDlpBlockedByYouTube(text)) {
+    return existsSync(YTDLP_COOKIES_PATH)
+      ? 'YouTube blocked this download even with cookies configured — they may be expired. Ask an admin to re-upload fresh YouTube cookies in Admin → Settings, or upload the video file instead.'
+      : 'YouTube blocked server download (sign-in/bot check). An admin can add YouTube cookies in Admin → Settings to fix this reliably, or upload the video file instead.';
+  }
   if (/private video/i.test(text)) return 'Private video. Try a public video link or upload the file instead.';
   if (/members-only|members only/i.test(text)) return 'Members-only video. Upload a file you have permission to reuse.';
   if (/age.?restricted/i.test(text)) return 'Age-restricted video. Upload a permitted file instead.';
@@ -907,14 +944,13 @@ async function fetchWithYtDlp(source) {
     throw new Error('yt-dlp is not installed on the server. Deploy with Docker or install yt-dlp from requirements.txt so imports can fallback when the YouTube API fails.');
   }
   assertYtDlpNotCoolingDown();
-  const args = [...(await ytDlpBaseArgs()), '--dump-single-json', '--skip-download', '--no-warnings', '--ignore-no-formats-error', '--playlist-end', '12', source];
+  const extraArgs = ['--dump-single-json', '--skip-download', '--no-warnings', '--ignore-no-formats-error', '--playlist-end', '12', source];
   importLog('log', 'yt-dlp metadata fallback started', { source, command: ytdlpCommand });
   let stdout = '';
   let stderr = '';
   try {
-    ({ stdout, stderr } = await run(ytdlpCommand, args));
+    ({ stdout, stderr } = await runYtDlpWithClientFallback(ytdlpCommand, extraArgs));
   } catch (error) {
-    rememberYtDlpBlock(error);
     importLog('error', 'yt-dlp metadata failed', { source, raw: String(error.message || error).slice(0, 1200) });
     throw new Error(friendlyYtDlpError(error));
   }
@@ -1576,9 +1612,12 @@ async function downloadVideo(video, jobId = '') {
   assertYtDlpNotCoolingDown();
   const output = path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.%(ext)s`);
   try {
-    await run(ytdlpCommand, [...(await ytDlpBaseArgs()), '-f', 'bv*[height<=1080]+ba/b[height<=1080]', '--merge-output-format', 'mp4', '-o', output, video.url], { jobId, label: 'yt-dlp download', timeoutMs: PROCESS_TIMEOUT_MS });
+    await runYtDlpWithClientFallback(
+      ytdlpCommand,
+      ['-f', 'bv*[height<=1080]+ba/b[height<=1080]', '--merge-output-format', 'mp4', '-o', output, video.url],
+      { jobId, label: 'yt-dlp download', timeoutMs: PROCESS_TIMEOUT_MS }
+    );
   } catch (error) {
-    rememberYtDlpBlock(error);
     importLog('error', 'yt-dlp download failed', { videoId: video.youtubeId, title: video.title, raw: String(error.message || error).slice(0, 1600) });
     throw new Error(friendlyYtDlpError(error));
   }
@@ -5798,6 +5837,32 @@ async function handleApi(req, res, pathname) {
         saveDb(db);
       }
       return json(res, 200, { settings: db.apiSettings.map(item => ({ ...item, configured: Boolean(item.value || process.env[item.key]), value: item.value ? '••••••••' : '' })) });
+    }
+    if (pathname === '/api/admin/youtube-cookies') {
+      const db = loadDb();
+      const admin = requireAdmin(req, db);
+      if (req.method === 'PUT' || req.method === 'PATCH') {
+        const body = await readJson(req);
+        const cookies = String(body.cookies || '').trim();
+        if (!cookies) throw Object.assign(new Error('Paste the exported cookies.txt contents.'), { status: 400 });
+        if (cookies.length > 200 * 1024) throw Object.assign(new Error('Cookie file is too large (max 200KB).'), { status: 400 });
+        if (!/youtube\.com|\.google\.com/i.test(cookies)) {
+          throw Object.assign(new Error('That does not look like a YouTube/Google cookies.txt export (Netscape format).'), { status: 400 });
+        }
+        const tmpPath = `${YTDLP_COOKIES_PATH}.tmp-${randomUUID()}`;
+        writeFileSync(tmpPath, cookies.endsWith('\n') ? cookies : `${cookies}\n`, { mode: 0o600 });
+        renameSync(tmpPath, YTDLP_COOKIES_PATH);
+        importLog('log', 'YouTube cookies updated by admin', { adminId: admin.id, bytes: cookies.length });
+      } else if (req.method === 'DELETE') {
+        if (existsSync(YTDLP_COOKIES_PATH)) unlinkSync(YTDLP_COOKIES_PATH);
+        importLog('log', 'YouTube cookies removed by admin', {});
+      }
+      const stats = existsSync(YTDLP_COOKIES_PATH) ? statSync(YTDLP_COOKIES_PATH) : null;
+      return json(res, 200, {
+        configured: Boolean(stats),
+        updatedAt: stats ? stats.mtime.toISOString() : null,
+        sizeBytes: stats ? stats.size : 0
+      });
     }
     if (pathname === '/api/admin/plans') {
       const db = loadDb();

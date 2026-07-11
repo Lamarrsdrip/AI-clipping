@@ -3,6 +3,7 @@
 !.env.example
 node_modules/
 data/db.json
+data/youtube_cookies.txt
 storage/originals/*
 storage/clips/*
 !storage/originals/.gitkeep
