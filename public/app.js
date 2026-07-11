@@ -3304,6 +3304,26 @@ function renderAdmin() {
         </form>
       </section>
 
+      <!-- ── YouTube cookies (bot-check bypass) ── -->
+      <section class="panel" style="margin-top:16px">
+        <div class="panel-head" style="margin-bottom:14px">
+          <div>
+            <span class="eyebrow">YouTube Import</span>
+            <h2>Cookies <span style="font-size:.7em;font-weight:400" class="muted">for sign-in-gated videos</span></h2>
+            <p class="muted" style="margin:4px 0 0;font-size:.82rem">Most videos import fine without this. If one fails with "sign-in/bot check", paste a fresh <code>cookies.txt</code> export (Netscape format) from a browser logged into YouTube — get one with a browser extension like "Get cookies.txt LOCALLY".</p>
+          </div>
+          <div id="ytCookiesStatusBadge" style="flex-shrink:0">Checking…</div>
+        </div>
+        <form id="ytCookiesForm" class="stack" style="max-width:540px">
+          <textarea name="cookies" rows="4" placeholder="# Netscape HTTP Cookie File&#10;.youtube.com  TRUE  /  TRUE  1893456000  ..." style="width:100%;font-family:monospace;font-size:.78rem;padding:10px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;color:var(--fg)"></textarea>
+          <div style="display:flex;gap:8px">
+            <button type="submit">Save cookies</button>
+            <button type="button" id="ytCookiesClearBtn" class="ghost" style="color:#ff6b6b;border-color:#ff6b6b33">Clear cookies</button>
+          </div>
+          <div id="ytCookiesResult"></div>
+        </form>
+      </section>
+
       <!-- ── Users + Credit Management ── -->
       <section class="panel" style="margin-top:16px">
         <div class="panel-head" style="margin-bottom:14px">
@@ -3518,6 +3538,43 @@ function renderAdmin() {
       state.studioStatus=null;
       $('#mediaKeyResult').innerHTML='<div class="verify-ok">Saved ✓</div>';
       setTimeout(()=>{ $('#mediaKeyResult').innerHTML=''; },3000);
+    } catch(err) { alert(err.message); }
+  });
+
+  // ── YouTube cookies ────────────────────────────────────────────
+  function renderYtCookiesStatus(data) {
+    const badge = $('#ytCookiesStatusBadge');
+    if (!badge) return;
+    badge.innerHTML = data.configured
+      ? `<span style="color:#7be57b;font-size:.85rem">● Configured — updated ${when(data.updatedAt)}</span>`
+      : '<span style="color:var(--fg2);font-size:.85rem">○ Not configured</span>';
+  }
+  api('/api/admin/youtube-cookies').then(renderYtCookiesStatus).catch(()=>{});
+
+  $('#ytCookiesForm')?.addEventListener('submit', async e => {
+    e.preventDefault();
+    const cookies = $('#ytCookiesForm textarea[name=cookies]')?.value || '';
+    const btn = e.target.querySelector('button[type=submit]');
+    btn.disabled = true;
+    try {
+      const data = await api('/api/admin/youtube-cookies',{method:'PUT',body:JSON.stringify({cookies})});
+      renderYtCookiesStatus(data);
+      $('#ytCookiesResult').innerHTML = '<div class="verify-ok">Saved ✓ — future imports will use these cookies</div>';
+      setTimeout(()=>{ $('#ytCookiesResult').innerHTML=''; },3000);
+    } catch(err) {
+      $('#ytCookiesResult').innerHTML = `<div class="verify-fail">✗ ${esc(err.message)}</div>`;
+    }
+    btn.disabled = false;
+  });
+
+  $('#ytCookiesClearBtn')?.addEventListener('click', async () => {
+    if (!confirm('Remove the saved YouTube cookies?')) return;
+    try {
+      const data = await api('/api/admin/youtube-cookies',{method:'DELETE'});
+      renderYtCookiesStatus(data);
+      $('#ytCookiesForm textarea[name=cookies]').value = '';
+      $('#ytCookiesResult').innerHTML = '<div class="verify-ok">Cleared ✓</div>';
+      setTimeout(()=>{ $('#ytCookiesResult').innerHTML=''; },3000);
     } catch(err) { alert(err.message); }
   });
 
