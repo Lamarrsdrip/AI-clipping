@@ -64,6 +64,7 @@ const renderQueue = [];
 const activeJobProcesses = new Map();
 
 mkdirSync(DATA_DIR, { recursive: true });
+mkdirSync(path.join(DATA_DIR, 'tmp'), { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'originals'), { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'clips'), { recursive: true });
 mkdirSync(path.join(STORAGE_DIR, 'uploads'), { recursive: true });
@@ -1860,6 +1861,13 @@ function buildCaptionText(text) {
   return String(text).split(/\s+/).slice(0, 22).join(' ').replace(/'/g, "\\'");
 }
 
+// Windows paths (e.g. C:\ClipForge\...) break ffmpeg's filtergraph parser, which splits
+// filter options on ':' — the drive-letter colon needs escaping, and using forward
+// slashes avoids also having to double-escape backslashes as the filter escape char.
+function ffmpegFilterPath(value = '') {
+  return String(value).replace(/\\/g, '/').replace(/:/g, '\\:');
+}
+
 function ffmpegText(value = '') {
   return String(value)
     .replace(/\\/g, '\\\\')
@@ -2925,7 +2933,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
 
   const clipId    = randomUUID();
   const output    = path.join(STORAGE_DIR, 'clips', `${clipId}.mp4`);
-  const assPath   = `/tmp/cf_${clipId}.ass`;
+  const assPath   = path.join(DATA_DIR, 'tmp', `cf_${clipId}.ass`);
   const startedAt = Date.now();
   const title     = String(video.title).slice(0, 42).replace(/:/g, ' ');
   const hook      = (moment.hook || buildCaptionText(moment.text)).slice(0, 120);
@@ -3022,7 +3030,9 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
 
   const assContent = buildASSFile(assWords, 0, totalOutDur, captionPreset, RW, RH, faceCyAvg);
   let hasASS = false;
-  try { writeFileSync(assPath, assContent, 'utf8'); hasASS = true; } catch {}
+  try { writeFileSync(assPath, assContent, 'utf8'); hasASS = true; } catch (error) {
+    console.error('[render:ass-write-failed]', { clipId, assPath, error: error.message });
+  }
 
   // loudnorm: broadcast-standard loudness (-14 LUFS), prevents clipping
   const audioF = 'acompressor=threshold=0.089:ratio=4:attack=5:release=50,loudnorm=I=-14:TP=-1.5:LRA=11';
@@ -3088,7 +3098,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     const cIn = edlSegs.map((_, i) => `[v${i}][a${i}]`).join('');
     // After concat: apply captions → route to pre-logo label
     const preCapLabel = logoOverlay ? '[_vcap]' : '[vout]';
-    const assChain = hasASS ? `[vcat]ass='${assPath}'${preCapLabel}` : '';
+    const assChain = hasASS ? `[vcat]ass='${ffmpegFilterPath(assPath)}'${preCapLabel}` : '';
     filterComplex =
       `${segParts.join(';')};${cIn}concat=n=${edlSegs.length}:v=1:a=1[vcat][acat]` +
       (hasASS ? `;${assChain}` : '') +
@@ -3106,7 +3116,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     const tE = moment.end.toFixed(3);
     // Captions are burned in before logo overlay
     const preCapLabel = logoOverlay ? '[_vcap]' : '[vout]';
-    const capF = hasASS ? `,ass='${assPath}'` : '';
+    const capF = hasASS ? `,ass='${ffmpegFilterPath(assPath)}'` : '';
 
     if (pfObj.portraitFill) {
       filterComplex =
@@ -3171,7 +3181,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     const fallbackVF = pfObj.portraitFill
       ? pfObj.portraitFill
       : segFillFilter(staticX);
-    const fallbackAssF = hasASS ? `,ass='${assPath}'` : '';
+    const fallbackAssF = hasASS ? `,ass='${ffmpegFilterPath(assPath)}'` : '';
     const fallbackDuration = Math.max(0.05, moment.end - effectiveStart).toFixed(3);
     const fallbackArgs = hasSourceAudio
       ? [
