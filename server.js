@@ -630,6 +630,9 @@ async function ytDlpBaseArgs() {
     else importLog('warn', 'yt-dlp JavaScript runtime not found', { runtime });
   }
   if (existsSync(YTDLP_COOKIES_PATH)) args.push('--cookies', YTDLP_COOKIES_PATH);
+  // YouTube's "n" parameter (anti-throttling) now requires yt-dlp to fetch an official
+  // remote solver script; without this, many videos report "Only images are available".
+  args.push('--remote-components', 'ejs:github');
   return args;
 }
 
