@@ -38,10 +38,9 @@ Edit `.env`:
 
 ```txt
 YOUTUBE_API_KEY=your_youtube_data_api_key
-LLM_PROVIDER=emergent
-LLM_API_KEY=your_emergent_universal_key
-LLM_BASE_URL=
-LLM_MODEL=gpt-4o-mini
+GEMINI_API_KEY=your_gemini_api_key
+AI_PROVIDER=gemini
+GEMINI_MODEL=gemini-2.5-flash-lite
 ```
 
 Restart:
@@ -67,4 +66,5 @@ node server.js
 - Billing uses local bank transfer verification.
 - Public signup is enabled for the web MVP.
 - No TikTok/Meta/YouTube/X OAuth is needed.
-- Demo clips appear if FFmpeg/yt-dlp/transcripts are not configured.
+- File upload works without YouTube credentials. YouTube link import needs yt-dlp and/or a YouTube Data API key.
+- If Gemini and fallback LLM keys are unavailable, clip selection falls back to deterministic transcript/visual windows, but rendering still requires FFmpeg.

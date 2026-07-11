@@ -1157,9 +1157,9 @@ function renderClipDetail() {
             <h4 style="margin-bottom:8px">Thumbnail options</h4>
             <div class="thumb-options">
               ${thumbOptions.map((t,i)=>`<div class="thumb-opt ${state.thumbTab===i?'active':''}" data-thumb-idx="${i}">
-                <img src="${t.path}" alt="${esc(t.label)}">
+                <img src="${esc(clipUrl(t.path))}" alt="${esc(t.label)}">
                 <small>${esc(t.label)}</small>
-                <a href="${t.path}" download="thumb-${c.id}-${t.name}.jpg" class="dl-thumb">⬇</a>
+                <a href="${esc(clipUrl(t.path))}" download="thumb-${c.id}-${t.name}.jpg" class="dl-thumb">⬇</a>
               </div>`).join('')}
             </div>
           </div>

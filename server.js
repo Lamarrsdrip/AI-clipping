@@ -32,10 +32,10 @@ loadEnvFile();
 
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || '127.0.0.1';
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = process.env.CLIPFORGE_DATA_DIR || path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 const PUBLIC_DIR = path.join(__dirname, 'public');
-const STORAGE_DIR = path.join(__dirname, 'storage');
+const STORAGE_DIR = process.env.CLIPFORGE_STORAGE_DIR || path.join(__dirname, 'storage');
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
 const CREDITS_ENABLED = process.env.CREDITS_ENABLED !== 'false';
@@ -51,6 +51,7 @@ const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 45 * 1000);
 const MAX_RSS_MB = Number(process.env.MAX_RSS_MB || 420);
 const RENDER_WIDTH = Number(process.env.RENDER_WIDTH || 720);
 const RENDER_HEIGHT = Number(process.env.RENDER_HEIGHT || 1280);
+const TRANSCRIPTION_CHUNK_SECONDS = Math.max(120, Number(process.env.TRANSCRIPTION_CHUNK_SECONDS || 600));
 const importAttempts = new Map();
 const importUserAttempts = new Map(); // userId → [timestamps] for rate-limiting by user
 const ytdlpBlock = { until: 0, reason: '' };
@@ -114,7 +115,8 @@ const seed = {
   billingPlans: defaultPlans(),
   usageEvents: [],
   transcriptions: [],
-  studioGenerations: []
+  studioGenerations: [],
+  audioGenerations: []
 };
 
 const PLATFORMS = ['TikTok', 'YouTube Shorts', 'Instagram Reels', 'Facebook Reels', 'X'];
@@ -336,6 +338,9 @@ function loadDb() {
   if (!Array.isArray(db.paymentRequests)) db.paymentRequests = [];
   if (!Array.isArray(db.billingPlans)) db.billingPlans = defaultPlans();
   if (!Array.isArray(db.usageEvents)) db.usageEvents = [];
+  if (!Array.isArray(db.studioGenerations)) db.studioGenerations = [];
+  if (!Array.isArray(db.transcriptions)) db.transcriptions = [];
+  if (!Array.isArray(db.audioGenerations)) db.audioGenerations = [];
   if (!Array.isArray(db.brandKits)) db.brandKits = [];
   for (const user of db.users) {
     if (!user.role) user.role = user.email === 'ava@clipforge.local' ? 'admin' : 'user';
@@ -367,6 +372,7 @@ function saveDb(db) {
   if (!Array.isArray(db.usageEvents)) db.usageEvents = [];
   if (!Array.isArray(db.studioGenerations)) db.studioGenerations = [];
   if (!Array.isArray(db.transcriptions)) db.transcriptions = [];
+  if (!Array.isArray(db.audioGenerations)) db.audioGenerations = [];
   if (!Array.isArray(db.brandKits)) db.brandKits = [];
   writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 }
@@ -513,6 +519,17 @@ function killActiveJobProcesses(jobId) {
   }
   activeJobProcesses.delete(jobId);
   return killed;
+}
+
+function cancelQueuedRenderJobsForVideo(videoId, message = 'Job cancelled because the source video was deleted.') {
+  let cancelled = 0;
+  for (let i = renderQueue.length - 1; i >= 0; i -= 1) {
+    if (renderQueue[i]?.payload?.videoId !== videoId) continue;
+    const [item] = renderQueue.splice(i, 1);
+    item.reject(new Error(message));
+    cancelled += 1;
+  }
+  return cancelled;
 }
 
 function memorySnapshot() {
@@ -1111,31 +1128,47 @@ function unlinkQuiet(filePath) {
 
 // ─── Gemini transcription fallback (no Whisper key needed) ───────────────────
 async function transcribeWithGemini(db, mediaPath, videoId, geminiKey) {
-  const audioPath = path.join(STORAGE_DIR, 'originals', `${videoId}_audio.mp3`);
+  const probe = await probeMedia(mediaPath).catch(() => ({ durationSeconds: 0 }));
+  const totalDuration = Math.max(0, Number(probe.durationSeconds || 0));
+  const chunks = totalDuration > TRANSCRIPTION_CHUNK_SECONDS
+    ? Array.from({ length: Math.ceil(totalDuration / TRANSCRIPTION_CHUNK_SECONDS) }, (_, i) => ({
+        start: i * TRANSCRIPTION_CHUNK_SECONDS,
+        duration: Math.min(TRANSCRIPTION_CHUNK_SECONDS, totalDuration - i * TRANSCRIPTION_CHUNK_SECONDS)
+      }))
+    : [{ start: 0, duration: totalDuration || 0 }];
+  const allSegments = [];
   try {
-    await run(FFMPEG, ['-y', '-i', mediaPath, '-vn', '-ar', '16000', '-ac', '1', '-b:a', '96k', '-t', '600', audioPath],
-      { timeoutMs: 3 * 60 * 1000, label: 'extract audio for gemini transcription' });
-    if (!existsSync(audioPath) || statSync(audioPath).size < 512) return [];
+    for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+      const chunk = chunks[chunkIndex];
+      const audioPath = path.join(STORAGE_DIR, 'originals', `${videoId}_audio_${chunkIndex}.mp3`);
+      try {
+        const trimArgs = chunk.duration > 0 ? ['-ss', String(chunk.start), '-t', String(chunk.duration)] : [];
+        await run(FFMPEG, ['-y', ...trimArgs, '-i', mediaPath, '-vn', '-ar', '16000', '-ac', '1', '-b:a', '96k', audioPath],
+          { timeoutMs: 3 * 60 * 1000, label: 'extract audio for gemini transcription' });
+        if (!existsSync(audioPath) || statSync(audioPath).size < 512) continue;
 
-    const text = await geminiTranscribeFile(geminiKey, audioPath, 'audio/mpeg');
-    if (!text || text.length < 10) return [];
+        const text = await geminiTranscribeFile(geminiKey, audioPath, 'audio/mpeg');
+        if (!text || text.length < 10) continue;
 
-    // Split into ~4-second segments (no word timing available from Gemini transcript)
-    const words = text.split(/\s+/).filter(Boolean);
-    const WORDS_PER_SEG = 12;
-    const segs = [];
-    for (let i = 0; i < words.length; i += WORDS_PER_SEG) {
-      const chunk = words.slice(i, i + WORDS_PER_SEG).join(' ');
-      const t = i / Math.max(1, words.length) * (words.length / 2.5);
-      segs.push({ start: t, end: t + WORDS_PER_SEG / 2.5, text: chunk });
+        // Split into ~4-second segments (Gemini transcript text has no word timing).
+        const words = text.split(/\s+/).filter(Boolean);
+        const WORDS_PER_SEG = 12;
+        const estimatedDuration = Math.min(chunk.duration || words.length / 2.5, Math.max(1, words.length / 2.5));
+        for (let i = 0; i < words.length; i += WORDS_PER_SEG) {
+          const textChunk = words.slice(i, i + WORDS_PER_SEG).join(' ');
+          const relStart = i / Math.max(1, words.length) * estimatedDuration;
+          const relEnd = Math.min(estimatedDuration, relStart + WORDS_PER_SEG / 2.5);
+          allSegments.push({ start: chunk.start + relStart, end: chunk.start + relEnd, text: textChunk });
+        }
+      } finally {
+        unlinkQuiet(audioPath);
+      }
     }
-    importLog('log', 'Gemini transcription succeeded', { videoId, segments: segs.length });
-    return segs;
+    importLog('log', 'Gemini transcription succeeded', { videoId, chunks: chunks.length, segments: allSegments.length });
+    return allSegments;
   } catch (err) {
     importLog('warn', 'Gemini transcription error', { videoId, error: String(err.message || err).slice(0, 300) });
     return [];
-  } finally {
-    unlinkQuiet(audioPath);
   }
 }
 
@@ -1148,7 +1181,7 @@ async function geminiVideoViralAnalysis(geminiKey, mediaPath, video, segments, o
   const videoDuration = Number(video.durationSeconds || 0);
   const minGap = Math.max(30, videoDuration * 0.15);
 
-  const transcript = segments.map(s => `[${Math.round(s.start)}-${Math.round(s.end)}s] ${s.text}`).join('\n').slice(0, 20000);
+  const transcript = buildTranscriptReference(segments, 24000);
 
   const prompt = `You are a world-class viral short-form video editor. Analyze this video visually and aurally.
 Watch for: facial expressions, emotional peaks, hand gestures, energy shifts, surprising moments, speaker changes, visual props, viewer retention patterns.
@@ -1470,10 +1503,11 @@ async function addWatchedChannel(payload) {
     throw new Error('Fair-use/remix auto-watch requires a transformation note.');
   }
   const db = loadDb();
-  const existing = db.watchedChannels.find(item => item.sourceUrl === parsed.canonical);
+  const ownerId = payload.userId || 'user_demo';
+  const existing = db.watchedChannels.find(item => item.sourceUrl === parsed.canonical && item.userId === ownerId);
   const watch = existing || {
     id: randomUUID(),
-    userId: payload.userId || 'user_demo',
+    userId: ownerId,
     sourceUrl: parsed.canonical,
     status: 'active',
     createdAt: new Date().toISOString(),
@@ -1501,6 +1535,7 @@ async function pollWatchedChannel(watchId) {
     const known = new Set([...(watch.knownVideoIds || []), ...db.videos.map(video => video.youtubeId)]);
     const freshVideos = videos.filter(video => !known.has(video.youtubeId));
     const result = addImportedVideos(db, watch.sourceUrl, parsed.type, freshVideos, {
+      userId: watch.userId,
       rightsConfirmed: watch.rightsConfirmed,
       fairUseMode: watch.fairUseMode,
       transformationNote: watch.transformationNote,
@@ -1514,6 +1549,7 @@ async function pollWatchedChannel(watchId) {
     if (watch.autoProcess) {
       for (const video of result.videos) {
         queueBackgroundProcess(video.id, {
+          userId: watch.userId,
           rightsConfirmed: true,
           fairUseMode: watch.fairUseMode,
           transformationNote: watch.transformationNote
@@ -1563,17 +1599,13 @@ async function transcribeAudioWithWhisper(db, mediaPath, videoId) {
     return transcribeWithGemini(db, mediaPath, videoId, geminiKey);
   }
   if (!apiKey) return [];
-  const audioPath = path.join(STORAGE_DIR, 'originals', `${videoId}_audio.mp3`);
-  try {
-    // 16kHz mono is Whisper's native format; 96k bitrate improves accuracy vs 64k.
-    await run(FFMPEG, ['-y', '-i', mediaPath, '-vn', '-ar', '16000', '-ac', '1', '-b:a', '96k', '-t', '600', audioPath], { timeoutMs: 3 * 60 * 1000, label: 'extract audio for whisper' });
-    if (!existsSync(audioPath) || statSync(audioPath).size < 512) return [];
+
+  async function transcribeChunk(audioPath, offsetSeconds) {
     const audioBytes = readFileSync(audioPath);
     const boundary = `--------whisper${randomUUID().replace(/-/g, '')}`;
     const fileName = 'audio.mp3';
     const modelName = provider === 'openai' ? 'whisper-1' : 'whisper-1';
     const part1 = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: audio/mpeg\r\n\r\n`);
-    // Include a prompt to improve accuracy for accents, slang, and fast speech.
     const whisperPrompt = 'Transcribe accurately. Include fillers like "um", "uh" only if clearly spoken. Preserve slang and casual speech. Add natural punctuation.';
     const part2 = Buffer.from(
       `\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${modelName}` +
@@ -1584,7 +1616,7 @@ async function transcribeAudioWithWhisper(db, mediaPath, videoId) {
       `\r\n--${boundary}--\r\n`
     );
     const body = Buffer.concat([part1, audioBytes, part2]);
-    const whisperEndpoint = provider === 'openai' ? 'https://api.openai.com/v1/audio/transcriptions' : 'https://api.openai.com/v1/audio/transcriptions';
+    const whisperEndpoint = 'https://api.openai.com/v1/audio/transcriptions';
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 120_000);
     let response;
@@ -1600,32 +1632,60 @@ async function transcribeAudioWithWhisper(db, mediaPath, videoId) {
     }
     if (!response.ok) {
       const errText = await response.text();
-      importLog('warn', 'Whisper transcription failed', { status: response.status, body: errText.slice(0, 400) });
-      return [];
+      importLog('warn', 'Whisper transcription failed', { status: response.status, body: errText.slice(0, 400), offsetSeconds });
+      return { segments: [], words: [] };
     }
     const data = await response.json();
-    const segs = (data.segments || []).map(seg => ({
-      start: Number(seg.start || 0),
-      end:   Number(seg.end   || seg.start + 2),
-      text:  String(seg.text  || '').trim()
-    })).filter(seg => seg.text);
-    // Store word-level timestamps for high-quality caption rendering
-    const wordData = (data.words || []).map(w => ({
-      word:  String(w.word  || '').trim(),
-      start: Number(w.start || 0),
-      end:   Number(w.end   || w.start + 0.15)
-    })).filter(w => w.word);
+    return {
+      segments: (data.segments || []).map(seg => ({
+        start: offsetSeconds + Number(seg.start || 0),
+        end:   offsetSeconds + Number(seg.end   || seg.start + 2),
+        text:  String(seg.text  || '').trim()
+      })).filter(seg => seg.text),
+      words: (data.words || []).map(w => ({
+        word:  String(w.word  || '').trim(),
+        start: offsetSeconds + Number(w.start || 0),
+        end:   offsetSeconds + Number(w.end   || w.start + 0.15)
+      })).filter(w => w.word)
+    };
+  }
+
+  try {
+    const probe = await probeMedia(mediaPath).catch(() => ({ durationSeconds: 0 }));
+    const totalDuration = Math.max(0, Number(probe.durationSeconds || 0));
+    const chunks = totalDuration > TRANSCRIPTION_CHUNK_SECONDS
+      ? Array.from({ length: Math.ceil(totalDuration / TRANSCRIPTION_CHUNK_SECONDS) }, (_, i) => ({
+          start: i * TRANSCRIPTION_CHUNK_SECONDS,
+          duration: Math.min(TRANSCRIPTION_CHUNK_SECONDS, totalDuration - i * TRANSCRIPTION_CHUNK_SECONDS)
+        }))
+      : [{ start: 0, duration: totalDuration || 0 }];
+
+    const segs = [];
+    const wordData = [];
+    for (let i = 0; i < chunks.length; i += 1) {
+      const chunk = chunks[i];
+      const audioPath = path.join(STORAGE_DIR, 'originals', `${videoId}_audio_${i}.mp3`);
+      try {
+        const trimArgs = chunk.duration > 0 ? ['-ss', String(chunk.start), '-t', String(chunk.duration)] : [];
+        await run(FFMPEG, ['-y', ...trimArgs, '-i', mediaPath, '-vn', '-ar', '16000', '-ac', '1', '-b:a', '96k', audioPath], { timeoutMs: 3 * 60 * 1000, label: 'extract audio for whisper' });
+        if (!existsSync(audioPath) || statSync(audioPath).size < 512) continue;
+        const result = await transcribeChunk(audioPath, chunk.start);
+        segs.push(...result.segments);
+        wordData.push(...result.words);
+      } finally {
+        unlinkQuiet(audioPath);
+      }
+    }
+
     if (wordData.length) {
       const wordCachePath = path.join(STORAGE_DIR, 'originals', `${videoId}_words.json`);
       try { writeFileSync(wordCachePath, JSON.stringify({ words: wordData }, null, 2)); } catch {}
     }
-    importLog('log', 'Whisper transcription succeeded', { videoId, segments: segs.length, words: wordData.length });
+    importLog('log', 'Whisper transcription succeeded', { videoId, chunks: chunks.length, segments: segs.length, words: wordData.length });
     return segs;
   } catch (error) {
     importLog('warn', 'Whisper transcription error', { videoId, error: String(error.message || error).slice(0, 400) });
     return [];
-  } finally {
-    unlinkQuiet(audioPath);
   }
 }
 
@@ -1659,6 +1719,48 @@ async function getTranscript(video, mediaPath) {
     return segments;
   }
   throw new Error('No transcript was available. Enable YouTube captions for the source video or add a transcription service before processing.');
+}
+
+function buildTranscriptReference(segments = [], maxChars = 30000) {
+  const cleanSegments = (segments || [])
+    .filter(seg => seg && Number.isFinite(Number(seg.start)) && Number.isFinite(Number(seg.end)) && String(seg.text || '').trim())
+    .sort((a, b) => Number(a.start) - Number(b.start));
+  const lines = cleanSegments.map(seg => `[${Math.round(Number(seg.start))}-${Math.round(Number(seg.end))}s] ${String(seg.text).replace(/\s+/g, ' ').trim()}`);
+  const full = lines.join('\n');
+  if (full.length <= maxChars) return full;
+
+  const bucketCount = Math.min(16, Math.max(4, Math.ceil(cleanSegments.length / 40)));
+  const perBucket = Math.max(800, Math.floor((maxChars - 220) / bucketCount));
+  const buckets = Array.from({ length: bucketCount }, () => []);
+  const firstStart = Number(cleanSegments[0]?.start || 0);
+  const lastEnd = Number(cleanSegments.at(-1)?.end || firstStart + 1);
+  const span = Math.max(1, lastEnd - firstStart);
+  for (const seg of cleanSegments) {
+    const idx = Math.min(bucketCount - 1, Math.floor(((Number(seg.start) - firstStart) / span) * bucketCount));
+    buckets[idx].push(seg);
+  }
+
+  const condensed = [];
+  for (const bucket of buckets) {
+    if (!bucket.length) continue;
+    let used = 0;
+    for (const seg of bucket) {
+      const line = `[${Math.round(Number(seg.start))}-${Math.round(Number(seg.end))}s] ${String(seg.text).replace(/\s+/g, ' ').trim()}`;
+      if (used + line.length > perBucket && used > 0) break;
+      condensed.push(line);
+      used += line.length + 1;
+    }
+  }
+  const prefix = '[Condensed transcript sampled across the full source timeline; every section of the video is represented.]';
+  const finalLine = lines.at(-1);
+  if (finalLine && !condensed.includes(finalLine)) {
+    while (condensed.length && `${prefix}\n${[...condensed, finalLine].join('\n')}`.length > maxChars) {
+      condensed.pop();
+    }
+    condensed.push(finalLine);
+  }
+  const output = `${prefix}\n${condensed.join('\n')}`;
+  return output.length <= maxChars ? output : output.slice(0, maxChars);
 }
 
 const VIRAL_HOOKS  = ['secret','mistake','truth','never told','nobody knows','they don\'t want you','most people','you won\'t believe','the real reason','i was wrong','changed my life','don\'t do this','everyone is wrong'];
@@ -2219,6 +2321,18 @@ async function probeVideoDims(mediaPath) {
   return m ? { w:parseInt(m[1]), h:parseInt(m[2]) } : { w:1920, h:1080 };
 }
 
+async function mediaHasAudio(mediaPath) {
+  try {
+    const { stdout } = await run('ffprobe', [
+      '-v', 'error', '-select_streams', 'a:0',
+      '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', mediaPath
+    ], { label:'probe-audio', timeoutMs:15_000 });
+    return stdout.trim().includes('audio');
+  } catch {
+    return false;
+  }
+}
+
 const FACE_TRACK_SCRIPT = path.join(__dirname, 'face_track.py');
 let _faceTrackAvailable = null;
 
@@ -2235,7 +2349,7 @@ async function faceTrackAvailable() {
       p.stderr.on('data', d => err += d);
       p.on('close', code => code === 0 ? resolve({ stdout:out }) : reject(new Error(err)));
     });
-    _faceTrackAvailable = out.trim() === 'ok' && existsSync(FACE_TRACK_SCRIPT);
+    _faceTrackAvailable = stdout.trim() === 'ok' && existsSync(FACE_TRACK_SCRIPT);
   } catch { _faceTrackAvailable = false; }
   return _faceTrackAvailable;
 }
@@ -2531,6 +2645,12 @@ function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920,
 }
 
 // ─── Pipeline Stage 5: Quality validator ─────────────────────────
+function parseFrameRate(value = '0/1') {
+  const [num, den] = String(value).split('/').map(Number);
+  if (!Number.isFinite(num) || !Number.isFinite(den) || den === 0) return 0;
+  return num / den;
+}
+
 async function validateClipRender(outputPath) {
   const scores = { captions:90, framing:88, audioSync:95, stability:90, overall:0 };
   const issues = [];
@@ -2550,7 +2670,7 @@ async function validateClipRender(outputPath) {
       if (w !== 1080 || h !== 1920) {
         issues.push(`Dimensions ${w}x${h} (expected 1080x1920)`); scores.framing -= 10;
       }
-      const fps = eval(vStream.r_frame_rate || '30/1');
+      const fps = parseFrameRate(vStream.r_frame_rate || '30/1');
       if (fps < 29) { issues.push(`Low framerate: ${fps.toFixed(1)}fps`); scores.stability -= 8; }
       const bitrate = Number(probe.format?.bit_rate || 0);
       if (bitrate > 0 && bitrate < 2_000_000) { issues.push('Low bitrate'); scores.framing -= 5; }
@@ -2809,10 +2929,11 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
 
   // ── Stage 2: Source dimensions + face tracking + stereo analysis
   const clipDuration = moment.end - moment.start;
-  const [{ w: srcW, h: srcH }, stereoSide, faceData] = await Promise.all([
+  const [{ w: srcW, h: srcH }, stereoSide, faceData, hasSourceAudio] = await Promise.all([
     probeVideoDims(mediaPath),
     detectSpeakerSide(mediaPath, moment.start, moment.end),
     trackFaces(mediaPath, moment.start, moment.end),
+    mediaHasAudio(mediaPath),
   ]);
   // Face tracking takes priority over stereo for speaker side
   const speakerSide = faceData?.speakerSide || stereoSide;
@@ -2887,6 +3008,13 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     };
   }
 
+  function segAudioFilter(s, i) {
+    const duration = Math.max(0.05, s.end - s.start).toFixed(3);
+    return hasSourceAudio
+      ? `[0:a]atrim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`
+      : `anullsrc=channel_layout=stereo:sample_rate=48000:d=${duration},atrim=duration=${duration},asetpts=PTS-STARTPTS[a${i}]`;
+  }
+
   let filterComplex, vMap, aMap;
 
   if (useEDL) {
@@ -2899,12 +3027,12 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
       if (pfObj.portraitFill) {
         return [
           `[0:v]trim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},setpts=PTS-STARTPTS,${pfObj.portraitFill}[v${i}]`,
-          `[0:a]atrim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`,
+          segAudioFilter(s, i),
         ].join(';');
       } else if (pfObj.type === 'fill') {
         return [
           `[0:v]trim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},setpts=PTS-STARTPTS,${segFillFilter(segX)}[v${i}]`,
-          `[0:a]atrim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`,
+          segAudioFilter(s, i),
         ].join(';');
       } else {
         const { fg, bg } = segBlurFilter(segX);
@@ -2913,7 +3041,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
           `[_s${i}a]${bg}[_s${i}bg]`,
           `[_s${i}b]${fg}[_s${i}fg]`,
           `[_s${i}bg][_s${i}fg]overlay=x=0:y=(H-h)/2[v${i}]`,
-          `[0:a]atrim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`,
+          segAudioFilter(s, i),
         ].join(';');
       }
     });
@@ -2944,13 +3072,13 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     if (pfObj.portraitFill) {
       filterComplex =
         `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,${pfObj.portraitFill}${qualityF}${capF}${preCapLabel};` +
-        `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
+        (hasSourceAudio ? `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]` : `anullsrc=channel_layout=stereo:sample_rate=48000:d=${totalOutDur.toFixed(3)},${audioF}[aout]`);
     } else if (pfObj.type === 'fill') {
       filterComplex =
         `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,` +
         `crop=w='${wExpr}':h=${pfObj.cropH}:x='${xExpr}':y=0,` +
         `scale=${RW}:${RH}:flags=lanczos,setsar=1${qualityF}${capF}${preCapLabel};` +
-        `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
+        (hasSourceAudio ? `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]` : `anullsrc=channel_layout=stereo:sample_rate=48000:d=${totalOutDur.toFixed(3)},${audioF}[aout]`);
     } else {
       const dynBgF = pfObj.bgFilterDynamic(xExpr, wExpr);
       filterComplex =
@@ -2959,7 +3087,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
         `[_dvfg]crop=w='${wExpr}':h=${pfObj.cropH}:x='${xExpr}':y=0,` +
         `scale=${RW}:${pfObj.scaledH}:flags=lanczos,setsar=1${qualityF}[_dbfg];` +
         `[_dbbg][_dbfg]overlay=x=0:y=(H-h)/2${capF}${preCapLabel};` +
-        `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]`;
+        (hasSourceAudio ? `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]` : `anullsrc=channel_layout=stereo:sample_rate=48000:d=${totalOutDur.toFixed(3)},${audioF}[aout]`);
     }
     vMap = preCapLabel; aMap = '[aout]';
   }
@@ -3005,12 +3133,24 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
       ? pfObj.portraitFill
       : segFillFilter(staticX);
     const fallbackAssF = hasASS ? `,ass='${assPath}'` : '';
-    await run(FFMPEG, [
-      '-y', '-ss', String(effectiveStart), '-to', String(moment.end), '-i', mediaPath,
-      '-vf', `${fallbackVF}${fallbackAssF}`,
-      '-af', audioF,
-      ...encodeArgs, output,
-    ], { jobId, label: 'render-fallback', timeoutMs: PROCESS_TIMEOUT_MS });
+    const fallbackDuration = Math.max(0.05, moment.end - effectiveStart).toFixed(3);
+    const fallbackArgs = hasSourceAudio
+      ? [
+          '-y', '-ss', String(effectiveStart), '-to', String(moment.end), '-i', mediaPath,
+          '-vf', `${fallbackVF}${fallbackAssF}`,
+          '-af', audioF,
+          ...encodeArgs, output,
+        ]
+      : [
+          '-y', '-ss', String(effectiveStart), '-to', String(moment.end), '-i', mediaPath,
+          '-f', 'lavfi', '-i', `anullsrc=channel_layout=stereo:sample_rate=48000:d=${fallbackDuration}`,
+          '-map', '0:v', '-map', '1:a',
+          '-vf', `${fallbackVF}${fallbackAssF}`,
+          '-af', audioF,
+          '-shortest',
+          ...encodeArgs, output,
+        ];
+    await run(FFMPEG, fallbackArgs, { jobId, label: 'render-fallback', timeoutMs: PROCESS_TIMEOUT_MS });
   } finally {
     try { if (existsSync(assPath)) unlinkSync(assPath); } catch {}
   }
@@ -3077,23 +3217,47 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   };
 }
 
+function buildTargetDurations(videoDurationSeconds, clipCount = 3, requestedLength = 60) {
+  const d = Math.max(0, Number(videoDurationSeconds || 0));
+  const count = Math.max(1, Math.min(10, Number(clipCount || 3)));
+  const requested = Math.max(15, Math.min(600, Number(requestedLength || 60)));
+  const cycle = requested === 60 && count >= 3 ? [60, 90, 120] : [requested];
+  const durations = [];
+  for (let i = 0; i < count; i += 1) {
+    if (d > 0 && d < 60) {
+      durations.push(Math.max(5, Math.floor(d * 0.85)));
+      continue;
+    }
+    const raw = cycle[i % cycle.length];
+    const sourceCap = d > 0 ? Math.max(60, Math.floor(d * 0.9)) : raw;
+    durations.push(Math.max(60, Math.min(raw, sourceCap)));
+  }
+  return durations;
+}
+
 function getTargetDurations(videoDurationSeconds) {
-  const d = videoDurationSeconds || 0;
-  if (d >= 120) return [60, 90, 120];
-  if (d >= 90)  return [60, 90];
-  if (d >= 60)  return [60];
-  return [Math.max(15, Math.floor(d * 0.85))];
+  return buildTargetDurations(videoDurationSeconds, 3, 60);
 }
 
 function fallbackMomentsForVideo(video, options = {}) {
   const duration = Math.max(5, Number(video.durationSeconds || 30));
   const targetDurations = options.targetDurations || getTargetDurations(duration);
-  const positions = targetDurations.length === 1
-    ? [0]
-    : targetDurations.map((_, i) => Math.floor(i * duration / targetDurations.length));
+  const count = targetDurations.length;
+  const minUsefulSeconds = Math.min(15, Math.max(1, Math.floor(duration / Math.max(1, count))));
+  const requestedTotal = targetDurations.reduce((sum, seconds) => sum + Number(seconds || 0), 0);
+  const canFitRequested = requestedTotal <= duration;
+  const fallbackLen = Math.max(minUsefulSeconds, Math.floor(duration / Math.max(1, count)));
+  let cursor = 0;
   return targetDurations.map((segLen, index) => {
-    const start = Math.min(positions[index], Math.max(0, duration - segLen));
-    const end   = Math.min(duration, Math.max(start + 15, start + segLen));
+    const effectiveLen = canFitRequested ? Math.min(segLen, duration) : Math.min(segLen, fallbackLen);
+    const remainingClips = count - index - 1;
+    const remainingRequested = canFitRequested
+      ? targetDurations.slice(index + 1).reduce((sum, seconds) => sum + Number(seconds || 0), 0)
+      : remainingClips * effectiveLen;
+    const maxStart = Math.max(0, duration - remainingRequested - effectiveLen);
+    const start = Math.min(cursor, maxStart);
+    const end = Math.min(duration, Math.max(start + minUsefulSeconds, start + effectiveLen));
+    cursor = end + (canFitRequested && count > 1 ? Math.max(0, (duration - requestedTotal) / (count - 1)) : 0);
     return {
       start,
       end,
@@ -3117,7 +3281,7 @@ function completeJobWithClips(jobId, videoId, clipRows) {
   freshJob.updatedAt = new Date().toISOString();
   freshJob.steps = processingSteps(freshJob.stage, freshJob.progress);
   freshVideo.status = 'complete';
-  const clipUserId = freshJob.userId || freshVideo.userId || freshVideo.createdBy || '';
+  const clipUserId = freshVideo.userId || freshVideo.createdBy || freshJob.userId || '';
   fresh.clips.unshift(...clipRows.map(clip => ({ ...clip, jobId, videoId, userId: clipUserId, status: 'ready' })));
   const watch = fresh.watchedChannels.find(item => item.id === freshVideo.watchedChannelId);
   if (watch?.autoSchedule && watch.platforms?.length) {
@@ -3196,12 +3360,16 @@ function createQueuedProcessingJob(payload) {
   // Use the userId from payload (set by the route handler), falling back to the video owner or first admin
   const requestingUserId = payload.userId;
   const db2video = db.videos.find(item => item.id === videoId);
-  const user = (requestingUserId && db.users.find(u => u.id === requestingUserId))
+  const requestingUser = requestingUserId ? db.users.find(u => u.id === requestingUserId) : null;
+  const user = requestingUser
     || (db2video && db.users.find(u => u.id === (db2video.userId || db2video.createdBy)))
     || db.users.find(u => u.role === 'admin')
     || db.users[0];
   const video = db2video;
   if (!video) throw new Error('Video not found.');
+  if (requestingUser && !userCanAccessVideo(requestingUser, video)) {
+    throw Object.assign(new Error('You do not have access to this video.'), { status: 403 });
+  }
   const existingJob = db.jobs.find(item => item.videoId === videoId && ['queued', 'running'].includes(item.status));
   if (existingJob) return { ...existingJob, duplicate: true };
   video.rightsConfirmed = true;
@@ -3228,11 +3396,13 @@ function createQueuedProcessingJob(payload) {
 async function processVideo(payload) {
   assertMemoryAvailable();
   const { videoId, rightsConfirmed, fairUseMode, transformationNote } = payload;
+  const requestedCaptionStyle = String(payload.captionStyle || '').toLowerCase();
   const clipOptions = {
     clipCount:   Math.max(1, Math.min(10, Number(payload.clipCount || 3))),
     clipLength:  Math.max(60, Math.min(600, Number(payload.clipLength || 60))),
     framingMode: ['tight','original','wide','medium','close','dynamic'].includes(payload.framingMode)
                    ? payload.framingMode : 'dynamic',
+    captionStyle: ASS_PRESETS[requestedCaptionStyle] ? requestedCaptionStyle : null,
     brandKitId:  payload.brandKitId || null,
   };
   if (!rightsConfirmed) throw new Error('Confirm that you own this video or have permission to reuse it before processing.');
@@ -3242,6 +3412,13 @@ async function processVideo(payload) {
   const db = loadDb();
   const video = db.videos.find(item => item.id === videoId);
   if (!video) throw new Error('Video not found.');
+  const requestingUser = payload.userId ? db.users.find(u => u.id === payload.userId) : null;
+  if (requestingUser && !userCanAccessVideo(requestingUser, video)) {
+    throw Object.assign(new Error('You do not have access to this video.'), { status: 403 });
+  }
+  if (requestingUser && clipOptions.brandKitId) {
+    requireBrandKitAccess(db, requestingUser, clipOptions.brandKitId);
+  }
   const existingJob = db.jobs.find(item => item.videoId === videoId && ['queued', 'running'].includes(item.status) && item.id !== payload.jobId);
   if (existingJob) return { jobId: existingJob.id, duplicate: true };
   const jobOwner = db.users.find(u => u.id === (video.userId || video.createdBy)) || db.users.find(u => u.role === 'admin');
@@ -3305,17 +3482,21 @@ async function processVideo(payload) {
       suggestBrollKeywords(db, transcript, video.title).catch(() => {});
     }
     updateJob(job.id, { progress: 58, stage: 'AI analysis — scoring viral moments', steps: processingSteps('analysis', 58) });
-    const targetDurations = getTargetDurations(video.durationSeconds);
+    const targetDurations = buildTargetDurations(video.durationSeconds, clipOptions.clipCount, clipOptions.clipLength);
     const rawMoments = transcript.length
       ? await detectViralMoments(db, video, transcript, {
           ...clipOptions,
-          clipCount: targetDurations.length,
+          clipCount: clipOptions.clipCount,
           clipLength: targetDurations[0],
           targetDurations,
           mediaPath,  // gives Gemini direct video access for superior analysis
         })
       : fallbackMomentsForVideo(video, { ...clipOptions, targetDurations });
-    const moments = rawMoments.map(m => ({ ...m, brandKitId: m.brandKitId || clipOptions.brandKitId || null }));
+    const moments = rawMoments.map(m => ({
+      ...m,
+      captionStyle: clipOptions.captionStyle || m.captionStyle,
+      brandKitId: m.brandKitId || clipOptions.brandKitId || null
+    }));
     if (!moments.length) throw new Error('Could not create a clipping window for this video.');
     updateJob(job.id, { progress: 72, stage: 'creating vertical clips', steps: processingSteps('vertical', 72) });
     const rendered = [];
@@ -3329,6 +3510,8 @@ async function processVideo(payload) {
       rendered.push(await renderClip(db, video, mediaPath, moments[i], i, job.id));
     }
     if (!rendered.length || rendered.some(clip => !clip.outputPath)) throw new Error('Rendering failed: no clips were saved.');
+
+    completeJobWithClips(job.id, video.id, rendered);
 
     // ── Gemini post-render enrichment (async, non-blocking) ──
     // Generate rich per-clip metadata and run QA for each rendered clip
@@ -3369,7 +3552,7 @@ async function processVideo(payload) {
 
         // QA review
         try {
-          const renderReport = clip.validation || {};
+          const renderReport = { scores: clip.renderQuality || {}, issues: clip.renderIssues || [] };
           const qa = await geminiQAReview(db, { ...clip, ...moment }, renderReport);
           if (qa) {
             const db3 = loadDb();
@@ -3380,7 +3563,6 @@ async function processVideo(payload) {
       })).catch(() => {});
     }
 
-    completeJobWithClips(job.id, video.id, rendered);
     if (downloadedPath) unlinkQuiet(downloadedPath);
     if (video.sourceKind === 'upload') {
       unlinkQuiet(mediaPath);
@@ -3468,6 +3650,109 @@ function requireAdmin(req, db) {
   const user = requireUser(req, db);
   if (user.role !== 'admin') throw Object.assign(new Error('Admin access required.'), { status: 403 });
   return user;
+}
+
+function userOwnsRecord(user, record = {}) {
+  return Boolean(user && record && (
+    user.role === 'admin' ||
+    record.userId === user.id ||
+    record.createdBy === user.id
+  ));
+}
+
+function userCanAccessVideo(user, video = {}) {
+  return userOwnsRecord(user, video);
+}
+
+function userCanAccessClip(user, clip = {}, db = null) {
+  if (userOwnsRecord(user, clip)) return true;
+  const video = db?.videos?.find(v => v.id === clip.videoId);
+  return Boolean(video && userCanAccessVideo(user, video));
+}
+
+function requireVideoAccess(db, user, videoId) {
+  const video = db.videos.find(item => item.id === videoId);
+  if (!video) throw new Error('Video not found.');
+  if (!userCanAccessVideo(user, video)) {
+    throw Object.assign(new Error('You do not have access to this video.'), { status: 403 });
+  }
+  return video;
+}
+
+function requireBrandKitAccess(db, user, brandKitId) {
+  if (!brandKitId) return null;
+  const kit = (db.brandKits || []).find(item => item.id === brandKitId);
+  if (!kit) throw new Error('Brand kit not found.');
+  if (!userOwnsRecord(user, kit)) {
+    throw Object.assign(new Error('You do not have access to this brand kit.'), { status: 403 });
+  }
+  return kit;
+}
+
+function requireWatchAccess(db, user, watchId) {
+  const watch = db.watchedChannels.find(item => item.id === watchId);
+  if (!watch) throw new Error('Watched channel not found.');
+  if (!userOwnsRecord(user, watch)) {
+    throw Object.assign(new Error('You do not have access to this watched channel.'), { status: 403 });
+  }
+  return watch;
+}
+
+function mediaRecordForPath(relative, db) {
+  const clean = relative.replace(/^\/+/, '');
+  const basename = path.basename(clean);
+
+  let match = clean.match(/^clips\/([^/]+)\.(?:mp4|mov|webm|m4v)$/i);
+  if (match) {
+    const clip = db.clips.find(c => c.id === match[1]);
+    return clip ? { type: 'clip', record: clip } : null;
+  }
+
+  match = clean.match(/^thumbs\/clip_([^/]+)\.(?:jpg|jpeg|png|webp)$/i);
+  if (match) {
+    const clip = db.clips.find(c => c.id === match[1]);
+    return clip ? { type: 'clip', record: clip } : null;
+  }
+
+  match = clean.match(/^thumbnails\/thumb_([^/]+)_[^/]+\.(?:jpg|jpeg|png|webp)$/i);
+  if (match) {
+    const clip = db.clips.find(c => c.id === match[1]);
+    return clip ? { type: 'clip', record: clip } : null;
+  }
+
+  if (clean.startsWith('uploads/') || clean.startsWith('thumbs/')) {
+    const video = db.videos.find(v =>
+      (v.storagePath && path.basename(v.storagePath) === basename) ||
+      (v.thumbnailUrl && path.basename(v.thumbnailUrl) === basename)
+    );
+    return video ? { type: 'video', record: video } : null;
+  }
+
+  if (clean.startsWith('logos/')) {
+    const kit = (db.brandKits || []).find(bk => bk.logoStoredName === basename);
+    return kit ? { type: 'brandKit', record: kit } : null;
+  }
+
+  if (clean.startsWith('generations/')) {
+    const generation = (db.studioGenerations || []).find(g => g.outputPath && path.basename(g.outputPath) === basename);
+    return generation ? { type: 'generation', record: generation } : null;
+  }
+
+  if (clean.startsWith('audio/')) {
+    const audio = (db.audioGenerations || []).find(a => a.outputPath && path.basename(a.outputPath) === basename);
+    return audio ? { type: 'audio', record: audio } : null;
+  }
+
+  return null;
+}
+
+function userCanAccessMedia(user, relative, db) {
+  if (user?.role === 'admin') return true;
+  if (relative.startsWith('originals/') || relative.startsWith('transcripts/')) return false;
+  const media = mediaRecordForPath(relative, db);
+  if (!media) return false;
+  if (media.type === 'clip') return userCanAccessClip(user, media.record, db);
+  return userOwnsRecord(user, media.record);
 }
 
 function subscriptionFor(db, userId) {
@@ -3937,7 +4222,7 @@ async function detectViralMoments(db, video, segments, options = {}) {
   }
 
   // ── Transcript text analysis (works with Gemini text OR other LLM providers) ──
-  const transcript = segments.map(seg => `[${Math.round(seg.start)}-${Math.round(seg.end)}s] ${seg.text}`).join('\n').slice(0, 20000);
+  const transcript = buildTranscriptReference(segments, 32000);
   try {
     const result = await aiChat(db, {
       purpose: 'viral moment detection',
@@ -4004,8 +4289,11 @@ function postProcessMoments(rawItems, ctx) {
 
   const moments = rawItems
     .map(item => {
-      const start = Math.max(0, Number(item.start || 0));
-      const end = Math.min(Number(videoDuration || start + desiredLength), Number(item.end || start + desiredLength));
+      const rawStart = Number(item.start);
+      const rawEnd = Number(item.end);
+      if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd)) return null;
+      const start = Math.max(0, Math.min(Number(videoDuration || rawStart), rawStart));
+      const end = Math.min(Number(videoDuration || start + desiredLength), Math.max(start, rawEnd));
       const text = segments.filter(seg => seg.end >= start && seg.start <= end).map(seg => seg.text).join(' ');
       const hooks = item.hooks || {};
       const primaryHook = hooks.curiosity || hooks.shock || hooks.value || buildCaptionText(text);
@@ -4052,12 +4340,14 @@ function postProcessMoments(rawItems, ctx) {
         text: text || primaryHook || video.title,
       };
     })
+    .filter(Boolean)
     .filter(item => item.end > item.start && item.end - item.start >= 55 && item.end - item.start <= 610);
 
-  // Enforce temporal diversity
+  // Enforce temporal diversity by both start gap and true overlap. Start-gap
+  // alone allowed duplicate clips with slightly shifted starts.
   const diverse = [];
   for (const m of moments.sort((a, b) => b.score - a.score)) {
-    if (diverse.every(d => Math.abs(d.start - m.start) >= minGap)) {
+    if (diverse.every(d => momentsAreDiverse(d, m, minGap))) {
       diverse.push(m);
       if (diverse.length >= desiredCount) break;
     }
@@ -4065,7 +4355,7 @@ function postProcessMoments(rawItems, ctx) {
   // Fill remaining slots from keyword-score fallback
   for (const fb of fallbackMoments) {
     if (diverse.length >= desiredCount) break;
-    if (diverse.every(d => Math.abs(d.start - fb.start) >= minGap)) diverse.push({ ...fb });
+    if (diverse.every(d => momentsAreDiverse(d, fb, minGap))) diverse.push({ ...fb });
   }
 
   // Chronological sort + assign target durations
@@ -4076,6 +4366,21 @@ function postProcessMoments(rawItems, ctx) {
     m.framingMode = framingMode;
   });
   return sorted.length ? sorted : fallbackMoments;
+}
+
+function overlapSeconds(a, b) {
+  return Math.max(0, Math.min(Number(a.end), Number(b.end)) - Math.max(Number(a.start), Number(b.start)));
+}
+
+function overlapRatio(a, b) {
+  const overlap = overlapSeconds(a, b);
+  const shortest = Math.max(1, Math.min(Number(a.end) - Number(a.start), Number(b.end) - Number(b.start)));
+  return overlap / shortest;
+}
+
+function momentsAreDiverse(a, b, minGap) {
+  if (Math.abs(Number(a.start) - Number(b.start)) < minGap) return false;
+  return overlapRatio(a, b) <= 0.20;
 }
 
 async function generateMultipleHooks(db, video, moment) {
@@ -4329,17 +4634,23 @@ async function handleApi(req, res, pathname) {
         maxUploadMb: Math.round(MAX_UPLOAD_BYTES / 1024 / 1024),
         maxConcurrentRenderJobs: MAX_CONCURRENT_RENDER_JOBS
       };
+      const scopedVideos = user.role === 'admin' ? db.videos : db.videos.filter(item => userCanAccessVideo(user, item));
+      const scopedVideoIds = new Set(scopedVideos.map(item => item.id));
+      const scopedClips = user.role === 'admin' ? db.clips : db.clips.filter(item => userCanAccessClip(user, item, db));
       return json(res, 200, {
         user: publicUser(user),
         subscription,
         plan,
         stats: {
           imports: db.imports.filter(item => item.userId === user.id || user.role === 'admin').length,
-          videos: db.videos.length,
+          videos: scopedVideos.length,
           projects: db.projects.filter(item => item.userId === user.id || user.role === 'admin').length,
           jobs: db.jobs.filter(item => item.userId === user.id || user.role === 'admin').length,
-          clips: db.clips.length,
-          scheduledPosts: db.scheduledPosts?.length || 0,
+          clips: scopedClips.length,
+          scheduledPosts: db.scheduledPosts?.filter(item => {
+            const clip = db.clips.find(c => c.id === item.clipId);
+            return user.role === 'admin' || (clip && (userCanAccessClip(user, clip, db) || scopedVideoIds.has(clip.videoId)));
+          }).length || 0,
           socialAccounts: db.socialAccounts?.filter(item => item.userId === user.id || !item.userId).length || 0,
           watchedChannels: db.watchedChannels?.filter(item => item.userId === user.id || user.role === 'admin').length || 0
         },
@@ -4493,9 +4804,13 @@ async function handleApi(req, res, pathname) {
       return json(res, 200, await importSource(body.sourceUrl || '', user.id));
     }
     if (pathname === '/api/upload' && req.method === 'POST') {
+      const db = loadDb();
+      requireUser(req, db);
       return json(res, 200, await importUploadedVideo(req));
     }
     if (pathname === '/api/debug/import') {
+      const db = loadDb();
+      requireUser(req, db);
       const debugUrl = new URL(req.url, `http://${req.headers.host}`).searchParams.get('url') || '';
       const parsed = parseYouTubeUrl(debugUrl);
       let apiVideos = [];
@@ -4537,11 +4852,15 @@ async function handleApi(req, res, pathname) {
     }
     if (pathname === '/api/poll-watch' && req.method === 'POST') {
       const body = await readJson(req);
+      const db = loadDb();
+      const user = requireUser(req, db);
+      requireWatchAccess(db, user, body.watchId);
       return json(res, 200, await pollWatchedChannel(body.watchId));
     }
     if (pathname === '/api/poll-all' && req.method === 'POST') {
       const db = loadDb();
-      const active = db.watchedChannels.filter(item => item.status === 'active');
+      const user = requireUser(req, db);
+      const active = db.watchedChannels.filter(item => item.status === 'active' && (user.role === 'admin' || item.userId === user.id));
       const results = [];
       for (const watch of active) {
         try {
@@ -4574,6 +4893,11 @@ async function handleApi(req, res, pathname) {
       });
       const myTranscriptions = isAdmin ? db.transcriptions : db.transcriptions.filter(t => myVideoIds.has(t.videoId));
       const myStudioGenerations = isAdmin ? db.studioGenerations : db.studioGenerations.filter(g => g.userId === user.id);
+      const myImports = isAdmin ? db.imports : db.imports.filter(item => item.userId === user.id || myProjects.some(project => project.importId === item.id));
+      const myWatchedChannels = isAdmin ? db.watchedChannels : db.watchedChannels.filter(item => item.userId === user.id);
+      const myBrandKits = isAdmin ? db.brandKits : db.brandKits.filter(item => item.userId === user.id);
+      const myAudioGenerations = isAdmin ? (db.audioGenerations || []) : (db.audioGenerations || []).filter(item => item.userId === user.id);
+      const myUsageEvents = isAdmin ? (db.usageEvents || []) : (db.usageEvents || []).filter(item => item.userId === user.id);
       // Attach live queue position so a queued job shows "waiting behind N others" instead
       // of an indistinguishable-from-stalled 0% progress bar.
       const queuedJobIds = renderQueue.map(item => item.payload.jobId).filter(Boolean);
@@ -4593,6 +4917,17 @@ async function handleApi(req, res, pathname) {
         scheduledPosts: myScheduledPosts,
         transcriptions: myTranscriptions,
         studioGenerations: myStudioGenerations,
+        imports: myImports,
+        watchedChannels: myWatchedChannels,
+        brandKits: myBrandKits,
+        audioGenerations: myAudioGenerations,
+        usageEvents: myUsageEvents,
+        apiSettings: isAdmin
+          ? db.apiSettings.map(item => ({ ...item, configured: Boolean(item.value || process.env[item.key]), value: item.value ? '••••••••' : '' }))
+          : [],
+        aiLogs: isAdmin ? (db.aiLogs || []) : [],
+        importCache: isAdmin ? (db.importCache || []) : [],
+        bankAccounts: isAdmin ? (db.bankAccounts || []) : [],
         // Admins see all users; regular users only see themselves
         users: isAdmin ? db.users.map(publicUser) : [publicUser(db.users.find(u => u.id === user.id))].filter(Boolean),
         subscriptions: isAdmin ? db.subscriptions : db.subscriptions.filter(s => s.userId === user.id),
@@ -4863,6 +5198,18 @@ async function handleApi(req, res, pathname) {
         audioBuffer = Buffer.from(await resp.arrayBuffer());
       }
       writeFileSync(outPath, audioBuffer);
+      if (!Array.isArray(db.audioGenerations)) db.audioGenerations = [];
+      db.audioGenerations.unshift({
+        id: randomUUID(),
+        userId: user.id,
+        type: 'tts_audio',
+        outputPath: `/media/audio/${filename}`,
+        chars: text.length,
+        voiceId: body.voiceId || '',
+        createdAt: new Date().toISOString()
+      });
+      db.audioGenerations = db.audioGenerations.slice(0, 200);
+      saveDb(db);
       return json(res, 200, { url: `/media/audio/${filename}`, filename, chars: text.length });
     }
     if (pathname === '/api/studio/status') {
@@ -4974,8 +5321,18 @@ async function handleApi(req, res, pathname) {
       const body = await readJson(req);
       const db = loadDb();
       const user = requireUser(req, db);
+      const video = requireVideoAccess(db, user, body.videoId);
+      requireBrandKitAccess(db, user, body.brandKitId);
       // Check clip count warning for the user's plan
       const { plan } = subscriptionFor(db, user.id);
+      const requestedClipCount = Math.max(1, Math.min(10, Number(body.clipCount || 3)));
+      if (requestedClipCount > Number(plan.maxClipsPerVideo || 3)) {
+        throw new Error(`Your ${plan.name} plan allows up to ${plan.maxClipsPerVideo} clips per video.`);
+      }
+      const maxPlanSeconds = Number(plan.maxVideoLength || 0) * 60;
+      if (maxPlanSeconds > 0 && Number(video.durationSeconds || 0) > maxPlanSeconds) {
+        throw new Error(`Your ${plan.name} plan allows videos up to ${plan.maxVideoLength} minutes. Upgrade or trim this source.`);
+      }
       const now = new Date();
       const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
       const completedThisMonth = db.jobs.filter(j =>
@@ -5018,8 +5375,8 @@ async function handleApi(req, res, pathname) {
         if (!video) throw new Error('Video not found for retry.');
         db.jobs = db.jobs.filter(item => item.id !== body.jobId);
         saveDb(db);
-        const queued = createQueuedProcessingJob({ videoId: video.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 60 });
-        const retry = enqueueRenderJob({ videoId: video.id, jobId: queued.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 60 });
+        const queued = createQueuedProcessingJob({ videoId: video.id, userId: user.role === 'admin' ? (video.userId || video.createdBy || user.id) : user.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 60 });
+        const retry = enqueueRenderJob({ videoId: video.id, userId: queued.userId, jobId: queued.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 60 });
         retry.catch(error => console.error('[job:retry-failed]', String(error.message || error).slice(0, 2000)));
         return json(res, 202, { queued: true, jobId: queued.id, queueDepth: renderQueue.length, activeRenderJobs });
       }
@@ -5035,7 +5392,10 @@ async function handleApi(req, res, pathname) {
       if (user.role !== 'admin' && video.userId !== user.id && video.createdBy !== user.id) {
         throw Object.assign(new Error('You do not have permission to delete this video.'), { status: 403 });
       }
-      killActiveJobProcesses(video.id);
+      for (const videoJob of db.jobs.filter(j => j.videoId === video.id)) {
+        killActiveJobProcesses(videoJob.id);
+      }
+      cancelQueuedRenderJobsForVideo(video.id);
       // Delete source file from disk
       if (video.storagePath) unlinkQuiet(video.storagePath);
       // Delete all clips and their files that belong to this video
@@ -5485,10 +5845,24 @@ async function handleApi(req, res, pathname) {
         const job = db.jobs.find(item => item.id === body.jobId);
         if (!job) throw new Error('Job not found.');
         if (body.action === 'retry') {
+          const video = db.videos.find(item => item.id === job.videoId);
+          if (!video) throw new Error('Video not found for retry.');
           job.status = 'queued';
           job.progress = 0;
           job.stage = 'queued for retry';
           job.error = '';
+          job.updatedAt = new Date().toISOString();
+          saveDb(db);
+          const retry = enqueueRenderJob({
+            videoId: video.id,
+            userId: video.userId || video.createdBy || job.userId,
+            jobId: job.id,
+            rightsConfirmed: true,
+            clipCount: body.clipCount || 3,
+            clipLength: body.clipLength || 60
+          });
+          retry.catch(error => console.error('[admin-job:retry-failed]', String(error.message || error).slice(0, 2000)));
+          return json(res, 202, { queued: true, jobId: job.id, queueDepth: renderQueue.length, activeRenderJobs });
         }
         if (body.action === 'delete') db.jobs = db.jobs.filter(item => item.id !== body.jobId);
         saveDb(db);
@@ -5578,14 +5952,17 @@ async function handleApi(req, res, pathname) {
       const ytdlpStatus = ytdlpCommand ? await commandVersion(ytdlpCommand) : { ok: false, version: '', error: `Tried: ${ytdlpCandidates().join(', ')}` };
       const ffmpegStatus = await commandVersion(FFMPEG);
       const llmReady = settingReady(db, 'LLM_API_KEY');
+      const geminiReady = settingReady(db, 'GEMINI_API_KEY');
       const youtubeReady = settingReady(db, 'YOUTUBE_API_KEY');
-      const allReady = ytdlpStatus.ok && ffmpegStatus.ok && llmReady;
+      const aiReady = llmReady || geminiReady;
+      const allReady = ytdlpStatus.ok && ffmpegStatus.ok && aiReady;
       return json(res, 200, {
         status: allReady ? 'ready' : 'degraded',
         tools: {
           ffmpeg: { ok: ffmpegStatus.ok, version: ffmpegStatus.version, error: ffmpegStatus.error || '' },
           ytdlp: { ok: ytdlpStatus.ok, version: ytdlpStatus.version, command: ytdlpCommand || '', error: ytdlpStatus.error || '' },
           llm: { ok: llmReady },
+          gemini: { ok: geminiReady },
           youtube_api: { ok: youtubeReady },
           upload: { ok: true, note: 'File upload always available as primary workflow' }
         },
@@ -5609,16 +5986,8 @@ const server = http.createServer(async (req, res) => {
     const db = loadDb();
     const user = currentUser(req, db);
     if (!user) return json(res, 401, { error: 'Authentication required.' });
-    // Clip video/thumbnail files are named after the clip id — enforce per-user ownership,
-    // not just "logged in", since these are the assets an IDOR would actually expose.
     const relative = url.pathname.replace('/media/', '');
-    const clipMatch = relative.match(/^(?:clips|thumbs)\/(?:clip_)?([^./]+)\./);
-    if (clipMatch) {
-      const clip = db.clips.find(c => c.id === clipMatch[1]);
-      if (clip && clip.userId !== user.id && user.role !== 'admin') {
-        return json(res, 403, { error: 'You do not have access to this clip.' });
-      }
-    }
+    if (!userCanAccessMedia(user, relative, db)) return json(res, 403, { error: 'You do not have access to this media.' });
     res.writeHead(200, { 'content-type': mimeFor(file), 'content-length': statSync(file).size });
     return res.end(readFileSync(file));
   }
@@ -5651,13 +6020,26 @@ async function pollDueWatchedChannels() {
   }
 }
 
-server.listen(PORT, HOST, async () => {
-  console.log(`ClipForge AI running at http://${HOST}:${PORT}`);
-  await verifyMediaBinaries();
-  recoverStaleJobs('startup');
-  logMemory('startup');
-  pollDueWatchedChannels().catch(() => {});
-  setInterval(() => pollDueWatchedChannels().catch(() => {}), Number(process.env.WATCH_INTERVAL_MINUTES || 15) * 60 * 1000);
-  setInterval(() => logMemory('heartbeat'), Number(process.env.MEMORY_LOG_INTERVAL_MS || 60_000));
-  setInterval(() => recoverStaleJobs('interval'), 60_000);
-});
+if (process.env.NODE_ENV !== 'test') {
+  server.listen(PORT, HOST, async () => {
+    console.log(`ClipForge AI running at http://${HOST}:${PORT}`);
+    await verifyMediaBinaries();
+    recoverStaleJobs('startup');
+    logMemory('startup');
+    pollDueWatchedChannels().catch(() => {});
+    setInterval(() => pollDueWatchedChannels().catch(() => {}), Number(process.env.WATCH_INTERVAL_MINUTES || 15) * 60 * 1000);
+    setInterval(() => logMemory('heartbeat'), Number(process.env.MEMORY_LOG_INTERVAL_MS || 60_000));
+    setInterval(() => recoverStaleJobs('interval'), 60_000);
+  });
+}
+
+export {
+  buildTargetDurations,
+  fallbackMomentsForVideo,
+  buildTranscriptReference,
+  momentsAreDiverse,
+  overlapRatio,
+  parseFrameRate,
+  postProcessMoments,
+  userCanAccessMedia,
+};

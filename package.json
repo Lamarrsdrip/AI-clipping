@@ -5,7 +5,11 @@
   "description": "AI clipping SaaS MVP for owned or permissioned YouTube videos.",
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "lint": "node --check server.js && node --check public/app.js && python3 -m py_compile face_track.py",
+    "typecheck": "npm run lint",
+    "build": "npm run lint",
+    "test": "NODE_ENV=test node --test"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
