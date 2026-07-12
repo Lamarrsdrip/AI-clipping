@@ -123,6 +123,9 @@ const state = {
   // Framing mode for new clips
   framingMode: 'dynamic',
   clipLength: 60,
+  workflowMode: 'viral',
+  partDuration: 90,
+  captionMode: 'auto',
   // Brand kit state
   brandKits: [],
   activeBrandKitId: null,
@@ -165,6 +168,43 @@ function statusBadge(status) {
   return `<span class="clip-status ${s}">${dot}${labels[s] || s}</span>`;
 }
 
+function isSeriesClip(c) {
+  return Boolean(c?.seriesId || c?.workflowMode === 'series' || c?.partNumber);
+}
+
+function clipPartLabel(c) {
+  if (!isSeriesClip(c) || !c.partNumber) return '';
+  return `Part ${Number(c.partNumber)}${c.totalParts ? ` of ${Number(c.totalParts)}` : ''}`;
+}
+
+function clipAudioWarning(c) {
+  const finalStatus = c?.audioStatus?.finalStatus || '';
+  const issues = Array.isArray(c?.renderIssues) ? c.renderIssues.join(' ') : '';
+  if (finalStatus === 'FINAL_AUDIO_SILENT' || /FINAL_AUDIO_SILENT/.test(issues)) return 'Audio is silent';
+  if (finalStatus === 'FINAL_AUDIO_MISSING' || /FINAL_AUDIO_MISSING/.test(issues)) return 'Audio missing';
+  return '';
+}
+
+function sourceRangeLabel(c) {
+  if (c?.sourceStart == null || c?.sourceEnd == null) return '';
+  return `${dur(c.sourceStart)}-${dur(c.sourceEnd)}`;
+}
+
+function seriesClipsFor(c) {
+  if (!c?.seriesId) return [];
+  return (state.library.clips || [])
+    .filter(item => item.seriesId === c.seriesId && item.outputPath && !item.demoMode)
+    .sort((a, b) => Number(a.partNumber || 0) - Number(b.partNumber || 0));
+}
+
+function openClipById(id) {
+  const clip = (state.library.clips || []).find(item => item.id === id);
+  if (!clip) return;
+  state.clip = clip;
+  state.view = 'clipDetail';
+  setView('clipDetail');
+}
+
 /* ── Clip Modal ──────────────────────────────────────────────────── */
 function openClipModal(clipId) {
   const c = (state.library.clips || []).find(x => x.id === clipId);
@@ -176,6 +216,8 @@ function openClipModal(clipId) {
   const hook = c.hookStrength ? Math.round(c.hookStrength * 10) : score;
   const viral = c.emotionalPunch ? Math.round(c.emotionalPunch * 10) : Math.round(score * 0.9);
   const share = c.shareability ? Math.round(c.shareability * 10) : Math.round(score * 0.85);
+  const partLabel = clipPartLabel(c);
+  const audioWarning = clipAudioWarning(c);
 
   let modal = document.getElementById('globalClipModal');
   if (!modal) {
@@ -206,7 +248,7 @@ function openClipModal(clipId) {
               <div class="modal-score-item"><small>🔥 Hook</small><b>${hook}%</b></div>
               <div class="modal-score-item"><small>❤️ Viral</small><b>${viral}%</b></div>
               <div class="modal-score-item"><small>📤 Share</small><b>${share}%</b></div>
-              <div class="modal-score-item"><small>⏱ Duration</small><b>${dur2}s</b></div>
+              <div class="modal-score-item"><small>${partLabel ? 'Part' : '⏱ Duration'}</small><b>${esc(partLabel || `${dur2}s`)}</b></div>
             </div>
           </div>
           <div>
@@ -215,6 +257,7 @@ function openClipModal(clipId) {
               <span>Style: ${esc(c.captionStyle || 'bold')}</span>
               <span>${when(c.createdAt)}</span>
             </div>
+            ${audioWarning ? `<p class="error-text" style="margin:0 0 10px">${esc(audioWarning)}. This export should be retried before posting.</p>` : ''}
             ${c.rationale ? `<p style="font-size:.83rem;line-height:1.6;color:var(--muted)">${esc(c.rationale)}</p>` : ''}
           </div>
           <div class="clip-modal-actions">
@@ -686,6 +729,12 @@ function renderCreate() {
           ${allVideos.length > 1 ? `<button class="ghost danger-btn" id="clearAllVideos" style="margin-top:4px;font-size:.8rem">Remove all videos</button>` : ''}
 
           <div class="gen-options" style="margin-top:16px">
+            <div class="option-row"><label>Mode</label>
+              <select id="workflowMode">
+                <option value="viral" ${state.workflowMode==='viral'?'selected':''}>Viral Clips</option>
+                <option value="series" ${state.workflowMode==='series'?'selected':''}>Full Video Series</option>
+              </select>
+            </div>
             <div class="option-row"><label>Clips</label>
               <select id="clipCount">
                 <option value="3">3 clips</option>
@@ -703,9 +752,26 @@ function renderCreate() {
                 <option value="600" ${state.clipLength===600?'selected':''}>10 min</option>
               </select>
             </div>
+            <div class="option-row"><label>Part length</label>
+              <select id="partDuration">
+                <option value="60"  ${state.partDuration===60 ?'selected':''}>60 s</option>
+                <option value="90"  ${state.partDuration===90 ?'selected':''}>90 s</option>
+                <option value="120" ${state.partDuration===120?'selected':''}>120 s</option>
+                <option value="180" ${state.partDuration===180?'selected':''}>3 min</option>
+              </select>
+            </div>
             <div class="option-row"><label>Captions</label>
               <select id="captionStyle">
                 ${CAPTION_STYLES.map(s=>`<option value="${s}">${CAPTION_STYLE_LABELS[s]||s}</option>`).join('')}
+              </select>
+            </div>
+            <div class="option-row"><label>Caption source</label>
+              <select id="captionMode">
+                <option value="auto" ${state.captionMode==='auto'?'selected':''}>Auto-detect</option>
+                <option value="source" ${state.captionMode==='source'?'selected':''}>Use source captions</option>
+                <option value="replace" ${state.captionMode==='replace'?'selected':''}>Replace with ClipForge captions</option>
+                <option value="add" ${state.captionMode==='add'?'selected':''}>Add ClipForge captions</option>
+                <option value="none" ${state.captionMode==='none'?'selected':''}>No captions</option>
               </select>
             </div>
             <div class="option-row"><label>Framing</label>
@@ -731,7 +797,7 @@ function renderCreate() {
 
           <label class="permission" style="margin-top:12px"><input id="rightsBulk" type="checkbox"> I own or have permission to use this content.</label>
           <button id="processSelected" style="margin-top:12px;width:100%" ${state.selected.size?'':'disabled'}>
-            Generate ${state.selected.size||''} video${state.selected.size!==1?'s':''} with AI →
+            ${state.workflowMode==='series' ? 'Generate full series' : `Generate ${state.selected.size||''} video${state.selected.size!==1?'s':''} with AI`} →
           </button>
         ` : `
           <div class="step-empty">
@@ -751,6 +817,9 @@ function renderCreate() {
     renderCreate();
   }));
   $('#processSelected')?.addEventListener('click', processSelected);
+  $('#workflowMode')?.addEventListener('change', e => { state.workflowMode = e.target.value; renderCreate(); });
+  $('#partDuration')?.addEventListener('change', e => { state.partDuration = Number(e.target.value || 90); });
+  $('#captionMode')?.addEventListener('change', e => { state.captionMode = e.target.value || 'auto'; });
 }
 
 function videoCards(videos) {
@@ -837,9 +906,15 @@ async function processSelected() {
   btn.disabled=true; btn.textContent='Processing…';
   const clipCount      = Number($('#clipCount')?.value  || 3);
   const clipLength     = Number($('#clipLength')?.value || 60);
+  const workflowMode   = $('#workflowMode')?.value || 'viral';
+  const partDuration   = Number($('#partDuration')?.value || 90);
   const captionStyle   = $('#captionStyle')?.value  || 'bold';
+  const captionMode    = $('#captionMode')?.value || 'auto';
   const framingMode    = $('#framingMode')?.value   || 'dynamic';
   const brandKitId     = $('#brandKitSelect')?.value || null;
+  state.workflowMode   = workflowMode;
+  state.partDuration   = partDuration;
+  state.captionMode    = captionMode;
   state.framingMode    = framingMode;
   state.clipLength     = clipLength;
   state.activeBrandKitId = brandKitId || null;
@@ -848,7 +923,7 @@ async function processSelected() {
   try {
     await Promise.all(selected.map(videoId => api('/api/process', {
       method:'POST',
-      body:JSON.stringify({videoId, rightsConfirmed:true, clipCount, clipLength, captionStyle, framingMode, brandKitId: brandKitId||undefined})
+      body:JSON.stringify({videoId, rightsConfirmed:true, clipCount, clipLength, workflowMode, partDuration, captionStyle, captionMode, framingMode, brandKitId: brandKitId||undefined})
     })));
     state.selected.clear(); await loadAll(); setView('clips');
   } catch(err) {
@@ -864,6 +939,7 @@ async function processSelected() {
 function renderClips() {
   const allClips = (state.library.clips||[]).filter(c=>c.outputPath&&!c.demoMode);
   const allJobs  = state.library.jobs||[];
+  const failedSeriesParts = (state.library.seriesParts||[]).filter(p=>p.status==='failed');
   const activeJobs = allJobs.filter(j=>['queued','running'].includes(j.status));
   const failedJobs = allJobs.filter(j=>j.status==='failed');
 
@@ -926,6 +1002,25 @@ function renderClips() {
         ${failedJobs.map(jobCard).join('')}
       </div>` : ''}
 
+    ${failedSeriesParts.length ? `
+      <div class="panel" style="margin-bottom:18px;border-color:rgba(248,113,113,.28)">
+        <h2 style="margin-bottom:13px;color:var(--danger)">Series parts needing retry</h2>
+        ${failedSeriesParts.map(part => {
+          const series = (state.library.seriesJobs||[]).find(s=>s.id===part.seriesId) || {};
+          const video = (state.library.videos||[]).find(v=>v.id===series.videoId) || {};
+          return `<div class="job-card failed">
+            <div class="job-head">
+              <div>
+                <b style="font-size:.9rem">${esc(video.title || 'Full Video Series')}</b>
+                <span style="margin-left:8px">${pill(`Part ${part.partNumber}${part.totalParts ? ` of ${part.totalParts}` : ''}`, 'error')}</span>
+              </div>
+              <button data-retry-series-part="${esc(part.id)}" data-series-job="${esc(series.jobId||'')}" style="font-size:.78rem;padding:7px 14px">Retry part</button>
+            </div>
+            ${part.error?`<p class="error-text" style="margin-top:7px">${esc(part.error)}</p>`:''}
+          </div>`;
+        }).join('')}
+      </div>` : ''}
+
     <!-- Clip grid or empty state -->
     ${clips.length ? `
       <div style="margin-bottom:12px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
@@ -965,6 +1060,19 @@ function renderClips() {
       state.clipsBulkSelected.clear(); renderClips();
     });
   });
+  $$('[data-retry-series-part]').forEach(btn => btn.addEventListener('click', async () => {
+    try {
+      btn.disabled = true;
+      btn.textContent = 'Retrying...';
+      await api('/api/job', { method:'PATCH', body:JSON.stringify({ action:'retry-series-part', jobId:btn.dataset.seriesJob, partId:btn.dataset.retrySeriesPart }) });
+      await loadAll();
+      renderClips();
+    } catch(e) {
+      alert(e.message);
+      await loadAll();
+      renderClips();
+    }
+  }));
 
   // Clip card events (preview, bulk select, context menu)
   $$('.clip-card[data-clip-id]').forEach(card => {
@@ -1046,6 +1154,9 @@ function clipCard(c) {
   const viralPct = c.emotionalPunch ? Math.round(c.emotionalPunch*10) : Math.round(score*.9);
   const retentionPct = c.retentionScore ? Math.round(c.retentionScore*10) : Math.round(score*.88);
   const title = clipTitle(c);
+  const partLabel = clipPartLabel(c);
+  const audioWarning = clipAudioWarning(c);
+  const sourceRange = sourceRangeLabel(c);
   const isSelected = state.clipsBulkSelected.has(c.id);
   const menuOpen = state.openMenuClipId === c.id;
   const dropoffRisk = c.dropoffRisk || 'medium';
@@ -1062,7 +1173,7 @@ function clipCard(c) {
       ${thumbEl}
       <div class="clip-thumb-overlay"></div>
       <div class="clip-thumb-tl">
-        <span class="clip-dur-badge">${dur2}s</span>
+        <span class="clip-dur-badge">${partLabel ? esc(partLabel) : `${dur2}s`}</span>
         ${platformBadge(c.bestPlatform)}
       </div>
       <div class="clip-thumb-tr">${scoreChip(score)}</div>
@@ -1095,6 +1206,8 @@ function clipCard(c) {
         </div>
       </div>
       <div class="clip-intel-row">
+        ${audioWarning ? `<div class="retention-badge high"><div class="retention-dot"></div>${esc(audioWarning)}</div>` : ''}
+        ${sourceRange ? `<div class="clip-intel-item"><span>${esc(sourceRange)}</span></div>` : ''}
         <div class="clip-intel-item">
           <span>Style:</span>
           <b>${esc(c.captionStyle||'viral')}</b>
@@ -1132,6 +1245,17 @@ function renderClipDetail() {
   const thumbOptions=c.thumbnailOptions||[];
   const intel=c.intelligence||{};
   const dur2=Math.round((c.endSeconds||0)-(c.startSeconds||0));
+  const partLabel = clipPartLabel(c);
+  const audioWarning = clipAudioWarning(c);
+  const sourceRange = sourceRangeLabel(c);
+  const seriesClips = seriesClipsFor(c);
+  const seriesIndex = seriesClips.findIndex(item => item.id === c.id);
+  const previousSeriesClip = c.previousPartId
+    ? (state.library.clips || []).find(item => item.id === c.previousPartId)
+    : seriesIndex > 0 ? seriesClips[seriesIndex - 1] : null;
+  const nextSeriesClip = c.nextPartId
+    ? (state.library.clips || []).find(item => item.id === c.nextPartId)
+    : seriesIndex >= 0 ? seriesClips[seriesIndex + 1] : null;
 
   $('#clipDetail').innerHTML = `
     <div class="detail-grid">
@@ -1147,10 +1271,19 @@ function renderClipDetail() {
           </div>
         </div>
         <div class="meta" style="margin-top:8px">
-          <span>${dur2}s clip</span>
+          <span>${esc(partLabel || `${dur2}s clip`)}</span>
+          ${sourceRange ? `<span>${esc(sourceRange)}</span>` : ''}
           <span>${esc(c.reason||'educational')}</span>
           <span>Style: ${esc(c.captionStyle||'bold')}</span>
         </div>
+        ${audioWarning ? `<p class="error-text">${esc(audioWarning)}. This export failed audio validation and should not be posted.</p>` : ''}
+        ${partLabel ? `
+          <div class="action-row" style="gap:8px;flex-wrap:wrap">
+            <button class="ghost" id="prevSeriesPart" ${previousSeriesClip?'':'disabled'}>Previous part</button>
+            <button class="ghost" id="nextSeriesPart" ${nextSeriesClip?'':'disabled'}>Next part</button>
+            ${seriesClips.length ? `<button class="ghost" id="downloadSeriesParts">Download all parts</button>` : ''}
+          </div>
+        ` : ''}
         <a class="button" href="${clipUrl(c.outputPath)}" download="clip-${c.id}.mp4" style="text-align:center">⬇ Download clip</a>
         ${thumbOptions.length?`
           <div>
@@ -1263,6 +1396,20 @@ function renderClipDetail() {
       state.clip.thumbnailOptions=res.options;
       renderClipDetail();
     } catch(e) { alert(e.message); $('#genThumbs').textContent='Generate thumbnails'; $('#genThumbs').disabled=false; }
+  });
+  $('#prevSeriesPart')?.addEventListener('click', () => previousSeriesClip && openClipById(previousSeriesClip.id));
+  $('#nextSeriesPart')?.addEventListener('click', () => nextSeriesClip && openClipById(nextSeriesClip.id));
+  $('#downloadSeriesParts')?.addEventListener('click', () => {
+    seriesClips.forEach((clip, index) => {
+      setTimeout(() => {
+        const a = document.createElement('a');
+        a.href = clipUrl(clip.outputPath);
+        a.download = `clip-${clip.id}.mp4`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }, index * 250);
+    });
   });
 }
 

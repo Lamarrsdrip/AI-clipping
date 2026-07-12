@@ -1,13 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildFullSeriesMoments,
   buildTargetDurations,
+  chooseBestDownloadedMedia,
   fallbackMomentsForVideo,
   buildTranscriptReference,
+  FINAL_AUDIO_MISSING,
+  FINAL_AUDIO_SILENT,
+  FINAL_AUDIO_VALID,
+  isEffectivelySilent,
   momentsAreDiverse,
   overlapRatio,
   parseFrameRate,
+  parseVolumeStats,
   postProcessMoments,
+  SOURCE_AUDIO_EXTRACTION_FAILED,
+  SOURCE_AUDIO_PRESENT,
+  SOURCE_HAS_NO_AUDIO,
+  upsertSeriesPlan,
   userCanAccessMedia,
 } from '../server.js';
 
@@ -74,6 +85,101 @@ test('postProcessMoments rejects heavily overlapping AI clips and fills with div
 test('parseFrameRate handles ffprobe ratios without eval', () => {
   assert.equal(Math.round(parseFrameRate('30000/1001')), 30);
   assert.equal(parseFrameRate('not-js'), 0);
+});
+
+test('volumedetect parsing rejects digital silence around -91 dB', () => {
+  const parsed = parseVolumeStats('mean_volume: -91.0 dB\nmax_volume: -91.0 dB');
+  assert.equal(parsed.meanVolumeDb, -91);
+  assert.equal(parsed.maxVolumeDb, -91);
+  assert.equal(isEffectivelySilent(parsed.maxVolumeDb), true);
+  assert.equal(isEffectivelySilent(-18.5), false);
+});
+
+test('audio state constants distinguish source and final failures', () => {
+  assert.notEqual(SOURCE_AUDIO_EXTRACTION_FAILED, SOURCE_HAS_NO_AUDIO);
+  assert.notEqual(SOURCE_AUDIO_PRESENT, SOURCE_HAS_NO_AUDIO);
+  assert.notEqual(FINAL_AUDIO_VALID, FINAL_AUDIO_SILENT);
+  assert.notEqual(FINAL_AUDIO_MISSING, FINAL_AUDIO_SILENT);
+});
+
+test('YouTube download selection prefers muxed media and otherwise pairs video-only with audio-only', () => {
+  const muxedChoice = chooseBestDownloadedMedia([
+    { path: '/tmp/video-720.mp4', hasVideo: true, hasAudio: true, height: 720, formatBitrate: 2_000_000, size: 20 },
+    { path: '/tmp/video-1080.mp4', hasVideo: true, hasAudio: false, height: 1080, formatBitrate: 4_000_000, size: 40 },
+    { path: '/tmp/audio.webm', hasVideo: false, hasAudio: true, audioBitrate: 128_000, size: 5 },
+  ]);
+  assert.equal(muxedChoice.muxed.path, '/tmp/video-720.mp4');
+
+  const splitChoice = chooseBestDownloadedMedia([
+    { path: '/tmp/video-720.mp4', hasVideo: true, hasAudio: false, height: 720, formatBitrate: 2_000_000, size: 20 },
+    { path: '/tmp/video-1080.mp4', hasVideo: true, hasAudio: false, height: 1080, formatBitrate: 4_000_000, size: 40 },
+    { path: '/tmp/audio-low.webm', hasVideo: false, hasAudio: true, audioBitrate: 64_000, size: 3 },
+    { path: '/tmp/audio-high.webm', hasVideo: false, hasAudio: true, audioBitrate: 160_000, size: 6 },
+  ]);
+  assert.equal(splitChoice.muxed, null);
+  assert.equal(splitChoice.videoOnly.path, '/tmp/video-1080.mp4');
+  assert.equal(splitChoice.audioOnly.path, '/tmp/audio-high.webm');
+});
+
+test('full video series covers a 10-minute source with sequential numbered parts and no gaps', () => {
+  const transcript = Array.from({ length: 40 }, (_, i) => ({
+    start: i * 15,
+    end: Math.min(600, i * 15 + 15),
+    text: `Sentence ${i}.`,
+  }));
+  const parts = buildFullSeriesMoments(
+    { id: 'video-series', title: 'Complete story', durationSeconds: 600 },
+    transcript,
+    { seriesId: 'series-1', partDuration: 120, boundaryAdjustmentSeconds: 15 },
+  );
+  assert.equal(parts.length, 5);
+  assert.deepEqual(parts.map(p => p.partNumber), [1, 2, 3, 4, 5]);
+  assert.ok(parts.every(p => p.totalParts === 5));
+  assert.equal(parts[0].sourceStart, 0);
+  assert.equal(parts.at(-1).sourceEnd, 600);
+  for (let i = 1; i < parts.length; i += 1) {
+    assert.equal(parts[i].sourceStart, parts[i - 1].sourceEnd);
+    assert.equal(parts[i].start, parts[i].sourceStart);
+  }
+});
+
+test('full video series uses natural boundaries within the configured adjustment window', () => {
+  const transcript = [
+    { start: 0, end: 92, text: 'First complete thought.' },
+    { start: 92, end: 181, text: 'Second complete thought.' },
+    { start: 181, end: 270, text: 'Third complete thought.' },
+  ];
+  const parts = buildFullSeriesMoments(
+    { id: 'video-boundaries', title: 'Boundary story', durationSeconds: 270 },
+    transcript,
+    { seriesId: 'series-2', partDuration: 90, boundaryAdjustmentSeconds: 15 },
+  );
+  assert.equal(parts[0].sourceEnd, 92);
+  assert.ok(Math.abs(parts[0].duration - 90) <= 15);
+  assert.equal(parts[1].sourceStart, 92);
+  assert.equal(parts[1].sourceEnd, 181);
+  assert.ok(Math.abs(parts[1].duration - 90) <= 15);
+});
+
+test('series plan persists completed parts and retries only failed rows', () => {
+  const db = { seriesJobs: [], seriesParts: [] };
+  const parts = buildFullSeriesMoments(
+    { id: 'video-retry', title: 'Retry story', durationSeconds: 360 },
+    Array.from({ length: 12 }, (_, i) => ({ start: i * 30, end: i * 30 + 30, text: `Part text ${i}.` })),
+    { seriesId: 'series-retry', partDuration: 120, boundaryAdjustmentSeconds: 10 },
+  );
+  upsertSeriesPlan(db, { seriesId: 'series-retry', jobId: 'job-1', videoId: 'video-retry', userId: 'u1', parts, targetPartDuration: 120 });
+  db.seriesParts[0].status = 'complete';
+  db.seriesParts[0].clipId = 'clip-1';
+  db.seriesParts[1].status = 'failed';
+  db.seriesParts[1].error = 'FINAL_AUDIO_SILENT';
+  upsertSeriesPlan(db, { seriesId: 'series-retry', jobId: 'job-2', videoId: 'video-retry', userId: 'u1', parts, targetPartDuration: 120 });
+  assert.equal(db.seriesParts.length, 3);
+  assert.equal(db.seriesParts[0].status, 'complete');
+  assert.equal(db.seriesParts[0].clipId, 'clip-1');
+  assert.equal(db.seriesParts[1].status, 'failed');
+  assert.equal(db.seriesParts[1].error, 'FINAL_AUDIO_SILENT');
+  assert.equal(db.seriesParts[2].status, 'queued');
 });
 
 test('media access is scoped to owners and blocks originals by default', () => {

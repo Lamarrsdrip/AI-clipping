@@ -38,6 +38,10 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const STORAGE_DIR = process.env.CLIPFORGE_STORAGE_DIR || path.join(__dirname, 'storage');
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
+const FFPROBE = process.env.FFPROBE_PATH || (() => {
+  if (/ffmpeg(?:\.exe)?$/i.test(FFMPEG)) return FFMPEG.replace(/ffmpeg(?:\.exe)?$/i, process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe');
+  return 'ffprobe';
+})();
 const CREDITS_ENABLED = process.env.CREDITS_ENABLED !== 'false';
 const CLIP_JOB_CREDIT_COST = Number(process.env.CLIP_JOB_CREDIT_COST || 5);
 const MIN_CLIP_SOURCE_SECONDS = Number(process.env.MIN_CLIP_SOURCE_SECONDS || 15);
@@ -56,6 +60,8 @@ const MAX_RSS_MB = Number(process.env.MAX_RSS_MB || 420);
 const RENDER_WIDTH = Number(process.env.RENDER_WIDTH || 720);
 const RENDER_HEIGHT = Number(process.env.RENDER_HEIGHT || 1280);
 const TRANSCRIPTION_CHUNK_SECONDS = Math.max(120, Number(process.env.TRANSCRIPTION_CHUNK_SECONDS || 600));
+const DIGITAL_SILENCE_MAX_DB = Number(process.env.DIGITAL_SILENCE_MAX_DB || -89);
+const MIN_AUDIBLE_AUDIO_BITRATE = Number(process.env.MIN_AUDIBLE_AUDIO_BITRATE || 16000);
 const importAttempts = new Map();
 const importUserAttempts = new Map(); // userId → [timestamps] for rate-limiting by user
 const ytdlpBlock = { until: 0, reason: '' };
@@ -121,7 +127,9 @@ const seed = {
   usageEvents: [],
   transcriptions: [],
   studioGenerations: [],
-  audioGenerations: []
+  audioGenerations: [],
+  seriesJobs: [],
+  seriesParts: []
 };
 
 const PLATFORMS = ['TikTok', 'YouTube Shorts', 'Instagram Reels', 'Facebook Reels', 'X'];
@@ -346,6 +354,8 @@ function loadDb() {
   if (!Array.isArray(db.studioGenerations)) db.studioGenerations = [];
   if (!Array.isArray(db.transcriptions)) db.transcriptions = [];
   if (!Array.isArray(db.audioGenerations)) db.audioGenerations = [];
+  if (!Array.isArray(db.seriesJobs)) db.seriesJobs = [];
+  if (!Array.isArray(db.seriesParts)) db.seriesParts = [];
   if (!Array.isArray(db.brandKits)) db.brandKits = [];
   for (const user of db.users) {
     if (!user.role) user.role = user.email === 'ava@clipforge.local' ? 'admin' : 'user';
@@ -378,6 +388,8 @@ function saveDb(db) {
   if (!Array.isArray(db.studioGenerations)) db.studioGenerations = [];
   if (!Array.isArray(db.transcriptions)) db.transcriptions = [];
   if (!Array.isArray(db.audioGenerations)) db.audioGenerations = [];
+  if (!Array.isArray(db.seriesJobs)) db.seriesJobs = [];
+  if (!Array.isArray(db.seriesParts)) db.seriesParts = [];
   if (!Array.isArray(db.brandKits)) db.brandKits = [];
   writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 }
@@ -672,6 +684,145 @@ async function commandVersion(command) {
   } catch (error) {
     return { ok: false, version: '', error: error.message };
   }
+}
+
+const SOURCE_AUDIO_PRESENT = 'SOURCE_AUDIO_PRESENT';
+const SOURCE_HAS_NO_AUDIO = 'SOURCE_HAS_NO_AUDIO';
+const SOURCE_AUDIO_EXTRACTION_FAILED = 'SOURCE_AUDIO_EXTRACTION_FAILED';
+const FINAL_AUDIO_VALID = 'FINAL_AUDIO_VALID';
+const FINAL_AUDIO_SILENT = 'FINAL_AUDIO_SILENT';
+const FINAL_AUDIO_MISSING = 'FINAL_AUDIO_MISSING';
+
+function hasPathSeparator(value = '') {
+  return /[\\/]/.test(String(value));
+}
+
+function ffmpegLocationArgs() {
+  if (!hasPathSeparator(FFMPEG)) return [];
+  return ['--ffmpeg-location', path.dirname(FFMPEG)];
+}
+
+function numberOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseVolumeStats(stderr = '') {
+  const mean = numberOrNull(stderr.match(/mean_volume:\s*([-\d.]+)/)?.[1]);
+  const max = numberOrNull(stderr.match(/max_volume:\s*([-\d.]+)/)?.[1]);
+  return { meanVolumeDb: mean, maxVolumeDb: max };
+}
+
+function isEffectivelySilent(maxVolumeDb) {
+  return maxVolumeDb === null || maxVolumeDb === undefined || !Number.isFinite(Number(maxVolumeDb)) || Number(maxVolumeDb) <= DIGITAL_SILENCE_MAX_DB;
+}
+
+async function probeMedia(filePath, { countPackets = false } = {}) {
+  const args = ['-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format'];
+  if (countPackets) args.splice(4, 0, '-count_packets');
+  const { stdout } = await run(FFPROBE, [...args, filePath], { label: 'ffprobe-media', timeoutMs: 30_000 });
+  const probe = JSON.parse(stdout || '{}');
+  const streams = Array.isArray(probe.streams) ? probe.streams : [];
+  const videoStream = streams.find(s => s.codec_type === 'video') || null;
+  const audioStream = streams.find(s => s.codec_type === 'audio') || null;
+  return {
+    path: filePath,
+    probe,
+    videoStream,
+    audioStream,
+    hasVideo: Boolean(videoStream),
+    hasAudio: Boolean(audioStream),
+    formatDuration: numberOrNull(probe.format?.duration),
+    formatBitrate: numberOrNull(probe.format?.bit_rate),
+    videoDuration: numberOrNull(videoStream?.duration),
+    audioDuration: numberOrNull(audioStream?.duration),
+    audioBitrate: numberOrNull(audioStream?.bit_rate),
+    audioPackets: numberOrNull(audioStream?.nb_read_packets) ?? numberOrNull(audioStream?.nb_frames),
+    width: numberOrNull(videoStream?.width),
+    height: numberOrNull(videoStream?.height),
+    fps: parseFrameRate(videoStream?.avg_frame_rate || videoStream?.r_frame_rate || '0/1'),
+  };
+}
+
+async function measureAudioVolume(filePath) {
+  try {
+    const { stderr } = await run(FFMPEG, [
+      '-hide_banner', '-i', filePath,
+      '-af', 'volumedetect', '-vn', '-sn', '-dn', '-f', 'null', '-',
+    ], { label: 'audio-volumedetect', timeoutMs: 90_000, maxOutputBytes: 512 * 1024 });
+    return parseVolumeStats(stderr);
+  } catch (error) {
+    return { meanVolumeDb: null, maxVolumeDb: null, error: String(error.message || error) };
+  }
+}
+
+async function inspectSourceAudio(mediaPath) {
+  try {
+    const info = await probeMedia(mediaPath, { countPackets: true });
+    if (!info.hasAudio) {
+      return {
+        status: SOURCE_HAS_NO_AUDIO,
+        reason: 'No audio stream found in source media.',
+        ...info,
+      };
+    }
+    const volume = await measureAudioVolume(mediaPath);
+    const silent = isEffectivelySilent(volume.maxVolumeDb);
+    return {
+      status: silent ? SOURCE_HAS_NO_AUDIO : SOURCE_AUDIO_PRESENT,
+      reason: silent ? 'Source audio stream is present but effectively silent.' : 'Source audio is present and audible.',
+      ...info,
+      ...volume,
+      silent,
+    };
+  } catch (error) {
+    return {
+      status: SOURCE_AUDIO_EXTRACTION_FAILED,
+      reason: String(error.message || error),
+      hasAudio: false,
+      hasVideo: false,
+      silent: true,
+    };
+  }
+}
+
+function summarizeFormat(info = {}) {
+  return {
+    file: path.basename(info.path || ''),
+    hasVideo: Boolean(info.hasVideo),
+    hasAudio: Boolean(info.hasAudio),
+    width: info.width || 0,
+    height: info.height || 0,
+    duration: info.formatDuration || info.videoDuration || info.audioDuration || 0,
+    audioBitrate: info.audioBitrate || 0,
+    videoCodec: info.videoStream?.codec_name || '',
+    audioCodec: info.audioStream?.codec_name || '',
+  };
+}
+
+function chooseBestDownloadedMedia(candidates = []) {
+  const usable = candidates.filter(item => item && (item.hasVideo || item.hasAudio));
+  const muxed = usable
+    .filter(item => item.hasVideo && item.hasAudio)
+    .sort((a, b) =>
+      (b.height || 0) - (a.height || 0) ||
+      (b.formatBitrate || 0) - (a.formatBitrate || 0) ||
+      (b.size || 0) - (a.size || 0)
+    )[0] || null;
+  const videoOnly = usable
+    .filter(item => item.hasVideo && !item.hasAudio)
+    .sort((a, b) =>
+      (b.height || 0) - (a.height || 0) ||
+      (b.formatBitrate || 0) - (a.formatBitrate || 0) ||
+      (b.size || 0) - (a.size || 0)
+    )[0] || null;
+  const audioOnly = usable
+    .filter(item => item.hasAudio && !item.hasVideo)
+    .sort((a, b) =>
+      (b.audioBitrate || 0) - (a.audioBitrate || 0) ||
+      (b.size || 0) - (a.size || 0)
+    )[0] || null;
+  return { muxed, videoOnly, audioOnly };
 }
 
 // Cache result — probe runs once per process lifetime
@@ -1163,12 +1314,17 @@ async function importSource(sourceUrl, userId) {
 function unlinkQuiet(filePath) {
   try {
     if (filePath && existsSync(filePath)) unlinkSync(filePath);
-  } catch {}
+  } catch (error) {
+    const reason = `Validation failed: ${String(error.message || error).slice(0, 300)}`;
+    issues.push(reason);
+    fatalIssues.push('FINAL_VALIDATION_FAILED');
+    audio.failureReason = reason;
+  }
 }
 
 // ─── Gemini transcription fallback (no Whisper key needed) ───────────────────
 async function transcribeWithGemini(db, mediaPath, videoId, geminiKey) {
-  const probe = await probeMedia(mediaPath).catch(() => ({ durationSeconds: 0 }));
+  const probe = await probeMediaDuration(mediaPath).catch(() => ({ durationSeconds: 0 }));
   const totalDuration = Math.max(0, Number(probe.durationSeconds || 0));
   const chunks = totalDuration > TRANSCRIPTION_CHUNK_SECONDS
     ? Array.from({ length: Math.ceil(totalDuration / TRANSCRIPTION_CHUNK_SECONDS) }, (_, i) => ({
@@ -1442,7 +1598,7 @@ function streamUploadedVideo(req) {
   });
 }
 
-async function probeMedia(filePath) {
+async function probeMediaDuration(filePath) {
   try {
     const { stdout } = await run(FFMPEG, ['-i', filePath, '-hide_banner']);
     return stdout;
@@ -1469,7 +1625,7 @@ async function thumbnailForUpload(filePath, uploadId) {
 async function importUploadedVideo(req) {
   const { fields, file } = await streamUploadedVideo(req);
   logMemory('after upload stream');
-  const probe = await probeMedia(file.path);
+  const probe = await probeMediaDuration(file.path);
   const thumbnailUrl = await thumbnailForUpload(file.path, file.uploadId);
   const title = fields.title || file.filename.replace(/\.[^.]+$/, '') || 'Uploaded video';
   const video = classifyVideoForImport({
@@ -1511,6 +1667,32 @@ function enqueueRenderJob(payload) {
     renderQueue.push({ payload, resolve, reject });
     drainRenderQueue();
   });
+}
+
+function recoverQueuedSeriesJobs(reason = 'startup') {
+  const db = loadDb();
+  const candidates = db.jobs.filter(job =>
+    ['queued', 'running'].includes(job.status) &&
+    ['series', 'full_series', 'full-video-series'].includes(String(job.payload?.workflowMode || job.payload?.mode || '').toLowerCase())
+  );
+  let queued = 0;
+  const payloads = [];
+  for (const job of candidates) {
+    job.status = 'queued';
+    job.stage = 'queued after restart';
+    job.progress = Math.max(1, Math.min(99, Number(job.progress || 1)));
+    job.updatedAt = new Date().toISOString();
+    payloads.push({ ...(job.payload || {}), jobId: job.id, videoId: job.videoId, rightsConfirmed: true });
+    queued += 1;
+  }
+  if (queued) {
+    saveDb(db);
+    for (const payload of payloads) {
+      enqueueRenderJob(payload).catch(error => console.error('[series:recovery-failed]', { jobId: payload.jobId, reason, error: String(error.message || error).slice(0, 500) }));
+    }
+    console.error('[series:recovered-queued]', { reason, queued });
+  }
+  return queued;
 }
 
 function drainRenderQueue() {
@@ -1618,7 +1800,13 @@ async function downloadVideo(video, jobId = '') {
   try {
     await runYtDlpWithClientFallback(
       ytdlpCommand,
-      ['-f', 'bv*[height<=1080]+ba/b[height<=1080]', '--merge-output-format', 'mp4', '-o', output, video.url],
+      [
+        ...ffmpegLocationArgs(),
+        '-f', 'bv*[height<=1080]+ba/b[height<=1080]',
+        '--merge-output-format', 'mp4',
+        '-o', output,
+        video.url
+      ],
       { jobId, label: 'yt-dlp download', timeoutMs: PROCESS_TIMEOUT_MS }
     );
   } catch (error) {
@@ -1626,9 +1814,61 @@ async function downloadVideo(video, jobId = '') {
     throw new Error(friendlyYtDlpError(error));
   }
   const files = await readdir(path.join(STORAGE_DIR, 'originals'));
-  const found = files.find(file => file.startsWith(video.youtubeId) && file.endsWith('.mp4'));
-  if (!found) throw new Error('yt-dlp completed but no mp4 output was found.');
-  return path.join(STORAGE_DIR, 'originals', found);
+  const mediaFiles = files
+    .filter(file => file.startsWith(video.youtubeId) && /\.(mp4|m4v|mov|webm|mkv|m4a|mp3|opus)$/i.test(file))
+    .map(file => path.join(STORAGE_DIR, 'originals', file));
+  if (!mediaFiles.length) throw new Error('yt-dlp completed but no media output was found.');
+
+  const inspected = [];
+  for (const filePath of mediaFiles) {
+    try {
+      const info = await probeMedia(filePath, { countPackets: true });
+      inspected.push({ ...info, size: statSync(filePath).size });
+    } catch (error) {
+      importLog('warn', 'downloaded media probe failed', { file: path.basename(filePath), error: String(error.message || error).slice(0, 300) });
+    }
+  }
+  importLog('log', 'yt-dlp downloaded formats', {
+    videoId: video.youtubeId,
+    formats: inspected.map(summarizeFormat)
+  });
+  const choice = chooseBestDownloadedMedia(inspected);
+  let selected = choice.muxed?.path || '';
+  if (!selected && choice.videoOnly && choice.audioOnly) {
+    const merged = path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.merged.mp4`);
+    await run(FFMPEG, [
+      '-y',
+      '-i', choice.videoOnly.path,
+      '-i', choice.audioOnly.path,
+      '-map', '0:v:0',
+      '-map', '1:a:0',
+      '-c:v', 'copy',
+      '-c:a', 'aac',
+      '-b:a', '192k',
+      '-ar', '48000',
+      '-shortest',
+      '-movflags', '+faststart',
+      merged
+    ], { jobId, label: 'yt-dlp manual merge', timeoutMs: PROCESS_TIMEOUT_MS, maxOutputBytes: 1024 * 1024 });
+    const mergedInfo = await probeMedia(merged, { countPackets: true });
+    if (!mergedInfo.hasVideo || !mergedInfo.hasAudio) {
+      throw new Error('SOURCE_AUDIO_EXTRACTION_FAILED: yt-dlp produced separate streams, but the manual merge did not contain both video and audio.');
+    }
+    selected = merged;
+  }
+  if (!selected) {
+    throw new Error('SOURCE_AUDIO_EXTRACTION_FAILED: yt-dlp did not provide a usable video+audio file or separate audio stream.');
+  }
+
+  const sourceAudio = await inspectSourceAudio(selected);
+  if (sourceAudio.status !== SOURCE_AUDIO_PRESENT) {
+    throw new Error(`${SOURCE_AUDIO_EXTRACTION_FAILED}: downloaded YouTube source is not audibly valid (${sourceAudio.reason || sourceAudio.status}).`);
+  }
+
+  for (const filePath of mediaFiles) {
+    if (filePath !== selected && path.basename(filePath) !== `${video.youtubeId}.en.json3`) unlinkQuiet(filePath);
+  }
+  return selected;
 }
 
 async function transcribeAudioWithWhisper(db, mediaPath, videoId) {
@@ -1694,7 +1934,7 @@ async function transcribeAudioWithWhisper(db, mediaPath, videoId) {
   }
 
   try {
-    const probe = await probeMedia(mediaPath).catch(() => ({ durationSeconds: 0 }));
+    const probe = await probeMediaDuration(mediaPath).catch(() => ({ durationSeconds: 0 }));
     const totalDuration = Math.max(0, Number(probe.durationSeconds || 0));
     const chunks = totalDuration > TRANSCRIPTION_CHUNK_SECONDS
       ? Array.from({ length: Math.ceil(totalDuration / TRANSCRIPTION_CHUNK_SECONDS) }, (_, i) => ({
@@ -2373,7 +2613,7 @@ async function probeVideoDims(mediaPath) {
 
 async function mediaHasAudio(mediaPath) {
   try {
-    const { stdout } = await run('ffprobe', [
+    const { stdout } = await run(FFPROBE, [
       '-v', 'error', '-select_streams', 'a:0',
       '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', mediaPath
     ], { label:'probe-audio', timeoutMs:15_000 });
@@ -2578,6 +2818,17 @@ function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920,
   const hasFaces    = (faceData?.totalDets  ?? 0) > 0;
   const rangeCX     = faceData?.rangeCX     ?? 0;
   const meanFaceX   = faceData?.meanFaceX   ?? (speakerSide === 'left' ? 0.35 : speakerSide === 'right' ? 0.65 : 0.5);
+  const avgConfidence = keyframes.length
+    ? keyframes.reduce((sum, kf) => sum + Number(kf.confidence || 0), 0) / keyframes.length
+    : 0;
+  const lowTrackingConfidence = !hasFaces || keyframes.length < 4 || avgConfidence < 0.45;
+  const minDynamicCropFrac = lowTrackingConfidence
+    ? 0.46
+    : faceCount >= 2 || sceneType === 'group'
+      ? 0.42
+      : sceneType === 'close_up'
+        ? 0.36
+        : 0.38;
 
   // Use globalCropFrac from face_track.py if available (scene-aware)
   const suggestedFrac  = faceData?.globalCropFrac ?? 0;
@@ -2603,21 +2854,23 @@ function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920,
   } else if (framingMode === 'original') {
     cropFrac = 0.50;
   } else {
-    // 'dynamic': trust face_track suggestion first
-    if (suggestedFrac > 0.01) {
-      cropFrac = suggestedFrac;
+    // 'dynamic': trust face tracking, but never let low-confidence crops zoom in
+    // so far that faces, captions, hands, or on-screen objects are clipped.
+    if (suggestedFrac > 0.01 && !lowTrackingConfidence) {
+      cropFrac = Math.max(suggestedFrac, minDynamicCropFrac);
     } else if (!hasFaces) {
-      cropFrac = 0.36;                     // no faces → natural medium shot
+      cropFrac = 0.50;                     // no faces → preserve scene context
     } else {
       switch (sceneType) {
-        case 'group':          cropFrac = 0.44; break;
-        case 'interview':      cropFrac = faceCount >= 2 ? 0.40 : 0.36; break;
-        case 'podcast':        cropFrac = faceCount >= 2 ? 0.38 : 0.34; break;
-        case 'reaction':       cropFrac = 0.34; break;
-        case 'wide_shot':      cropFrac = 0.40; break;
-        case 'close_up':       cropFrac = 0.32; break;
-        default:               cropFrac = rangeCX > 0.20 ? 0.36 : 0.34;
+        case 'group':          cropFrac = 0.50; break;
+        case 'interview':      cropFrac = faceCount >= 2 ? 0.44 : 0.40; break;
+        case 'podcast':        cropFrac = faceCount >= 2 ? 0.42 : 0.38; break;
+        case 'reaction':       cropFrac = 0.38; break;
+        case 'wide_shot':      cropFrac = 0.50; break;
+        case 'close_up':       cropFrac = 0.36; break;
+        default:               cropFrac = rangeCX > 0.20 ? 0.42 : 0.38;
       }
+      if (lowTrackingConfidence) cropFrac = Math.max(cropFrac, minDynamicCropFrac);
     }
   }
   cropFrac = Math.max(tightFrac, Math.min(0.92, cropFrac));
@@ -2701,18 +2954,33 @@ function parseFrameRate(value = '0/1') {
   return num / den;
 }
 
-async function validateClipRender(outputPath) {
+async function validateClipRender(outputPath, options = {}) {
   const scores = { captions:90, framing:88, audioSync:95, stability:90, overall:0 };
   const issues = [];
+  const fatalIssues = [];
+  const sourceAudioInfo = options.sourceAudioInfo || {};
+  const sourceHasAudibleAudio = sourceAudioInfo.status === SOURCE_AUDIO_PRESENT;
+  let audio = {
+    sourceStatus: sourceAudioInfo.status || '',
+    finalStatus: FINAL_AUDIO_MISSING,
+    hasAudio: false,
+    duration: 0,
+    packets: 0,
+    bitRate: 0,
+    meanVolumeDb: null,
+    maxVolumeDb: null,
+    failureReason: '',
+  };
   try {
     // Check dimensions, framerate, duration, codec via ffprobe
-    const { stdout: probeOut } = await run('ffprobe', [
-      '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', outputPath
+    const { stdout: probeOut } = await run(FFPROBE, [
+      '-v', 'quiet', '-count_packets', '-print_format', 'json', '-show_streams', '-show_format', outputPath
     ], { label:'validate-probe', timeoutMs:20_000 }).catch(() => ({ stdout:'{}' }));
 
     const probe = JSON.parse(probeOut || '{}');
     const vStream = (probe.streams || []).find(s => s.codec_type === 'video');
     const aStream = (probe.streams || []).find(s => s.codec_type === 'audio');
+    const videoDuration = numberOrNull(vStream?.duration) ?? numberOrNull(probe.format?.duration) ?? 0;
 
     if (vStream) {
       const w = vStream.width || 0;
@@ -2720,13 +2988,69 @@ async function validateClipRender(outputPath) {
       if (w !== 1080 || h !== 1920) {
         issues.push(`Dimensions ${w}x${h} (expected 1080x1920)`); scores.framing -= 10;
       }
+      if (vStream.sample_aspect_ratio && vStream.sample_aspect_ratio !== '1:1') {
+        issues.push(`Non-square pixels: SAR ${vStream.sample_aspect_ratio}`); scores.framing -= 6;
+      }
       const fps = parseFrameRate(vStream.r_frame_rate || '30/1');
       if (fps < 29) { issues.push(`Low framerate: ${fps.toFixed(1)}fps`); scores.stability -= 8; }
       const bitrate = Number(probe.format?.bit_rate || 0);
       if (bitrate > 0 && bitrate < 2_000_000) { issues.push('Low bitrate'); scores.framing -= 5; }
     }
 
-    if (!aStream) { issues.push('No audio stream'); scores.audioSync -= 30; }
+    if (!aStream) {
+      audio.finalStatus = FINAL_AUDIO_MISSING;
+      audio.failureReason = 'No audio stream found in rendered output.';
+      issues.push('FINAL_AUDIO_MISSING');
+      fatalIssues.push('FINAL_AUDIO_MISSING');
+      scores.audioSync -= 40;
+    } else {
+      audio = {
+        ...audio,
+        hasAudio: true,
+        finalStatus: FINAL_AUDIO_VALID,
+        duration: numberOrNull(aStream.duration) ?? numberOrNull(probe.format?.duration) ?? 0,
+        packets: numberOrNull(aStream.nb_read_packets) ?? numberOrNull(aStream.nb_frames) ?? 0,
+        bitRate: numberOrNull(aStream.bit_rate) ?? 0,
+      };
+      if (audio.packets <= 0) {
+        audio.failureReason = 'Audio stream has no readable packets.';
+        issues.push('FINAL_AUDIO_MISSING: no audio packets');
+        fatalIssues.push('FINAL_AUDIO_MISSING');
+        scores.audioSync -= 35;
+      }
+      if (videoDuration && audio.duration && Math.abs(videoDuration - audio.duration) > 1.5) {
+        issues.push(`Audio/video duration mismatch: audio ${audio.duration.toFixed(2)}s vs video ${videoDuration.toFixed(2)}s`);
+        fatalIssues.push('FINAL_AUDIO_DURATION_MISMATCH');
+        scores.audioSync -= 25;
+      }
+      const volume = await measureAudioVolume(outputPath);
+      audio.meanVolumeDb = volume.meanVolumeDb;
+      audio.maxVolumeDb = volume.maxVolumeDb;
+      const silent = isEffectivelySilent(volume.maxVolumeDb);
+      if (silent) {
+        audio.finalStatus = FINAL_AUDIO_SILENT;
+        audio.failureReason = `Maximum volume ${volume.maxVolumeDb ?? 'unknown'} dB is effectively digital silence.`;
+        issues.push('FINAL_AUDIO_SILENT');
+        if (sourceHasAudibleAudio) {
+          fatalIssues.push('FINAL_AUDIO_SILENT');
+          scores.audioSync -= 45;
+        }
+      }
+      if (sourceHasAudibleAudio && audio.bitRate > 0 && audio.bitRate < MIN_AUDIBLE_AUDIO_BITRATE) {
+        issues.push(`Implausibly tiny audio bitrate: ${audio.bitRate} bps`);
+        fatalIssues.push('FINAL_AUDIO_TINY_BITRATE');
+        scores.audioSync -= 20;
+      }
+    }
+
+    const decode = await run(FFMPEG, [
+      '-v', 'error', '-i', outputPath, '-f', 'null', '-'
+    ], { label:'validate-decode', timeoutMs:90_000, maxOutputBytes:512 * 1024 }).catch(e => ({ error: e.message || String(e) }));
+    if (decode.error) {
+      issues.push('Output decode failed');
+      fatalIssues.push('FINAL_DECODE_FAILED');
+      scores.stability -= 35;
+    }
 
     // Quick black frame check at start
     const r = await run(FFMPEG, [
@@ -2744,7 +3068,7 @@ async function validateClipRender(outputPath) {
 
   } catch {}
   scores.overall = Math.round((scores.captions + scores.framing + scores.audioSync + scores.stability) / 4);
-  return { valid: issues.length === 0, scores, issues };
+  return { valid: fatalIssues.length === 0, scores, issues, fatalIssues, audio };
 }
 
 // ─── Logo upload helper ───────────────────────────────────────────────────────
@@ -2941,6 +3265,9 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   const title     = String(video.title).slice(0, 42).replace(/:/g, ' ');
   const hook      = (moment.hook || buildCaptionText(moment.text)).slice(0, 120);
   const captionPreset = moment.captionStyle || 'bold';
+  const captionMode = ['auto','source','replace','add','none'].includes(String(moment.captionMode || '').toLowerCase())
+    ? String(moment.captionMode || '').toLowerCase()
+    : 'auto';
   const platform  = (moment.bestPlatform || 'universal').toLowerCase().replace(/\s/g, '');
   const renderCfg = RENDER_PRESETS[platform] || RENDER_PRESETS.universal;
   const { width: RW, height: RH } = renderCfg;
@@ -2979,12 +3306,16 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
 
   // ── Stage 2: Source dimensions + face tracking + stereo analysis
   const clipDuration = moment.end - moment.start;
-  const [{ w: srcW, h: srcH }, stereoSide, faceData, hasSourceAudio] = await Promise.all([
+  const [{ w: srcW, h: srcH }, stereoSide, faceData, sourceAudioInfo] = await Promise.all([
     probeVideoDims(mediaPath),
     detectSpeakerSide(mediaPath, moment.start, moment.end),
     trackFaces(mediaPath, moment.start, moment.end),
-    mediaHasAudio(mediaPath),
+    video._sourceAudioInfo ? Promise.resolve(video._sourceAudioInfo) : inspectSourceAudio(mediaPath),
   ]);
+  const hasSourceAudio = sourceAudioInfo.status === SOURCE_AUDIO_PRESENT;
+  if (sourceAudioInfo.status === SOURCE_AUDIO_EXTRACTION_FAILED) {
+    throw new Error(`${SOURCE_AUDIO_EXTRACTION_FAILED}: ${sourceAudioInfo.reason || 'Could not verify source audio.'}`);
+  }
   // Face tracking takes priority over stereo for speaker side
   const speakerSide = faceData?.speakerSide || stereoSide;
   console.log('[render:analysis]', {
@@ -2994,6 +3325,9 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     meanFaceW:  faceData?.meanFaceW ?? 0,
     combinedBox: faceData?.combinedBox,
     faceTracked: !!faceData,
+    sourceAudioStatus: sourceAudioInfo.status,
+    sourceAudioMaxVolumeDb: sourceAudioInfo.maxVolumeDb,
+    sourceAudioBitrate: sourceAudioInfo.audioBitrate,
   });
 
   // ── Stage 3: Black frame trim ─────────────────────────────────
@@ -3031,9 +3365,15 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   const kfCyVals = (faceData?.keyframes || []).filter(kf => kf.faceCount > 0).map(kf => kf.cy);
   const faceCyAvg = kfCyVals.length ? kfCyVals.reduce((s, v) => s + v, 0) / kfCyVals.length : null;
 
-  const assContent = buildASSFile(assWords, 0, totalOutDur, captionPreset, RW, RH, faceCyAvg);
+  const shouldRenderGeneratedCaptions = !['none', 'source'].includes(captionMode);
+  const assContent = shouldRenderGeneratedCaptions ? buildASSFile(assWords, 0, totalOutDur, captionPreset, RW, RH, faceCyAvg) : '';
   let hasASS = false;
-  try { writeFileSync(assPath, assContent, 'utf8'); hasASS = true; } catch (error) {
+  try {
+    if (shouldRenderGeneratedCaptions) {
+      writeFileSync(assPath, assContent, 'utf8');
+      hasASS = true;
+    }
+  } catch (error) {
     console.error('[render:ass-write-failed]', { clipId, assPath, error: error.message });
   }
 
@@ -3092,7 +3432,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
           `[0:v]trim=start=${s.start.toFixed(3)}:end=${s.end.toFixed(3)},setpts=PTS-STARTPTS,split[_s${i}a][_s${i}b]`,
           `[_s${i}a]${bg}[_s${i}bg]`,
           `[_s${i}b]${fg}[_s${i}fg]`,
-          `[_s${i}bg][_s${i}fg]overlay=x=0:y=(H-h)/2[v${i}]`,
+          `[_s${i}bg][_s${i}fg]overlay=x=0:y=(H-h)/2,setsar=1[v${i}]`,
           segAudioFilter(s, i),
         ].join(';');
       }
@@ -3101,12 +3441,14 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     const cIn = edlSegs.map((_, i) => `[v${i}][a${i}]`).join('');
     // After concat: apply captions → route to pre-logo label
     const preCapLabel = logoOverlay ? '[_vcap]' : '[vout]';
-    const assChain = hasASS ? `[vcat]ass='${ffmpegFilterPath(assPath)}'${preCapLabel}` : '';
+    const assChain = hasASS
+      ? `[vcat]setsar=1,ass='${ffmpegFilterPath(assPath)}'${preCapLabel}`
+      : `[vcat]setsar=1${preCapLabel}`;
     filterComplex =
       `${segParts.join(';')};${cIn}concat=n=${edlSegs.length}:v=1:a=1[vcat][acat]` +
-      (hasASS ? `;${assChain}` : '') +
+      `;${assChain}` +
       `;[acat]${audioF}[aout]`;
-    vMap = hasASS ? preCapLabel : '[vcat]';
+    vMap = preCapLabel;
     aMap = '[aout]';
 
   } else {
@@ -3123,13 +3465,13 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
 
     if (pfObj.portraitFill) {
       filterComplex =
-        `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,${pfObj.portraitFill}${qualityF}${capF}${preCapLabel};` +
+        `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,${pfObj.portraitFill}${qualityF},setsar=1${capF}${preCapLabel};` +
         (hasSourceAudio ? `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]` : `anullsrc=channel_layout=stereo:sample_rate=48000:d=${totalOutDur.toFixed(3)},${audioF}[aout]`);
     } else if (pfObj.type === 'fill') {
       filterComplex =
         `[0:v]trim=start=${tS}:end=${tE},setpts=PTS-STARTPTS,` +
         `crop=w='${wExpr}':h=${pfObj.cropH}:x='${xExpr}':y=0,` +
-        `scale=${RW}:${RH}:flags=lanczos,setsar=1${qualityF}${capF}${preCapLabel};` +
+        `scale=${RW}:${RH}:flags=lanczos,setsar=1${qualityF},setsar=1${capF}${preCapLabel};` +
         (hasSourceAudio ? `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]` : `anullsrc=channel_layout=stereo:sample_rate=48000:d=${totalOutDur.toFixed(3)},${audioF}[aout]`);
     } else {
       const dynBgF = pfObj.bgFilterDynamic(xExpr, wExpr);
@@ -3138,7 +3480,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
         `[_dvbg]${dynBgF}[_dbbg];` +
         `[_dvfg]crop=w='${wExpr}':h=${pfObj.cropH}:x='${xExpr}':y=0,` +
         `scale=${RW}:${pfObj.scaledH}:flags=lanczos,setsar=1${qualityF}[_dbfg];` +
-        `[_dbbg][_dbfg]overlay=x=0:y=(H-h)/2${capF}${preCapLabel};` +
+        `[_dbbg][_dbfg]overlay=x=0:y=(H-h)/2,setsar=1${capF}${preCapLabel};` +
         (hasSourceAudio ? `[0:a]atrim=start=${tS}:end=${tE},asetpts=PTS-STARTPTS,${audioF}[aout]` : `anullsrc=channel_layout=stereo:sample_rate=48000:d=${totalOutDur.toFixed(3)},${audioF}[aout]`);
     }
     vMap = preCapLabel; aMap = '[aout]';
@@ -3221,8 +3563,13 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   } catch {}
 
   // ── Stage 9: Quality validation ───────────────────────────────
-  const quality = await validateClipRender(output);
-  if (quality.issues.length) console.warn('[render:quality-issues]', { clipId, issues: quality.issues });
+  const quality = await validateClipRender(output, { sourceAudioInfo });
+  if (quality.issues.length) console.warn('[render:quality-issues]', { clipId, issues: quality.issues, audio: quality.audio });
+  if (!quality.valid) {
+    unlinkQuiet(output);
+    if (thumbnailPath) unlinkQuiet(path.join(STORAGE_DIR, 'thumbs', path.basename(thumbnailPath)));
+    throw new Error(`Rendered clip failed validation: ${quality.fatalIssues.join(', ')}${quality.audio?.failureReason ? ` — ${quality.audio.failureReason}` : ''}`);
+  }
 
   // ── Stage 10: Enrichment ──────────────────────────────────────
   const canDT           = await drawtextSupported();
@@ -3236,6 +3583,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     hook,
     hooks:          moment.hooks || { curiosity:hook, shock:hook, value:hook, story:hook, controversy:hook, sales:hook },
     captionStyle:   captionPreset,
+    captionMode,
     startSeconds:   moment.start,
     endSeconds:     moment.end,
     score:          moment.score,
@@ -3255,6 +3603,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     platform,
     renderQuality:  quality.scores,
     renderIssues:   quality.issues,
+    audioStatus:    quality.audio,
     wordCount:      wordTimings.length,
     blackTrimmed:   blackOffset > 0.05,
     silencesRemoved: silences.length,
@@ -3265,6 +3614,14 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     platformContent:  postingData.platformContent || null,
     transformation:   defaultTransformation(title),
     intelligence,
+    seriesId:       moment.seriesId || null,
+    partNumber:     moment.partNumber || null,
+    totalParts:     moment.totalParts || null,
+    sourceStart:    moment.sourceStart ?? moment.start,
+    sourceEnd:      moment.sourceEnd ?? moment.end,
+    previousPartId: moment.previousPartId || null,
+    nextPartId:     moment.nextPartId || null,
+    workflowMode:   moment.workflowMode || 'viral',
     createdAt: new Date().toISOString(),
   };
 }
@@ -3320,6 +3677,160 @@ function fallbackMomentsForVideo(video, options = {}) {
       text: video.title || 'Uploaded video clip'
     };
   });
+}
+
+function cleanBoundaryTime(value, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, n));
+}
+
+function candidateBoundariesFromTranscript(segments = []) {
+  return segments
+    .flatMap(seg => [seg.start, seg.end])
+    .map(Number)
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+}
+
+function chooseNaturalBoundary(cursor, targetEnd, sourceEnd, boundaries = [], adjustment = 15) {
+  const min = Math.max(cursor + 8, targetEnd - adjustment);
+  const max = Math.min(sourceEnd, targetEnd + adjustment);
+  if (sourceEnd <= max) return sourceEnd;
+  const candidates = boundaries
+    .filter(t => t > cursor + 8 && t >= min && t <= max)
+    .sort((a, b) => Math.abs(a - targetEnd) - Math.abs(b - targetEnd));
+  return cleanBoundaryTime(candidates[0] ?? targetEnd, cursor + 8, sourceEnd);
+}
+
+function buildFullSeriesMoments(video, transcript = [], options = {}) {
+  const sourceStart = Math.max(0, Number(options.sourceStart || 0));
+  const sourceEnd = Math.max(sourceStart + 1, Number(options.sourceEnd || video.durationSeconds || 0));
+  const targetDuration = Math.max(30, Math.min(600, Number(options.partDuration || options.clipLength || 90)));
+  const adjustment = Math.max(0, Math.min(30, Number(options.boundaryAdjustmentSeconds ?? 15)));
+  const contextOverlap = Math.max(0, Math.min(3, Number(options.contextOverlapSeconds || 0)));
+  const boundaries = candidateBoundariesFromTranscript(transcript);
+  const seriesId = options.seriesId || randomUUID();
+  const parts = [];
+  let cursor = sourceStart;
+  let guard = 0;
+  while (cursor < sourceEnd - 0.5 && guard < 1000) {
+    guard += 1;
+    const targetEnd = Math.min(sourceEnd, cursor + targetDuration);
+    let end = chooseNaturalBoundary(cursor, targetEnd, sourceEnd, boundaries, adjustment);
+    if (sourceEnd - end > 0 && sourceEnd - end < Math.max(20, targetDuration * 0.35)) end = sourceEnd;
+    const renderStart = Math.max(sourceStart, cursor - (parts.length ? contextOverlap : 0));
+    const text = transcript
+      .filter(seg => seg.end > renderStart && seg.start < end)
+      .map(seg => seg.text)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    parts.push({
+      start: renderStart,
+      end,
+      sourceStart: cursor,
+      sourceEnd: end,
+      duration: Math.max(0, end - renderStart),
+      contextOverlapSeconds: parts.length ? contextOverlap : 0,
+      score: 85,
+      reason: 'full-series',
+      hook: `Part ${parts.length + 1}`,
+      title: `Part ${parts.length + 1}`,
+      rationale: 'Chronological full-video series part with natural-boundary adjustment.',
+      text: text || video.title || `Part ${parts.length + 1}`,
+      workflowMode: 'series',
+      seriesId,
+    });
+    if (end <= cursor) break;
+    cursor = end;
+  }
+  const totalParts = parts.length;
+  return parts.map((part, index) => ({
+    ...part,
+    partNumber: index + 1,
+    totalParts,
+    title: `Part ${index + 1} of ${totalParts}`,
+    hook: `Part ${index + 1} of ${totalParts}`,
+  }));
+}
+
+function upsertSeriesPlan(db, { seriesId, jobId, videoId, userId, parts, targetPartDuration }) {
+  if (!Array.isArray(db.seriesJobs)) db.seriesJobs = [];
+  if (!Array.isArray(db.seriesParts)) db.seriesParts = [];
+  let series = db.seriesJobs.find(item => item.id === seriesId);
+  if (!series) {
+    series = {
+      id: seriesId,
+      jobId,
+      videoId,
+      userId,
+      status: 'running',
+      targetPartDuration,
+      totalParts: parts.length,
+      completedParts: 0,
+      failedParts: 0,
+      createdAt: new Date().toISOString(),
+    };
+    db.seriesJobs.unshift(series);
+  }
+  Object.assign(series, {
+    jobId,
+    videoId,
+    userId,
+    status: series.status === 'complete' ? 'complete' : 'running',
+    targetPartDuration,
+    totalParts: parts.length,
+    updatedAt: new Date().toISOString(),
+  });
+  for (const part of parts) {
+    let row = db.seriesParts.find(item => item.seriesId === seriesId && item.partNumber === part.partNumber);
+    if (!row) {
+      row = {
+        id: randomUUID(),
+        seriesId,
+        jobId,
+        videoId,
+        userId,
+        partNumber: part.partNumber,
+        totalParts: part.totalParts,
+        sourceStart: part.sourceStart,
+        sourceEnd: part.sourceEnd,
+        duration: part.duration,
+        status: 'queued',
+        clipId: '',
+        outputPath: '',
+        error: '',
+        createdAt: new Date().toISOString(),
+      };
+      db.seriesParts.push(row);
+    } else {
+      Object.assign(row, {
+        jobId,
+        totalParts: part.totalParts,
+        sourceStart: part.sourceStart,
+        sourceEnd: part.sourceEnd,
+        duration: part.duration,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+  }
+  return series;
+}
+
+function updateSeriesPart(partId, patch) {
+  const db = loadDb();
+  const part = db.seriesParts?.find(item => item.id === partId);
+  if (part) Object.assign(part, patch, { updatedAt: new Date().toISOString() });
+  const series = part ? db.seriesJobs?.find(item => item.id === part.seriesId) : null;
+  if (series) {
+    const rows = db.seriesParts.filter(item => item.seriesId === series.id);
+    series.completedParts = rows.filter(item => item.status === 'complete').length;
+    series.failedParts = rows.filter(item => item.status === 'failed').length;
+    series.status = series.completedParts === series.totalParts ? 'complete' : series.failedParts ? 'partial_failed' : 'running';
+    series.updatedAt = new Date().toISOString();
+  }
+  saveDb(db);
 }
 
 function completeJobWithClips(jobId, videoId, clipRows) {
@@ -3432,6 +3943,19 @@ function createQueuedProcessingJob(payload) {
     id: randomUUID(),
     userId: user.id,
     videoId,
+    payload: {
+      videoId,
+      userId: user.id,
+      rightsConfirmed: true,
+      clipCount: payload.clipCount || 3,
+      clipLength: payload.clipLength || 60,
+      partDuration: payload.partDuration || payload.clipLength || 90,
+      workflowMode: payload.workflowMode || payload.mode || 'viral',
+      captionStyle: payload.captionStyle || '',
+      captionMode: payload.captionMode || 'auto',
+      framingMode: payload.framingMode || 'dynamic',
+      brandKitId: payload.brandKitId || null,
+    },
     status: 'queued',
     progress: 1,
     stage: 'queued',
@@ -3449,14 +3973,20 @@ async function processVideo(payload) {
   assertMemoryAvailable();
   const { videoId, rightsConfirmed, fairUseMode, transformationNote } = payload;
   const requestedCaptionStyle = String(payload.captionStyle || '').toLowerCase();
+  const requestedMode = String(payload.workflowMode || payload.mode || 'viral').toLowerCase();
+  const requestedCaptionMode = String(payload.captionMode || 'auto').toLowerCase();
   const clipOptions = {
     clipCount:   Math.max(1, Math.min(10, Number(payload.clipCount || 3))),
     clipLength:  Math.max(60, Math.min(600, Number(payload.clipLength || 60))),
+    workflowMode: ['viral', 'series', 'full_series', 'full-video-series'].includes(requestedMode) ? requestedMode : 'viral',
+    partDuration: Math.max(30, Math.min(600, Number(payload.partDuration || payload.clipLength || 90))),
+    captionMode: ['auto','source','replace','add','none'].includes(requestedCaptionMode) ? requestedCaptionMode : 'auto',
     framingMode: ['tight','original','wide','medium','close','dynamic'].includes(payload.framingMode)
                    ? payload.framingMode : 'dynamic',
     captionStyle: ASS_PRESETS[requestedCaptionStyle] ? requestedCaptionStyle : null,
     brandKitId:  payload.brandKitId || null,
   };
+  const isSeriesMode = clipOptions.workflowMode !== 'viral';
   if (!rightsConfirmed) throw new Error('Confirm that you own this video or have permission to reuse it before processing.');
   if (fairUseMode && !String(transformationNote || '').trim()) {
     throw new Error('Fair-use/remix mode requires a commentary, reaction, education, or transformation note.');
@@ -3501,6 +4031,14 @@ async function processVideo(payload) {
     progress: 5,
     stage: 'downloading',
     steps: processingSteps('downloading', 5),
+    payload: {
+      ...payload,
+      userId: jobOwner.id,
+      rightsConfirmed: true,
+      workflowMode: clipOptions.workflowMode,
+      captionMode: clipOptions.captionMode,
+      partDuration: clipOptions.partDuration,
+    },
     error: '',
     startedAt: job.startedAt || new Date().toISOString(),
     updatedAt: new Date().toISOString()
@@ -3515,6 +4053,22 @@ async function processVideo(payload) {
     const mediaPath = video.sourceKind === 'upload' ? video.storagePath : await downloadVideo(video, job.id);
     if (!mediaPath || !existsSync(mediaPath)) throw new Error('Source video file is missing. Upload the video again and retry.');
     if (video.sourceKind !== 'upload') downloadedPath = mediaPath;
+    updateJob(job.id, { progress: 24, stage: 'verifying source audio', steps: processingSteps('transcribing', 24) });
+    const sourceAudioInfo = await inspectSourceAudio(mediaPath);
+    video.sourceAudioStatus = sourceAudioInfo.status;
+    video._sourceAudioInfo = sourceAudioInfo;
+    const audioDb = loadDb();
+    const audioVideo = audioDb.videos.find(item => item.id === video.id);
+    if (audioVideo) {
+      audioVideo.sourceAudioStatus = sourceAudioInfo.status;
+      audioVideo.sourceAudioReason = sourceAudioInfo.reason || '';
+      audioVideo.sourceAudioMaxVolumeDb = sourceAudioInfo.maxVolumeDb ?? null;
+      audioVideo.sourceAudioBitrate = sourceAudioInfo.audioBitrate ?? null;
+      saveDb(audioDb);
+    }
+    if (video.sourceKind !== 'upload' && sourceAudioInfo.status !== SOURCE_AUDIO_PRESENT) {
+      throw new Error(`${SOURCE_AUDIO_EXTRACTION_FAILED}: YouTube source audio was not audibly valid after download (${sourceAudioInfo.reason || sourceAudioInfo.status}).`);
+    }
     updateJob(job.id, { progress: 30, stage: 'transcribing', steps: processingSteps('transcribing', 30) });
     let transcript = [];
     try {
@@ -3533,35 +4087,77 @@ async function processVideo(payload) {
       updateJob(job.id, { progress: 50, stage: 'extracting B-roll suggestions', steps: processingSteps('analysis', 50) });
       suggestBrollKeywords(db, transcript, video.title).catch(() => {});
     }
-    updateJob(job.id, { progress: 58, stage: 'AI analysis — scoring viral moments', steps: processingSteps('analysis', 58) });
+    updateJob(job.id, { progress: 58, stage: isSeriesMode ? 'planning full video series' : 'AI analysis — scoring viral moments', steps: processingSteps('analysis', 58) });
+    const seriesId = payload.seriesId || (isSeriesMode ? randomUUID() : null);
     const targetDurations = buildTargetDurations(video.durationSeconds, clipOptions.clipCount, clipOptions.clipLength);
-    const rawMoments = transcript.length
-      ? await detectViralMoments(db, video, transcript, {
-          ...clipOptions,
-          clipCount: clipOptions.clipCount,
-          clipLength: targetDurations[0],
-          targetDurations,
-          mediaPath,  // gives Gemini direct video access for superior analysis
+    const rawMoments = isSeriesMode
+      ? buildFullSeriesMoments(video, transcript, {
+          seriesId,
+          partDuration: clipOptions.partDuration,
+          boundaryAdjustmentSeconds: 15,
+          contextOverlapSeconds: Number(payload.contextOverlapSeconds || 0),
         })
-      : fallbackMomentsForVideo(video, { ...clipOptions, targetDurations });
+      : transcript.length
+        ? await detectViralMoments(db, video, transcript, {
+            ...clipOptions,
+            clipCount: clipOptions.clipCount,
+            clipLength: targetDurations[0],
+            targetDurations,
+            mediaPath,  // gives Gemini direct video access for superior analysis
+          })
+        : fallbackMomentsForVideo(video, { ...clipOptions, targetDurations });
     const moments = rawMoments.map(m => ({
       ...m,
+      workflowMode: isSeriesMode ? 'series' : 'viral',
+      captionMode: clipOptions.captionMode,
       captionStyle: clipOptions.captionStyle || m.captionStyle,
       brandKitId: m.brandKitId || clipOptions.brandKitId || null
     }));
     if (!moments.length) throw new Error('Could not create a clipping window for this video.');
+    let seriesRowsByPart = new Map();
+    if (isSeriesMode) {
+      const seriesDb = loadDb();
+      upsertSeriesPlan(seriesDb, {
+        seriesId,
+        jobId: job.id,
+        videoId: video.id,
+        userId: jobOwner.id,
+        parts: moments,
+        targetPartDuration: clipOptions.partDuration,
+      });
+      saveDb(seriesDb);
+      seriesRowsByPart = new Map((seriesDb.seriesParts || [])
+        .filter(part => part.seriesId === seriesId)
+        .map(part => [part.partNumber, part]));
+    }
     updateJob(job.id, { progress: 72, stage: 'creating vertical clips', steps: processingSteps('vertical', 72) });
     const rendered = [];
     for (let i = 0; i < moments.length; i += 1) {
       if (isJobStopped(job.id)) throw new Error('Job was cancelled.');
+      const seriesPart = isSeriesMode ? seriesRowsByPart.get(moments[i].partNumber) : null;
+      if (seriesPart?.status === 'complete' && seriesPart.clipId) continue;
+      if (seriesPart) updateSeriesPart(seriesPart.id, { status: 'running', error: '' });
       updateJob(job.id, {
         progress: Math.min(94, 72 + Math.round((i / Math.max(1, moments.length)) * 22)),
-        stage: `rendering clip ${i + 1} of ${moments.length}`,
+        stage: isSeriesMode ? `Rendering Part ${i + 1} of ${moments.length}` : `rendering clip ${i + 1} of ${moments.length}`,
         steps: processingSteps('rendering', 80)
       });
-      rendered.push(await renderClip(db, video, mediaPath, moments[i], i, job.id));
+      try {
+        const clip = await renderClip(db, video, mediaPath, moments[i], i, job.id);
+        rendered.push(clip);
+        if (seriesPart) updateSeriesPart(seriesPart.id, { status: 'complete', clipId: clip.id, outputPath: clip.outputPath, error: '' });
+      } catch (error) {
+        if (seriesPart) updateSeriesPart(seriesPart.id, { status: 'failed', error: String(error.message || error) });
+        throw error;
+      }
     }
     if (!rendered.length || rendered.some(clip => !clip.outputPath)) throw new Error('Rendering failed: no clips were saved.');
+    if (isSeriesMode) {
+      for (let i = 0; i < rendered.length; i += 1) {
+        rendered[i].previousPartId = rendered[i - 1]?.id || null;
+        rendered[i].nextPartId = rendered[i + 1]?.id || null;
+      }
+    }
 
     completeJobWithClips(job.id, video.id, rendered);
 
@@ -4950,6 +5546,9 @@ async function handleApi(req, res, pathname) {
       const myBrandKits = isAdmin ? db.brandKits : db.brandKits.filter(item => item.userId === user.id);
       const myAudioGenerations = isAdmin ? (db.audioGenerations || []) : (db.audioGenerations || []).filter(item => item.userId === user.id);
       const myUsageEvents = isAdmin ? (db.usageEvents || []) : (db.usageEvents || []).filter(item => item.userId === user.id);
+      const mySeriesJobs = isAdmin ? (db.seriesJobs || []) : (db.seriesJobs || []).filter(item => item.userId === user.id || myVideoIds.has(item.videoId));
+      const mySeriesJobIds = new Set(mySeriesJobs.map(item => item.id));
+      const mySeriesParts = isAdmin ? (db.seriesParts || []) : (db.seriesParts || []).filter(item => mySeriesJobIds.has(item.seriesId));
       // Attach live queue position so a queued job shows "waiting behind N others" instead
       // of an indistinguishable-from-stalled 0% progress bar.
       const queuedJobIds = renderQueue.map(item => item.payload.jobId).filter(Boolean);
@@ -4974,6 +5573,8 @@ async function handleApi(req, res, pathname) {
         brandKits: myBrandKits,
         audioGenerations: myAudioGenerations,
         usageEvents: myUsageEvents,
+        seriesJobs: mySeriesJobs,
+        seriesParts: mySeriesParts,
         apiSettings: isAdmin
           ? db.apiSettings.map(item => ({ ...item, configured: Boolean(item.value || process.env[item.key]), value: item.value ? '••••••••' : '' }))
           : [],
@@ -5377,8 +5978,10 @@ async function handleApi(req, res, pathname) {
       requireBrandKitAccess(db, user, body.brandKitId);
       // Check clip count warning for the user's plan
       const { plan } = subscriptionFor(db, user.id);
+      const workflowMode = String(body.workflowMode || body.mode || 'viral').toLowerCase();
+      const isSeriesRequest = workflowMode !== 'viral';
       const requestedClipCount = Math.max(1, Math.min(10, Number(body.clipCount || 3)));
-      if (requestedClipCount > Number(plan.maxClipsPerVideo || 3)) {
+      if (!isSeriesRequest && requestedClipCount > Number(plan.maxClipsPerVideo || 3)) {
         throw new Error(`Your ${plan.name} plan allows up to ${plan.maxClipsPerVideo} clips per video.`);
       }
       const maxPlanSeconds = Number(plan.maxVideoLength || 0) * 60;
@@ -5425,12 +6028,46 @@ async function handleApi(req, res, pathname) {
       if (body.action === 'retry') {
         const video = db.videos.find(item => item.id === job.videoId);
         if (!video) throw new Error('Video not found for retry.');
+        const retryPayload = {
+          ...(job.payload || {}),
+          videoId: video.id,
+          userId: user.role === 'admin' ? (video.userId || video.createdBy || user.id) : user.id,
+          rightsConfirmed: true,
+          clipCount: body.clipCount || job.payload?.clipCount || 3,
+          clipLength: body.clipLength || job.payload?.clipLength || 60,
+        };
         db.jobs = db.jobs.filter(item => item.id !== body.jobId);
         saveDb(db);
-        const queued = createQueuedProcessingJob({ videoId: video.id, userId: user.role === 'admin' ? (video.userId || video.createdBy || user.id) : user.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 60 });
-        const retry = enqueueRenderJob({ videoId: video.id, userId: queued.userId, jobId: queued.id, rightsConfirmed: true, clipCount: body.clipCount || 3, clipLength: body.clipLength || 60 });
+        const queued = createQueuedProcessingJob(retryPayload);
+        const retry = enqueueRenderJob({ ...retryPayload, userId: queued.userId, jobId: queued.id });
         retry.catch(error => console.error('[job:retry-failed]', String(error.message || error).slice(0, 2000)));
         return json(res, 202, { queued: true, jobId: queued.id, queueDepth: renderQueue.length, activeRenderJobs });
+      }
+      if (body.action === 'retry-series-part') {
+        const part = db.seriesParts?.find(item => item.id === body.partId || (item.seriesId === body.seriesId && item.partNumber === Number(body.partNumber)));
+        if (!part) throw new Error('Series part not found.');
+        const series = db.seriesJobs?.find(item => item.id === part.seriesId);
+        if (!series) throw new Error('Series not found.');
+        if (user.role !== 'admin' && series.userId !== user.id) throw Object.assign(new Error('You do not have access to this series.'), { status: 403 });
+        const video = db.videos.find(item => item.id === series.videoId);
+        if (!video) throw new Error('Video not found for series retry.');
+        part.status = 'queued';
+        part.error = '';
+        part.updatedAt = new Date().toISOString();
+        const basePayload = job.payload || db.jobs.find(item => item.id === series.jobId)?.payload || {};
+        saveDb(db);
+        const queued = createQueuedProcessingJob({
+          ...basePayload,
+          videoId: video.id,
+          userId: user.role === 'admin' ? (video.userId || video.createdBy || user.id) : user.id,
+          rightsConfirmed: true,
+          workflowMode: 'series',
+          seriesId: series.id,
+          partDuration: series.targetPartDuration || basePayload.partDuration || basePayload.clipLength || 90,
+        });
+        const retry = enqueueRenderJob({ ...(queued.payload || basePayload), videoId: video.id, userId: queued.userId, jobId: queued.id, rightsConfirmed: true, workflowMode: 'series', seriesId: series.id });
+        retry.catch(error => console.error('[series:part-retry-failed]', String(error.message || error).slice(0, 2000)));
+        return json(res, 202, { queued: true, jobId: queued.id, seriesId: series.id, partNumber: part.partNumber, queueDepth: renderQueue.length, activeRenderJobs });
       }
       throw new Error('Unsupported job action.');
     }
@@ -6098,11 +6735,14 @@ async function pollDueWatchedChannels() {
   }
 }
 
-if (process.env.NODE_ENV !== 'test') {
+const isMainModule = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMainModule && process.env.NODE_ENV !== 'test') {
   server.listen(PORT, HOST, async () => {
     console.log(`ClipForge AI running at http://${HOST}:${PORT}`);
     await verifyMediaBinaries();
     recoverStaleJobs('startup');
+    recoverQueuedSeriesJobs('startup');
     logMemory('startup');
     pollDueWatchedChannels().catch(() => {});
     setInterval(() => pollDueWatchedChannels().catch(() => {}), Number(process.env.WATCH_INTERVAL_MINUTES || 15) * 60 * 1000);
@@ -6113,11 +6753,22 @@ if (process.env.NODE_ENV !== 'test') {
 
 export {
   buildTargetDurations,
+  buildFullSeriesMoments,
+  chooseBestDownloadedMedia,
   fallbackMomentsForVideo,
   buildTranscriptReference,
+  FINAL_AUDIO_MISSING,
+  FINAL_AUDIO_SILENT,
+  FINAL_AUDIO_VALID,
+  isEffectivelySilent,
   momentsAreDiverse,
   overlapRatio,
   parseFrameRate,
+  parseVolumeStats,
   postProcessMoments,
+  SOURCE_AUDIO_EXTRACTION_FAILED,
+  SOURCE_AUDIO_PRESENT,
+  SOURCE_HAS_NO_AUDIO,
+  upsertSeriesPlan,
   userCanAccessMedia,
 };
