@@ -2308,11 +2308,37 @@ async function transcribeAudioWithWhisper(db, mediaPath, videoId) {
   }
 }
 
+// YouTube's auto-caption (json3) format is a ROLLING display timeline, not per-word
+// speech alignment: each event's tStartMs is roughly when that phrase begins, but
+// dDurationMs is inflated so the next line can visually roll in before the current
+// one fades out. Taken at face value, adjacent segments overlap in time (confirmed:
+// e.g. "how much time..." reports start=2.48s while the prior segment "The older I
+// get..." reports end=4.88s — both cannot be true of one speaker's continuous speech).
+// That overlap corrupts downstream word-time estimation (misplaced/garbled words)
+// and caption/audio sync. Clip each segment's end to the next segment's start so the
+// timeline is monotonic and non-overlapping, matching how the speech actually runs.
+function deoverlapCaptionSegments(segments) {
+  const sorted = [...(segments || [])]
+    .filter(seg => seg && Number.isFinite(seg.start) && Number.isFinite(seg.end) && seg.text)
+    .sort((a, b) => a.start - b.start);
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const next = sorted[i + 1];
+    if (sorted[i].end > next.start) {
+      sorted[i] = { ...sorted[i], end: Math.max(sorted[i].start + 0.05, next.start) };
+    }
+  }
+  return sorted;
+}
+
 async function getTranscript(video, mediaPath) {
   const transcriptPath = path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.transcript.json`);
   if (existsSync(transcriptPath)) {
     const cached = JSON.parse(readFileSync(transcriptPath, 'utf8'));
-    if (Array.isArray(cached.segments) && cached.segments.length) return cached.segments;
+    if (Array.isArray(cached.segments) && cached.segments.length) {
+      // Re-run deoverlap even on cached data: caches written before this fix still
+      // carry YouTube's raw overlapping rolling-caption windows.
+      return deoverlapCaptionSegments(cached.segments);
+    }
   }
   try {
     const ytdlpCommand = await workingYtDlpCommand();
@@ -2326,7 +2352,7 @@ async function getTranscript(video, mediaPath) {
   if (possible) {
     const raw = JSON.parse(readFileSync(path.join(STORAGE_DIR, 'originals', possible), 'utf8'));
     const events = raw.events || [];
-    const segments = events
+    const rawSegments = events
       .filter(event => event.segs?.length && Number.isFinite(event.tStartMs))
       .map(event => ({
         start: event.tStartMs / 1000,
@@ -2334,6 +2360,7 @@ async function getTranscript(video, mediaPath) {
         text: event.segs.map(seg => seg.utf8).join('').replace(/\s+/g, ' ').trim()
       }))
       .filter(seg => seg.text);
+    const segments = deoverlapCaptionSegments(rawSegments);
     writeFileSync(transcriptPath, JSON.stringify({ segments }, null, 2));
     return segments;
   }
@@ -3195,7 +3222,14 @@ function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920,
     if (suggestedFrac > 0.01 && !lowTrackingConfidence) {
       cropFrac = Math.max(suggestedFrac, minDynamicCropFrac);
     } else if (!hasFaces) {
-      cropFrac = 0.50;                     // no faces → preserve scene context
+      // No face detected is the common case for animated/cartoon content, since
+      // face_track.py's detector is a human-face Haar cascade and rarely fires on
+      // stylized characters. 0.50 was leaving ~37% of the frame as blurred padding
+      // for what's usually a single centered subject. 0.42 matches the tightness
+      // already trusted elsewhere in this function for known multi-subject scenes
+      // (group/wide_shot), so it stays safe for wider compositions without a full
+      // content-aware detector, while meaningfully shrinking blur for the common case.
+      cropFrac = 0.42;
     } else {
       switch (sceneType) {
         case 'group':          cropFrac = 0.50; break;
@@ -3521,7 +3555,7 @@ function buildLogoOverlay(brandKit, outW, outH, faceData = null) {
 
   if (isHandle) {
     autoStyle = 'clean';      // @handles: clean white, thin outline
-    autoPos   = 'bottom-right';
+    autoPos   = 'top-right';  // keep clear of the caption safe zone at the bottom
   } else if (isDomain) {
     autoStyle = 'minimal';    // domains: subtle, small, unobtrusive
     autoPos   = 'bottom-center';
@@ -7114,12 +7148,17 @@ if (isMainModule && process.env.NODE_ENV !== 'test') {
 }
 
 export {
+  buildASSFile,
+  buildLogoOverlay,
+  buildPortraitFilter,
   buildTargetDurations,
   buildFullSeriesMoments,
   cleanupClipAssets,
   cleanupResult,
   cleanupVideoAssets,
   chooseBestDownloadedMedia,
+  deoverlapCaptionSegments,
+  estimateWordTimings,
   fallbackMomentsForVideo,
   buildTranscriptReference,
   FINAL_AUDIO_MISSING,

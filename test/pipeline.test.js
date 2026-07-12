@@ -2,12 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import {
+  buildASSFile,
   buildFullSeriesMoments,
+  buildLogoOverlay,
+  buildPortraitFilter,
   buildTargetDurations,
   cleanupClipAssets,
   cleanupResult,
   cleanupVideoAssets,
   chooseBestDownloadedMedia,
+  deoverlapCaptionSegments,
+  estimateWordTimings,
   fallbackMomentsForVideo,
   buildTranscriptReference,
   FINAL_AUDIO_MISSING,
@@ -323,4 +328,134 @@ test('video asset cleanup removes video metadata without touching accounts or bi
   assert.deepEqual(db.paymentRequests, [{ id: 'pay1', userId: 'u1', status: 'approved' }]);
   assert.deepEqual(db.creditTransactions, [{ id: 'tx1', userId: 'u1', amount: 10 }]);
   assert.deepEqual(db.usageEvents, [{ id: 'usage-other', kind: 'login' }]);
+});
+
+// ─── Caption timing fix: YouTube auto-caption overlap correction ──────────
+test('deoverlapCaptionSegments removes YouTube rolling-caption overlap (real bug reproduction)', () => {
+  // Actual data pattern captured from a real YouTube auto-caption (json3) export:
+  // each event's reported end time bleeds into the next event's start, because
+  // YouTube's rolling-caption display keeps the previous line visible while the
+  // next one begins rendering. This is not real overlapping speech.
+  const raw = [
+    { start: 0.00, end: 4.88, text: "The older I get, the more I've realized" },
+    { start: 2.48, end: 7.60, text: 'how much time I have to set aside' },
+    { start: 4.88, end: 9.20, text: 'just to clean' },
+  ];
+  const fixed = deoverlapCaptionSegments(raw);
+  for (let i = 0; i < fixed.length - 1; i++) {
+    assert.ok(fixed[i].end <= fixed[i + 1].start, `segment ${i} must not overlap segment ${i + 1}`);
+  }
+  assert.equal(fixed[0].end, 2.48);
+  assert.equal(fixed[1].end, 4.88);
+  // Original start times and text are preserved -- only the inflated end is clipped.
+  assert.equal(fixed[0].start, 0);
+  assert.equal(fixed[0].text, raw[0].text);
+});
+
+test('deoverlapCaptionSegments is a no-op on already-clean, non-overlapping segments', () => {
+  const clean = [
+    { start: 0, end: 2, text: 'one' },
+    { start: 2, end: 4, text: 'two' },
+    { start: 4, end: 6, text: 'three' },
+  ];
+  const result = deoverlapCaptionSegments(clean);
+  assert.deepEqual(result.map(s => [s.start, s.end]), clean.map(s => [s.start, s.end]));
+});
+
+test('deoverlapCaptionSegments sorts out-of-order input and drops empty/invalid entries', () => {
+  const messy = [
+    { start: 5, end: 6, text: 'later' },
+    { start: 0, end: 3, text: 'first' },
+    { start: 1, end: 2, text: '' },
+    { start: NaN, end: 2, text: 'bad' },
+  ];
+  const result = deoverlapCaptionSegments(messy);
+  assert.deepEqual(result.map(s => s.text), ['first', 'later']);
+});
+
+// ─── Word-level timing bounds (Priority 1 validation subset) ──────────────
+test('estimateWordTimings never produces negative or out-of-clip timestamps', () => {
+  const segments = [
+    { start: -1, end: 3, text: 'hello there world' },
+    { start: 3, end: 100, text: 'this segment runs way past the clip end' },
+  ];
+  const words = estimateWordTimings(segments, 0, 10);
+  for (const w of words) {
+    assert.ok(w.start >= 0, 'word start must not be negative');
+    assert.ok(w.end <= 10, 'word end must not exceed clip duration');
+    assert.ok(w.end > w.start, 'word end must be after word start');
+  }
+});
+
+test('estimateWordTimings keeps words monotonic within a segment', () => {
+  const segments = [{ start: 0, end: 4, text: 'one two three four' }];
+  const words = estimateWordTimings(segments, 0, 4);
+  for (let i = 1; i < words.length; i++) {
+    assert.ok(words[i].start >= words[i - 1].start, 'words must not go backwards in time');
+  }
+});
+
+// ─── buildASSFile bounds (regression subset of the caption-sync validation spec) ──
+test('buildASSFile never emits negative timestamps or timestamps beyond clip duration', () => {
+  const words = [
+    { word: 'hello', start: -0.5, end: 0.3 },
+    { word: 'world', start: 0.3, end: 0.9 },
+    { word: 'this',  start: 9.8,  end: 10.5 }, // extends past a 10s clip
+  ];
+  const ass = buildASSFile(words, 0, 10, 'bold');
+  const dialogueLines = ass.split('\n').filter(l => l.startsWith('Dialogue:'));
+  assert.ok(dialogueLines.length > 0, 'expected at least one caption event');
+  for (const line of dialogueLines) {
+    const [, startStr, endStr] = line.split(',');
+    const toSeconds = (t) => {
+      const [h, m, s] = t.split(':');
+      return Number(h) * 3600 + Number(m) * 60 + Number(s);
+    };
+    const s = toSeconds(startStr);
+    const e = toSeconds(endStr);
+    assert.ok(s >= 0, `caption start must not be negative (got ${s})`);
+    assert.ok(e <= 10 + 0.05, `caption end must not exceed clip duration (got ${e})`);
+    assert.ok(e > s, 'caption end must be after start');
+  }
+});
+
+test('buildASSFile keeps caption events monotonic (no unexpected overlap)', () => {
+  const words = [
+    { word: 'a', start: 0,   end: 0.3 },
+    { word: 'b', start: 0.3, end: 0.6 },
+    { word: 'c', start: 0.6, end: 0.9 },
+    { word: 'd', start: 2.0, end: 2.3 },
+  ];
+  const ass = buildASSFile(words, 0, 5, 'bold');
+  const starts = ass.split('\n')
+    .filter(l => l.startsWith('Dialogue:'))
+    .map(l => {
+      const [, , startStr] = l.split(',');
+      const [h, m, s] = startStr.split(':');
+      return Number(h) * 3600 + Number(m) * 60 + Number(s);
+    });
+  for (let i = 1; i < starts.length; i++) {
+    assert.ok(starts[i] >= starts[i - 1], 'caption event start times must be monotonic');
+  }
+});
+
+// ─── Framing: no-face-detected default should not waste ~37% of frame on blur ──
+test('buildPortraitFilter uses a tighter default crop for animated content with no detected face', () => {
+  // Real observed case: cartoon content where the human-face Haar cascade finds
+  // nothing. Previously defaulted to cropFrac=0.50 (~37% blurred padding); should
+  // now use 0.42, matching the tightness already trusted for known multi-subject
+  // scenes elsewhere in this function.
+  const srcW = 1920, srcH = 1080, outW = 1080, outH = 1920;
+  const result = buildPortraitFilter(srcW, srcH, outW, outH, 'center', 30, null, 'dynamic');
+  const expectedCropW = Math.max(2, Math.round(Math.min(srcW, 0.42 * srcW) / 2) * 2);
+  assert.equal(result.cropW, expectedCropW);
+});
+
+// ─── Watermark position: @handles must not sit in the bottom caption safe zone ──
+test('buildLogoOverlay positions @handle text watermarks top-right, not bottom-right', () => {
+  const brandKit = { watermarkEnabled: true, textWatermark: '@emriz.eth' };
+  const overlay = buildLogoOverlay(brandKit, 1080, 1920, null);
+  assert.ok(overlay, 'expected a watermark overlay to be produced');
+  assert.equal(overlay.detectedPos, 'top-right');
+  assert.ok(!overlay.filterFrag.includes('H-th-380'), 'must not use the bottom safe-zone y-offset');
 });
