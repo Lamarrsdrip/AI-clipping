@@ -13,6 +13,7 @@ import {
   chooseBestDownloadedMedia,
   deoverlapCaptionSegments,
   estimateWordTimings,
+  isProxyReachable,
   fallbackMomentsForVideo,
   buildTranscriptReference,
   FINAL_AUDIO_MISSING,
@@ -460,4 +461,28 @@ test('buildLogoOverlay positions @handle text watermarks top-right, not bottom-r
   assert.ok(overlay, 'expected a watermark overlay to be produced');
   assert.equal(overlay.detectedPos, 'top-right');
   assert.ok(!overlay.filterFrag.includes('H-th-380'), 'must not use the bottom safe-zone y-offset');
+});
+
+// ─── Residential proxy tunnel fallback ─────────────────────────────────────
+test('isProxyReachable resolves false quickly when nothing is listening', async () => {
+  // Port 1 is a reserved/privileged port nothing will ever be listening on in a
+  // test environment -- a safe, deterministic "definitely not connected" case.
+  const start = Date.now();
+  const reachable = await isProxyReachable('127.0.0.1', 1, 500);
+  const elapsed = Date.now() - start;
+  assert.equal(reachable, false);
+  assert.ok(elapsed < 2000, `should fail fast, not hang (took ${elapsed}ms)`);
+});
+
+test('isProxyReachable resolves true when something is actually listening', async () => {
+  const net = await import('node:net');
+  const server = net.createServer();
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  try {
+    const reachable = await isProxyReachable('127.0.0.1', port, 500);
+    assert.equal(reachable, true);
+  } finally {
+    server.close();
+  }
 });

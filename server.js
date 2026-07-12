@@ -5,6 +5,7 @@ import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import { connect as netConnect } from 'node:net';
 import Busboy from 'busboy';
 import {
   GEMINI_COMPAT_BASE, GEMINI_FLASH, GEMINI_MODEL_CASCADE,
@@ -51,6 +52,13 @@ const YTDLP_COOKIES_PATH = process.env.YTDLP_COOKIES_PATH || path.join(DATA_DIR,
 // Clients tried, in order, when YouTube's bot-check blocks the default client. Each only
 // runs if the previous attempt failed specifically with a bot-check error (not other failures).
 const YOUTUBE_CLIENT_FALLBACKS = ['android_vr', 'ios', 'web_safari', 'tv_embedded'];
+// Last-resort fallback: a reverse SSH tunnel from a residential machine (opened from
+// that machine's side, not this server's) can expose a local SOCKS proxy here. When
+// present, YouTube sees that machine's IP instead of this server's datacenter IP for
+// the one request that needed it — everything else still goes direct. Optional by
+// design: if nothing is listening, this is skipped with no effect on normal imports.
+const YTDLP_PROXY_HOST = process.env.YTDLP_PROXY_HOST || '127.0.0.1';
+const YTDLP_PROXY_PORT = Number(process.env.YTDLP_PROXY_PORT || 1080);
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 300 * 1024 * 1024);
 const MAX_CONCURRENT_RENDER_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_RENDER_JOBS || 1));
 const PROCESS_TIMEOUT_MS = Number(process.env.PROCESS_TIMEOUT_MS || 10 * 60 * 1000);
@@ -653,9 +661,26 @@ async function ytDlpBaseArgs() {
   return args;
 }
 
+// Fast, short-lived TCP probe -- does not use yt-dlp itself, so it can't hang on a
+// dead proxy. Used to decide whether the residential-tunnel fallback is worth trying
+// at all right now, since the tunnel is optional and often not connected.
+function isProxyReachable(host = YTDLP_PROXY_HOST, port = YTDLP_PROXY_PORT, timeoutMs = 1200) {
+  return new Promise(resolve => {
+    const socket = netConnect({ host, port, timeout: timeoutMs });
+    const finish = (ok) => { socket.destroy(); resolve(ok); };
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+  });
+}
+
 // Runs yt-dlp with the default client first; if YouTube's bot-check blocks that specific
 // attempt, retries with each fallback client in turn before giving up. Any non-bot-check
 // error (private video, unsupported URL, etc.) fails immediately without wasting retries.
+// As the true last resort -- after every client has been tried directly from this
+// server's own IP -- if a residential SOCKS tunnel is currently connected, one more
+// attempt is made through it. That tunnel is opened from the residential machine's
+// side (see docs/youtube-proxy-tunnel.md); this server only ever dials localhost.
 async function runYtDlpWithClientFallback(ytdlpCommand, extraArgs, runOptions = {}) {
   const baseArgs = await ytDlpBaseArgs();
   const attempts = [null, ...YOUTUBE_CLIENT_FALLBACKS];
@@ -677,6 +702,21 @@ async function runYtDlpWithClientFallback(ytdlpCommand, extraArgs, runOptions = 
         remainingAttempts: attempts.length - i - 1
       });
     }
+  }
+  if (await isProxyReachable()) {
+    const proxyArgs = [...baseArgs, `--proxy`, `socks5://${YTDLP_PROXY_HOST}:${YTDLP_PROXY_PORT}`, ...extraArgs];
+    try {
+      const result = await run(ytdlpCommand, proxyArgs, runOptions);
+      importLog('log', 'yt-dlp succeeded via residential proxy tunnel (all direct client attempts were blocked)', {});
+      return result;
+    } catch (error) {
+      lastError = error;
+      importLog('warn', 'yt-dlp blocked even through the residential proxy tunnel', {
+        raw: String(error?.message || error).slice(0, 400)
+      });
+    }
+  } else {
+    importLog('log', 'residential proxy tunnel not connected, skipping that fallback', {});
   }
   rememberYtDlpBlock(lastError);
   throw lastError;
@@ -7162,6 +7202,7 @@ export {
   chooseBestDownloadedMedia,
   deoverlapCaptionSegments,
   estimateWordTimings,
+  isProxyReachable,
   fallbackMomentsForVideo,
   buildTranscriptReference,
   FINAL_AUDIO_MISSING,
