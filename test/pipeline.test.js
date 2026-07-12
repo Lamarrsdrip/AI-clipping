@@ -12,6 +12,7 @@ import {
   cleanupResult,
   cleanupVideoAssets,
   chooseBestDownloadedMedia,
+  clipCaptionWordsToRenderWindow,
   deoverlapCaptionSegments,
   estimateWordTimings,
   parseYouTubeJson3,
@@ -547,6 +548,22 @@ test('assessCaptionSync accepts real word-level timing and rejects impossible of
   assert.equal(invalid.status, CAPTION_SYNC_OFFSET_DETECTED);
   assert.equal(invalid.valid, false);
   assert.equal(invalid.fatal, true);
+});
+
+test('caption render-window clipping prevents tiny boundary overlaps from failing a valid 90s render', () => {
+  const words = clipCaptionWordsToRenderWindow([
+    { word: 'almost', start: 89.50, end: 89.84, timingSource: 'youtube-json3-word-offset' },
+    { word: 'but', start: 89.84, end: 90.16, timingSource: 'youtube-json3-word-offset' },
+    { word: 'outside', start: 90.20, end: 90.50, timingSource: 'youtube-json3-word-offset' },
+  ], 90);
+  assert.deepEqual(words.map(w => w.word), ['almost', 'but']);
+  assert.equal(words[1].end, 90);
+  assert.equal(words[1].originalRenderEnd, 90.16);
+  assert.equal(words[1].clippedToRenderWindow, true);
+
+  const result = assessCaptionSync(words, { outputDuration: 90 });
+  assert.equal(result.status, CAPTION_SYNC_VALID);
+  assert.equal(result.valid, true);
 });
 
 test('assessCaptionSync records missing word timestamps without pretending alignment exists', () => {

@@ -3009,6 +3009,32 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   return header + events.join('\n') + '\n';
 }
 
+function clipCaptionWordsToRenderWindow(words = [], outputDuration = 0) {
+  const dur = Math.max(0, Number(outputDuration || 0));
+  if (!dur) return [];
+  return (words || [])
+    .map(word => {
+      const start = Number(word.start);
+      const end = Number(word.end);
+      if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+      if (end <= 0 || start >= dur) return null;
+      const clippedStart = Math.max(0, start);
+      const clippedEnd = Math.min(dur, end);
+      if (clippedEnd <= clippedStart + 0.01) return null;
+      return {
+        ...word,
+        start: clippedStart,
+        end: clippedEnd,
+        renderStart: clippedStart,
+        renderEnd: clippedEnd,
+        originalRenderStart: start,
+        originalRenderEnd: end,
+        clippedToRenderWindow: clippedStart !== start || clippedEnd !== end,
+      };
+    })
+    .filter(Boolean);
+}
+
 function assessCaptionSync(words = [], options = {}) {
   const enabled = options.enabled !== false;
   if (!enabled) {
@@ -4039,7 +4065,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   const useEDL = edlSegs.length > 1 && !(pfObj.type === 'blurred' && edlSegs.length > 5);
 
   // ── Stage 5: ASS word-level captions ─────────────────────────
-  const assWords = useEDL
+  const rawAssWords = useEDL
     ? remapWordTimings(wordTimings, edlSegs)
     : wordTimings.map(w => ({
         word: w.word,
@@ -4056,6 +4082,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   const totalOutDur = useEDL
     ? edlSegs.reduce((s, seg) => s + seg.end - seg.start, 0)
     : moment.end - effectiveStart;
+  const assWords = clipCaptionWordsToRenderWindow(rawAssWords, totalOutDur);
   // Compute average face Y to position captions above faces in bottom-framed shots
   const kfCyVals = (faceData?.keyframes || []).filter(kf => kf.faceCount > 0).map(kf => kf.cy);
   const faceCyAvg = kfCyVals.length ? kfCyVals.reduce((s, v) => s + v, 0) / kfCyVals.length : null;
@@ -7493,6 +7520,7 @@ export {
   cleanupResult,
   cleanupVideoAssets,
   chooseBestDownloadedMedia,
+  clipCaptionWordsToRenderWindow,
   deoverlapCaptionSegments,
   parseYouTubeJson3,
   assessCaptionSync,
