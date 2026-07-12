@@ -3349,6 +3349,26 @@ function renderAdmin() {
         <div class="stat-card"><div class="stat-num">${failed.length}</div><div class="stat-label">Failed</div></div>
       </div>
 
+      <!-- ── Storage cleanup ── -->
+      <section class="panel" style="margin-top:16px;border-color:rgba(248,113,113,.28)">
+        <div class="panel-head" style="margin-bottom:14px">
+          <div>
+            <span class="eyebrow">Storage retention</span>
+            <h2>Video file cleanup</h2>
+            <p class="muted" style="margin:4px 0 0;font-size:.82rem">Source uploads, generated clips, thumbnails, transcripts, captions, and render temp files expire after 3 days.</p>
+          </div>
+          <div id="storageCleanupBadge" style="flex-shrink:0">Checking…</div>
+        </div>
+        <div id="storageCleanupStatus" class="muted" style="font-size:.84rem;margin-bottom:12px">Loading storage status…</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <input id="retentionDaysInput" type="number" min="1" max="30" value="3"
+            style="width:88px;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;color:var(--fg)">
+          <button class="ghost" id="runStorageRetentionBtn">Run retention cleanup</button>
+          <button class="ghost danger-btn" id="deleteAllVideoAssetsBtn">Delete all video files</button>
+        </div>
+        <div id="storageCleanupResult" style="margin-top:10px"></div>
+      </section>
+
       <!-- ── Gemini AI (Primary Brain) ── -->
       <section class="panel" style="margin-top:16px;border:2px solid var(--accent)">
         <div class="panel-head" style="margin-bottom:16px">
@@ -3723,6 +3743,81 @@ function renderAdmin() {
       $('#ytCookiesResult').innerHTML = '<div class="verify-ok">Cleared ✓</div>';
       setTimeout(()=>{ $('#ytCookiesResult').innerHTML=''; },3000);
     } catch(err) { alert(err.message); }
+  });
+
+  // ── Storage cleanup ───────────────────────────────────────────
+  function renderStorageCleanupStatus(data) {
+    const stats = data?.stats || {};
+    const badge = $('#storageCleanupBadge');
+    const status = $('#storageCleanupStatus');
+    if (badge) badge.innerHTML = `<span style="color:var(--fg2);font-size:.85rem">${Number(stats.bytesMb || 0).toLocaleString()} MB</span>`;
+    if (status) {
+      const last = data?.recent?.[0] || stats.lastCleanup;
+      status.innerHTML = `
+        <div class="meta" style="gap:10px;flex-wrap:wrap">
+          <span>${Number(stats.files || 0).toLocaleString()} files</span>
+          <span>${Number(stats.videos || 0).toLocaleString()} videos</span>
+          <span>${Number(stats.clips || 0).toLocaleString()} clips</span>
+          <span>${Number(stats.retentionDays || 3)} day retention</span>
+          ${last ? `<span>Last cleanup: ${when(last.createdAt)}</span>` : '<span>No cleanup run yet</span>'}
+        </div>`;
+    }
+  }
+  async function refreshStorageCleanupStatus() {
+    try {
+      renderStorageCleanupStatus(await api('/api/admin/storage-cleanup'));
+    } catch {
+      const status = $('#storageCleanupStatus');
+      if (status) status.innerHTML = '<span class="error-text">Could not load storage cleanup status.</span>';
+    }
+  }
+  refreshStorageCleanupStatus();
+
+  $('#runStorageRetentionBtn')?.addEventListener('click', async () => {
+    const btn = $('#runStorageRetentionBtn');
+    const resultEl = $('#storageCleanupResult');
+    btn.disabled = true;
+    btn.textContent = 'Cleaning…';
+    try {
+      const data = await api('/api/admin/storage-cleanup', {
+        method: 'POST',
+        body: JSON.stringify({
+          action: 'run-retention',
+          retentionDays: Number($('#retentionDaysInput')?.value || 3),
+        })
+      });
+      const r = data.result || {};
+      resultEl.innerHTML = `<div class="verify-ok">Deleted ${r.filesDeleted || 0} files, ${r.videosDeleted || 0} videos, ${r.clipsDeleted || 0} clips · freed ${((r.bytesFreed || 0) / 1024 / 1024).toFixed(2)} MB</div>`;
+      renderStorageCleanupStatus(data);
+    } catch(e) {
+      resultEl.innerHTML = `<div class="verify-fail">✗ ${esc(e.message)}</div>`;
+    }
+    btn.disabled = false;
+    btn.textContent = 'Run retention cleanup';
+  });
+
+  $('#deleteAllVideoAssetsBtn')?.addEventListener('click', async () => {
+    const phrase = prompt('Type DELETE VIDEO FILES to remove all video assets, clips, thumbnails, transcripts, and render temp files. User accounts and payments are kept.');
+    if (phrase !== 'DELETE VIDEO FILES') return;
+    const btn = $('#deleteAllVideoAssetsBtn');
+    const resultEl = $('#storageCleanupResult');
+    btn.disabled = true;
+    btn.textContent = 'Deleting…';
+    try {
+      const data = await api('/api/admin/storage-cleanup', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'delete-all-video-assets', confirm: phrase })
+      });
+      const r = data.result || {};
+      resultEl.innerHTML = `<div class="verify-ok">Deleted all video assets: ${r.filesDeleted || 0} files, ${r.videosDeleted || 0} videos, ${r.clipsDeleted || 0} clips · freed ${((r.bytesFreed || 0) / 1024 / 1024).toFixed(2)} MB</div>`;
+      await loadAll();
+      renderStorageCleanupStatus(data);
+      if (state.view === 'admin') setTimeout(renderAdmin, 800);
+    } catch(e) {
+      resultEl.innerHTML = `<div class="verify-fail">✗ ${esc(e.message)}</div>`;
+    }
+    btn.disabled = false;
+    btn.textContent = 'Delete all video files';
   });
 
   // ── Admin credit / plan management ────────────────────────────

@@ -1,8 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import {
   buildFullSeriesMoments,
   buildTargetDurations,
+  cleanupClipAssets,
+  cleanupResult,
+  cleanupVideoAssets,
   chooseBestDownloadedMedia,
   fallbackMomentsForVideo,
   buildTranscriptReference,
@@ -15,6 +19,7 @@ import {
   parseFrameRate,
   parseVolumeStats,
   postProcessMoments,
+  resolveManagedDeletionPath,
   SOURCE_AUDIO_EXTRACTION_FAILED,
   SOURCE_AUDIO_PRESENT,
   SOURCE_HAS_NO_AUDIO,
@@ -201,4 +206,121 @@ test('media access is scoped to owners and blocks originals by default', () => {
   assert.equal(userCanAccessMedia(other, 'logos/logo-one.png', db), false);
   assert.equal(userCanAccessMedia(user, 'originals/private-source.mp4', db), false);
   assert.equal(userCanAccessMedia(admin, 'originals/private-source.mp4', db), true);
+});
+
+test('storage cleanup path validation stays inside managed media roots', () => {
+  const safe = resolveManagedDeletionPath('/media/clips/cleanup-safe.mp4');
+  assert.ok(safe);
+  assert.match(safe, /storage[\\/]clips[\\/]cleanup-safe\.mp4$/);
+  assert.equal(resolveManagedDeletionPath('/media/../server.js'), null);
+  assert.equal(resolveManagedDeletionPath('/etc/passwd'), null);
+  assert.equal(resolveManagedDeletionPath('https://example.com/video.mp4'), null);
+});
+
+test('clip cleanup physically removes generated files and frees bytes', () => {
+  const clipsDir = new URL('../storage/clips/', import.meta.url);
+  const clipFile = new URL('../storage/clips/unit-cleanup-physical.mp4', import.meta.url);
+  mkdirSync(clipsDir, { recursive: true });
+  writeFileSync(clipFile, Buffer.alloc(4096, 7));
+  const db = {
+    clips: [{ id: 'unit-cleanup-physical', outputPath: '/media/clips/unit-cleanup-physical.mp4' }],
+    scheduledPosts: [],
+    seriesParts: [],
+    seriesJobs: [],
+    usageEvents: [],
+  };
+  try {
+    const result = cleanupClipAssets(db, ['unit-cleanup-physical'], cleanupResult('unit-test', 'clip-delete'));
+    assert.equal(existsSync(clipFile), false);
+    assert.equal(result.filesDeleted, 1);
+    assert.ok(result.bytesFreed >= 4096);
+    assert.equal(db.clips.length, 0);
+  } finally {
+    if (existsSync(clipFile)) unlinkSync(clipFile);
+  }
+});
+
+test('video cleanup refuses non-video storage roots', () => {
+  const logosDir = new URL('../storage/logos/', import.meta.url);
+  const logoFile = new URL('../storage/logos/unit-keep-logo.png', import.meta.url);
+  mkdirSync(logosDir, { recursive: true });
+  writeFileSync(logoFile, Buffer.from('keep-logo'));
+  const db = {
+    videos: [{
+      id: 'video-bad-path-test',
+      userId: 'u1',
+      storagePath: '/media/logos/unit-keep-logo.png',
+      createdAt: '2026-01-01T00:00:00.000Z',
+    }],
+    clips: [],
+    jobs: [],
+    transcriptions: [],
+    scheduledPosts: [],
+    seriesJobs: [],
+    seriesParts: [],
+    projects: [],
+    imports: [],
+    usageEvents: [],
+  };
+  try {
+    const result = cleanupVideoAssets(db, ['video-bad-path-test'], cleanupResult('unit-test', 'video-delete'));
+    assert.equal(result.videosDeleted, 1);
+    assert.equal(existsSync(logoFile), true);
+    assert.ok(result.skippedUnsafe.includes('/media/logos/unit-keep-logo.png'));
+  } finally {
+    if (existsSync(logoFile)) unlinkSync(logoFile);
+  }
+});
+
+test('video asset cleanup removes video metadata without touching accounts or billing data', () => {
+  const db = {
+    users: [{ id: 'u1', email: 'owner@example.com' }],
+    subscriptions: [{ id: 'sub1', userId: 'u1' }],
+    paymentRequests: [{ id: 'pay1', userId: 'u1', status: 'approved' }],
+    creditTransactions: [{ id: 'tx1', userId: 'u1', amount: 10 }],
+    videos: [{
+      id: 'video-cleanup-test',
+      userId: 'u1',
+      importId: 'import1',
+      projectId: 'project1',
+      youtubeId: 'yt-cleanup-test',
+      storagePath: '/media/uploads/source-cleanup-test.mp4',
+      thumbnailUrl: '/media/thumbs/source-cleanup-test.jpg',
+      createdAt: '2026-01-01T00:00:00.000Z',
+    }],
+    clips: [{
+      id: 'clip-cleanup-test',
+      userId: 'u1',
+      videoId: 'video-cleanup-test',
+      outputPath: '/media/clips/clip-cleanup-test.mp4',
+      thumbnailPath: '/media/thumbs/clip_clip-cleanup-test.jpg',
+      thumbnailOptions: [{ path: '/media/thumbnails/thumb_clip-cleanup-test_viral.jpg' }],
+      createdAt: '2026-01-01T00:00:00.000Z',
+    }],
+    jobs: [{ id: 'job1', videoId: 'video-cleanup-test', status: 'complete' }],
+    transcriptions: [{ id: 'tr1', videoId: 'video-cleanup-test', segments: [] }],
+    scheduledPosts: [{ id: 'post1', clipId: 'clip-cleanup-test' }],
+    seriesJobs: [{ id: 'series1', videoId: 'video-cleanup-test' }],
+    seriesParts: [{ id: 'part1', seriesId: 'series1', videoId: 'video-cleanup-test', clipId: 'clip-cleanup-test' }],
+    projects: [{ id: 'project1', userId: 'u1' }],
+    imports: [{ id: 'import1', userId: 'u1' }],
+    usageEvents: [{ id: 'usage-video', videoId: 'video-cleanup-test' }, { id: 'usage-other', kind: 'login' }],
+  };
+  const result = cleanupVideoAssets(db, ['video-cleanup-test'], cleanupResult('unit-test', 'video-delete'));
+  assert.equal(result.videosDeleted, 1);
+  assert.equal(result.clipsDeleted, 1);
+  assert.equal(db.videos.length, 0);
+  assert.equal(db.clips.length, 0);
+  assert.equal(db.jobs.length, 0);
+  assert.equal(db.transcriptions.length, 0);
+  assert.equal(db.scheduledPosts.length, 0);
+  assert.equal(db.seriesJobs.length, 0);
+  assert.equal(db.seriesParts.length, 0);
+  assert.equal(db.projects.length, 0);
+  assert.equal(db.imports.length, 0);
+  assert.deepEqual(db.users, [{ id: 'u1', email: 'owner@example.com' }]);
+  assert.deepEqual(db.subscriptions, [{ id: 'sub1', userId: 'u1' }]);
+  assert.deepEqual(db.paymentRequests, [{ id: 'pay1', userId: 'u1', status: 'approved' }]);
+  assert.deepEqual(db.creditTransactions, [{ id: 'tx1', userId: 'u1', amount: 10 }]);
+  assert.deepEqual(db.usageEvents, [{ id: 'usage-other', kind: 'login' }]);
 });

@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { createHash, createHmac, randomUUID, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
-import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -62,6 +62,8 @@ const RENDER_HEIGHT = Number(process.env.RENDER_HEIGHT || 1280);
 const TRANSCRIPTION_CHUNK_SECONDS = Math.max(120, Number(process.env.TRANSCRIPTION_CHUNK_SECONDS || 600));
 const DIGITAL_SILENCE_MAX_DB = Number(process.env.DIGITAL_SILENCE_MAX_DB || -89);
 const MIN_AUDIBLE_AUDIO_BITRATE = Number(process.env.MIN_AUDIBLE_AUDIO_BITRATE || 16000);
+const STORAGE_RETENTION_DAYS = Math.max(1, Number(process.env.STORAGE_RETENTION_DAYS || 3));
+const STORAGE_CLEANUP_INTERVAL_MS = Math.max(15 * 60 * 1000, Number(process.env.STORAGE_CLEANUP_INTERVAL_MS || 60 * 60 * 1000));
 const importAttempts = new Map();
 const importUserAttempts = new Map(); // userId → [timestamps] for rate-limiting by user
 const ytdlpBlock = { until: 0, reason: '' };
@@ -129,7 +131,8 @@ const seed = {
   studioGenerations: [],
   audioGenerations: [],
   seriesJobs: [],
-  seriesParts: []
+  seriesParts: [],
+  storageCleanupRuns: []
 };
 
 const PLATFORMS = ['TikTok', 'YouTube Shorts', 'Instagram Reels', 'Facebook Reels', 'X'];
@@ -356,6 +359,7 @@ function loadDb() {
   if (!Array.isArray(db.audioGenerations)) db.audioGenerations = [];
   if (!Array.isArray(db.seriesJobs)) db.seriesJobs = [];
   if (!Array.isArray(db.seriesParts)) db.seriesParts = [];
+  if (!Array.isArray(db.storageCleanupRuns)) db.storageCleanupRuns = [];
   if (!Array.isArray(db.brandKits)) db.brandKits = [];
   for (const user of db.users) {
     if (!user.role) user.role = user.email === 'ava@clipforge.local' ? 'admin' : 'user';
@@ -390,6 +394,7 @@ function saveDb(db) {
   if (!Array.isArray(db.audioGenerations)) db.audioGenerations = [];
   if (!Array.isArray(db.seriesJobs)) db.seriesJobs = [];
   if (!Array.isArray(db.seriesParts)) db.seriesParts = [];
+  if (!Array.isArray(db.storageCleanupRuns)) db.storageCleanupRuns = [];
   if (!Array.isArray(db.brandKits)) db.brandKits = [];
   writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 }
@@ -1311,15 +1316,346 @@ async function importSource(sourceUrl, userId) {
   return { ...result, source: source || 'youtube-api', warnings: warnings || [], canonicalUrl: parsed.canonical };
 }
 
-function unlinkQuiet(filePath) {
-  try {
-    if (filePath && existsSync(filePath)) unlinkSync(filePath);
-  } catch (error) {
-    const reason = `Validation failed: ${String(error.message || error).slice(0, 300)}`;
-    issues.push(reason);
-    fatalIssues.push('FINAL_VALIDATION_FAILED');
-    audio.failureReason = reason;
+const VIDEO_STORAGE_DIRS = [
+  path.join(STORAGE_DIR, 'originals'),
+  path.join(STORAGE_DIR, 'uploads'),
+  path.join(STORAGE_DIR, 'clips'),
+  path.join(STORAGE_DIR, 'thumbs'),
+  path.join(STORAGE_DIR, 'thumbnails'),
+  path.join(STORAGE_DIR, 'transcripts'),
+];
+const MANAGED_DELETE_ROOTS = [STORAGE_DIR, path.join(DATA_DIR, 'tmp')].map(root => path.resolve(root));
+const VIDEO_DELETE_ROOTS = [...VIDEO_STORAGE_DIRS, path.join(DATA_DIR, 'tmp')].map(root => path.resolve(root));
+
+function isPathInsideRoot(candidatePath, rootPath) {
+  const resolved = path.resolve(candidatePath);
+  const root = path.resolve(rootPath);
+  const rel = path.relative(root, resolved);
+  return Boolean(rel) && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
+
+function isPathAtOrInsideRoot(candidatePath, rootPath) {
+  const resolved = path.resolve(candidatePath);
+  const root = path.resolve(rootPath);
+  const rel = path.relative(root, resolved);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+function resolveManagedDeletionPath(rawPath, roots = MANAGED_DELETE_ROOTS) {
+  if (!rawPath) return null;
+  let value = String(rawPath).trim();
+  if (!value || /^https?:\/\//i.test(value) || value.startsWith('data:')) return null;
+  value = value.split('?')[0].split('#')[0].replace(/\\/g, path.sep);
+  let candidate;
+  if (value.startsWith('/media/')) {
+    candidate = path.join(STORAGE_DIR, value.slice('/media/'.length));
+  } else if (value.startsWith('media/')) {
+    candidate = path.join(STORAGE_DIR, value.slice('media/'.length));
+  } else if (path.isAbsolute(value)) {
+    candidate = value;
+  } else {
+    candidate = path.join(STORAGE_DIR, value);
   }
+  const resolved = path.resolve(candidate);
+  return roots.some(root => isPathInsideRoot(resolved, root)) ? resolved : null;
+}
+
+function cleanupResult(reason = 'manual', mode = 'video-assets') {
+  return {
+    id: randomUUID(),
+    reason,
+    mode,
+    retentionDays: STORAGE_RETENTION_DAYS,
+    videosDeleted: 0,
+    clipsDeleted: 0,
+    jobsDeleted: 0,
+    transcriptionsDeleted: 0,
+    seriesRowsDeleted: 0,
+    metadataDeleted: 0,
+    filesDeleted: 0,
+    bytesFreed: 0,
+    skippedUnsafe: [],
+    errors: [],
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function deleteFileIfSafe(rawPath, result = cleanupResult('single-file'), roots = MANAGED_DELETE_ROOTS) {
+  const resolved = resolveManagedDeletionPath(rawPath, roots);
+  if (!resolved) {
+    if (rawPath) result.skippedUnsafe.push(String(rawPath));
+    return false;
+  }
+  try {
+    if (!existsSync(resolved)) return false;
+    const stat = statSync(resolved);
+    if (!stat.isFile()) {
+      result.skippedUnsafe.push(resolved);
+      return false;
+    }
+    unlinkSync(resolved);
+    result.filesDeleted += 1;
+    result.bytesFreed += stat.size;
+    return true;
+  } catch (error) {
+    result.errors.push({ path: resolved, error: String(error.message || error).slice(0, 300) });
+    return false;
+  }
+}
+
+function deleteVideoFileIfSafe(rawPath, result = cleanupResult('single-video-file')) {
+  return deleteFileIfSafe(rawPath, result, VIDEO_DELETE_ROOTS);
+}
+
+function unlinkQuiet(filePath) {
+  deleteFileIfSafe(filePath, cleanupResult('unlinkQuiet'));
+}
+
+function pathBasenameMaybe(value = '') {
+  const raw = String(value || '').split('?')[0].split('#')[0];
+  if (!raw || /^https?:\/\//i.test(raw)) return '';
+  return path.basename(raw.replace(/\\/g, path.sep));
+}
+
+function pathStemMaybe(value = '') {
+  const base = pathBasenameMaybe(value);
+  return base ? base.replace(/\.[^.]+$/, '') : '';
+}
+
+function addPath(paths, value) {
+  if (value) paths.add(String(value));
+}
+
+function safeReaddir(dirPath, roots = MANAGED_DELETE_ROOTS) {
+  const resolved = path.resolve(dirPath);
+  if (!roots.some(root => isPathAtOrInsideRoot(resolved, root))) return [];
+  try {
+    return readdirSync(resolved).map(name => path.join(resolved, name));
+  } catch {
+    return [];
+  }
+}
+
+function deleteMatchingFiles(dirPath, predicate, result, roots = VIDEO_DELETE_ROOTS) {
+  for (const filePath of safeReaddir(dirPath, roots)) {
+    let stat;
+    try {
+      stat = statSync(filePath);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile()) continue;
+    const name = path.basename(filePath);
+    if (predicate(name, filePath, stat)) deleteFileIfSafe(filePath, result, roots);
+  }
+}
+
+function deleteFilesByPrefixes(dirPath, prefixes, result, roots = VIDEO_DELETE_ROOTS) {
+  const cleanPrefixes = Array.from(new Set([...prefixes].filter(prefix => String(prefix || '').length >= 6)));
+  if (!cleanPrefixes.length) return;
+  deleteMatchingFiles(dirPath, name => cleanPrefixes.some(prefix => name.startsWith(prefix)), result, roots);
+}
+
+function collectReferencedVideoAssetPaths(db) {
+  const refs = new Set();
+  for (const video of db.videos || []) {
+    addPath(refs, video.storagePath);
+    addPath(refs, video.thumbnailUrl);
+    if (String(video.url || '').startsWith('/media/')) addPath(refs, video.url);
+  }
+  for (const clip of db.clips || []) {
+    addPath(refs, clip.outputPath);
+    addPath(refs, clip.thumbnailPath);
+    for (const opt of clip.thumbnailOptions || []) addPath(refs, opt.path);
+  }
+  const resolved = new Set();
+  for (const ref of refs) {
+    const filePath = resolveManagedDeletionPath(ref, VIDEO_DELETE_ROOTS);
+    if (filePath) resolved.add(filePath);
+  }
+  return resolved;
+}
+
+function cleanupClipAssets(db, clipIds, result = cleanupResult('manual', 'clips')) {
+  const ids = new Set([...clipIds].filter(Boolean));
+  if (!ids.size) return result;
+  const clips = (db.clips || []).filter(clip => ids.has(clip.id));
+  const paths = new Set();
+  const thumbPrefixes = new Set();
+  const optionPrefixes = new Set();
+  const tmpPrefixes = new Set();
+  for (const clip of clips) {
+    addPath(paths, clip.outputPath);
+    addPath(paths, clip.thumbnailPath);
+    for (const opt of clip.thumbnailOptions || []) addPath(paths, opt.path);
+    thumbPrefixes.add(`clip_${clip.id}`);
+    optionPrefixes.add(`thumb_${clip.id}_`);
+    tmpPrefixes.add(`cf_${clip.id}`);
+  }
+  for (const filePath of paths) deleteVideoFileIfSafe(filePath, result);
+  deleteFilesByPrefixes(path.join(STORAGE_DIR, 'thumbs'), thumbPrefixes, result);
+  deleteFilesByPrefixes(path.join(STORAGE_DIR, 'thumbnails'), optionPrefixes, result);
+  deleteFilesByPrefixes(path.join(DATA_DIR, 'tmp'), tmpPrefixes, result);
+  const beforePosts = (db.scheduledPosts || []).length;
+  db.scheduledPosts = (db.scheduledPosts || []).filter(post => !ids.has(post.clipId));
+  const beforeParts = (db.seriesParts || []).length;
+  db.seriesParts = (db.seriesParts || []).filter(part => !ids.has(part.clipId));
+  db.seriesJobs = (db.seriesJobs || []).filter(series => (db.seriesParts || []).some(part => part.seriesId === series.id));
+  db.usageEvents = (db.usageEvents || []).filter(event => !ids.has(event.clipId));
+  db.clips = (db.clips || []).filter(clip => !ids.has(clip.id));
+  result.clipsDeleted += clips.length;
+  result.seriesRowsDeleted += beforeParts - db.seriesParts.length;
+  if (beforePosts !== (db.scheduledPosts || []).length) result.metadataDeleted += beforePosts - db.scheduledPosts.length;
+  return result;
+}
+
+function cleanupVideoAssets(db, videoIds, result = cleanupResult('manual', 'videos')) {
+  const ids = new Set([...videoIds].filter(Boolean));
+  if (!ids.size) return result;
+  const videos = (db.videos || []).filter(video => ids.has(video.id));
+  const relatedClips = (db.clips || []).filter(clip => ids.has(clip.videoId));
+  cleanupClipAssets(db, relatedClips.map(clip => clip.id), result);
+  const paths = new Set();
+  const originalPrefixes = new Set();
+  const transcriptPrefixes = new Set();
+  const uploadPrefixes = new Set();
+  for (const video of videos) {
+    addPath(paths, video.storagePath);
+    addPath(paths, video.thumbnailUrl);
+    if (String(video.url || '').startsWith('/media/')) addPath(paths, video.url);
+    for (const prefix of [video.youtubeId, video.id, pathStemMaybe(video.storagePath), pathStemMaybe(video.url)].filter(Boolean)) {
+      originalPrefixes.add(prefix);
+      transcriptPrefixes.add(prefix);
+      uploadPrefixes.add(prefix);
+    }
+  }
+  for (const filePath of paths) deleteVideoFileIfSafe(filePath, result);
+  deleteFilesByPrefixes(path.join(STORAGE_DIR, 'originals'), originalPrefixes, result);
+  deleteFilesByPrefixes(path.join(STORAGE_DIR, 'transcripts'), transcriptPrefixes, result);
+  deleteFilesByPrefixes(path.join(STORAGE_DIR, 'uploads'), uploadPrefixes, result);
+  for (const video of videos) {
+    for (const job of (db.jobs || []).filter(item => item.videoId === video.id)) killActiveJobProcesses(job.id);
+    cancelQueuedRenderJobsForVideo(video.id, 'Job cancelled because the source video was removed by storage cleanup.');
+  }
+  const beforeJobs = (db.jobs || []).length;
+  const beforeTranscriptions = (db.transcriptions || []).length;
+  const beforeSeriesParts = (db.seriesParts || []).length;
+  db.jobs = (db.jobs || []).filter(job => !ids.has(job.videoId));
+  db.transcriptions = (db.transcriptions || []).filter(row => !ids.has(row.videoId));
+  db.seriesParts = (db.seriesParts || []).filter(part => !ids.has(part.videoId));
+  db.seriesJobs = (db.seriesJobs || []).filter(series => !ids.has(series.videoId));
+  db.usageEvents = (db.usageEvents || []).filter(event => !ids.has(event.videoId));
+  db.videos = (db.videos || []).filter(video => !ids.has(video.id));
+  db.projects = (db.projects || []).filter(project => db.videos.some(video => video.projectId === project.id) || db.clips.some(clip => db.videos.some(video => video.id === clip.videoId && video.projectId === project.id)));
+  db.imports = (db.imports || []).filter(item => db.videos.some(video => video.importId === item.id));
+  result.videosDeleted += videos.length;
+  result.jobsDeleted += beforeJobs - db.jobs.length;
+  result.transcriptionsDeleted += beforeTranscriptions - db.transcriptions.length;
+  result.seriesRowsDeleted += beforeSeriesParts - db.seriesParts.length;
+  return result;
+}
+
+function timestampMs(record = {}) {
+  for (const key of ['createdAt', 'completedAt', 'updatedAt', 'startedAt', 'publishedAt']) {
+    const value = Date.parse(record[key] || '');
+    if (Number.isFinite(value)) return value;
+  }
+  return 0;
+}
+
+function latestVideoAssetTime(db, video) {
+  const times = [timestampMs(video)];
+  for (const clip of (db.clips || []).filter(item => item.videoId === video.id)) times.push(timestampMs(clip));
+  for (const job of (db.jobs || []).filter(item => item.videoId === video.id && ['queued', 'running'].includes(item.status))) times.push(Date.now());
+  return Math.max(...times.filter(Boolean), 0);
+}
+
+function normalizeRetentionDays(value = STORAGE_RETENTION_DAYS) {
+  const days = Number(value);
+  if (!Number.isFinite(days)) return STORAGE_RETENTION_DAYS;
+  return Math.max(1, Math.min(365, days));
+}
+
+function sweepOldFiles(db, cutoffMs, result, { all = false } = {}) {
+  const refs = collectReferencedVideoAssetPaths(db);
+  const shouldDelete = (filePath, stat) => {
+    if (all) return true;
+    return stat.mtimeMs < cutoffMs && !refs.has(path.resolve(filePath));
+  };
+  for (const dir of VIDEO_STORAGE_DIRS) {
+    deleteMatchingFiles(dir, (_name, filePath, stat) => shouldDelete(filePath, stat), result);
+  }
+  deleteMatchingFiles(path.join(DATA_DIR, 'tmp'), (_name, _filePath, stat) => all || stat.mtimeMs < cutoffMs, result);
+}
+
+function recordStorageCleanupRun(db, result) {
+  if (!Array.isArray(db.storageCleanupRuns)) db.storageCleanupRuns = [];
+  db.storageCleanupRuns.unshift({
+    ...result,
+    bytesFreedMb: Math.round((result.bytesFreed / 1024 / 1024) * 100) / 100,
+  });
+  db.storageCleanupRuns = db.storageCleanupRuns.slice(0, 50);
+}
+
+function runStorageRetentionCleanup({ reason = 'retention', retentionDays = STORAGE_RETENTION_DAYS } = {}) {
+  const db = loadDb();
+  const result = cleanupResult(reason, 'retention');
+  const days = normalizeRetentionDays(retentionDays);
+  result.retentionDays = days;
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const activeVideoIds = new Set((db.jobs || []).filter(job => ['queued', 'running'].includes(job.status)).map(job => job.videoId));
+  const staleVideoIds = (db.videos || [])
+    .filter(video => !activeVideoIds.has(video.id) && latestVideoAssetTime(db, video) > 0 && latestVideoAssetTime(db, video) < cutoff)
+    .map(video => video.id);
+  cleanupVideoAssets(db, staleVideoIds, result);
+  const staleClipIds = (db.clips || [])
+    .filter(clip => timestampMs(clip) > 0 && timestampMs(clip) < cutoff)
+    .map(clip => clip.id);
+  cleanupClipAssets(db, staleClipIds, result);
+  sweepOldFiles(db, cutoff, result);
+  recordStorageCleanupRun(db, result);
+  saveDb(db);
+  return result;
+}
+
+function deleteAllVideoAssetsForAdmin({ reason = 'admin-delete-all-video-assets' } = {}) {
+  const db = loadDb();
+  const result = cleanupResult(reason, 'admin-delete-all-video-assets');
+  cleanupVideoAssets(db, (db.videos || []).map(video => video.id), result);
+  cleanupClipAssets(db, (db.clips || []).map(clip => clip.id), result);
+  sweepOldFiles(db, 0, result, { all: true });
+  result.jobsDeleted += (db.jobs || []).length;
+  db.videos = [];
+  db.clips = [];
+  db.jobs = [];
+  db.transcriptions = [];
+  db.seriesJobs = [];
+  db.seriesParts = [];
+  db.scheduledPosts = [];
+  db.projects = [];
+  db.imports = [];
+  db.importCache = [];
+  db.usageEvents = (db.usageEvents || []).filter(event => !event.videoId && !event.clipId);
+  recordStorageCleanupRun(db, result);
+  saveDb(db);
+  return result;
+}
+
+function videoStorageStats(db = loadDb()) {
+  const result = { files: 0, bytes: 0, bytesMb: 0, videos: (db.videos || []).length, clips: (db.clips || []).length, retentionDays: STORAGE_RETENTION_DAYS };
+  for (const dir of [...VIDEO_STORAGE_DIRS, path.join(DATA_DIR, 'tmp')]) {
+    for (const filePath of safeReaddir(dir, VIDEO_DELETE_ROOTS)) {
+      try {
+        const stat = statSync(filePath);
+        if (!stat.isFile()) continue;
+        result.files += 1;
+        result.bytes += stat.size;
+      } catch {}
+    }
+  }
+  result.bytesMb = Math.round((result.bytes / 1024 / 1024) * 100) / 100;
+  result.lastCleanup = (db.storageCleanupRuns || [])[0] || null;
+  return result;
 }
 
 // ─── Gemini transcription fallback (no Whisper key needed) ───────────────────
@@ -6081,34 +6417,10 @@ async function handleApi(req, res, pathname) {
       if (user.role !== 'admin' && video.userId !== user.id && video.createdBy !== user.id) {
         throw Object.assign(new Error('You do not have permission to delete this video.'), { status: 403 });
       }
-      for (const videoJob of db.jobs.filter(j => j.videoId === video.id)) {
-        killActiveJobProcesses(videoJob.id);
-      }
-      cancelQueuedRenderJobsForVideo(video.id);
-      // Delete source file from disk
-      if (video.storagePath) unlinkQuiet(video.storagePath);
-      // Delete all clips and their files that belong to this video
-      const videoClips = db.clips.filter(c => c.videoId === video.id);
-      const deletedClipIds = new Set(videoClips.map(c => c.id));
-      for (const clip of videoClips) {
-        if (clip.outputPath) unlinkQuiet(path.join(STORAGE_DIR, 'clips', path.basename(clip.outputPath)));
-        if (clip.thumbnailPath) unlinkQuiet(path.join(STORAGE_DIR, 'thumbs', path.basename(clip.thumbnailPath)));
-        // Also remove thumbnail options files
-        if (Array.isArray(clip.thumbnailOptions)) {
-          for (const opt of clip.thumbnailOptions) {
-            if (opt.path) unlinkQuiet(path.join(STORAGE_DIR, opt.path.replace('/media/', '')));
-          }
-        }
-      }
-      // Delete scheduled posts linked to these clips
-      db.scheduledPosts = (db.scheduledPosts || []).filter(p => !deletedClipIds.has(p.clipId));
-      // Remove from db
-      db.clips = db.clips.filter(c => c.videoId !== video.id);
-      db.jobs = db.jobs.filter(j => j.videoId !== video.id);
-      db.videos = db.videos.filter(v => v.id !== video.id);
-      db.projects = db.projects.filter(p => db.videos.some(v => v.projectId === p.id));
+      const cleanup = cleanupVideoAssets(db, [video.id], cleanupResult('user-delete-video', 'video-delete'));
+      recordStorageCleanupRun(db, cleanup);
       saveDb(db);
-      return json(res, 200, { deleted: true });
+      return json(res, 200, { deleted: true, cleanup });
     }
     if (pathname === '/api/clip/download' && req.method === 'GET') {
       // Authenticated clip download — checks ownership before serving
@@ -6142,23 +6454,18 @@ async function handleApi(req, res, pathname) {
       const db = loadDb();
       const user = requireUser(req, db);
       if (body.all) {
-        const userClips = db.clips.filter(c => c.userId === user.id);
-        for (const clip of userClips) {
-          if (clip.outputPath) unlinkQuiet(path.join(STORAGE_DIR, 'clips', path.basename(clip.outputPath)));
-          if (clip.thumbnailPath) unlinkQuiet(path.join(STORAGE_DIR, 'thumbs', path.basename(clip.thumbnailPath)));
-        }
-        const deleted = userClips.length;
-        db.clips = db.clips.filter(c => c.userId !== user.id);
+        const userClips = db.clips.filter(c => c.userId === user.id || c.createdBy === user.id);
+        const cleanup = cleanupClipAssets(db, userClips.map(clip => clip.id), cleanupResult('user-delete-all-clips', 'clip-delete'));
+        recordStorageCleanupRun(db, cleanup);
         saveDb(db);
-        return json(res, 200, { deleted: true, count: deleted });
+        return json(res, 200, { deleted: true, count: cleanup.clipsDeleted, cleanup });
       }
-      const clip = db.clips.find(c => c.id === body.clipId && c.userId === user.id);
+      const clip = db.clips.find(c => c.id === body.clipId && (c.userId === user.id || c.createdBy === user.id || user.role === 'admin'));
       if (!clip) throw new Error('Clip not found.');
-      if (clip.outputPath) unlinkQuiet(path.join(STORAGE_DIR, 'clips', path.basename(clip.outputPath)));
-      if (clip.thumbnailPath) unlinkQuiet(path.join(STORAGE_DIR, 'thumbs', path.basename(clip.thumbnailPath)));
-      db.clips = db.clips.filter(c => c.id !== body.clipId);
+      const cleanup = cleanupClipAssets(db, [clip.id], cleanupResult('user-delete-clip', 'clip-delete'));
+      recordStorageCleanupRun(db, cleanup);
       saveDb(db);
-      return json(res, 200, { deleted: true });
+      return json(res, 200, { deleted: true, cleanup });
     }
     if (pathname === '/api/clip' && req.method === 'PATCH') {
       const body = await readJson(req);
@@ -6514,6 +6821,38 @@ async function handleApi(req, res, pathname) {
         sizeBytes: stats ? stats.size : 0
       });
     }
+    if (pathname === '/api/admin/storage-cleanup') {
+      const db = loadDb();
+      const admin = requireAdmin(req, db);
+      if (req.method === 'GET') {
+        return json(res, 200, { stats: videoStorageStats(db), recent: (db.storageCleanupRuns || []).slice(0, 10) });
+      }
+      if (req.method !== 'POST') throw Object.assign(new Error('Unsupported method.'), { status: 405 });
+      const body = await readJson(req);
+      let result;
+      if (body.action === 'run-retention') {
+        result = runStorageRetentionCleanup({
+          reason: `admin-retention:${admin.id}`,
+          retentionDays: normalizeRetentionDays(body.retentionDays),
+        });
+      } else if (body.action === 'delete-all-video-assets') {
+        if (body.confirm !== 'DELETE VIDEO FILES') {
+          throw Object.assign(new Error('Type DELETE VIDEO FILES to confirm video asset deletion.'), { status: 400 });
+        }
+        result = deleteAllVideoAssetsForAdmin({ reason: `admin-delete-all:${admin.id}` });
+      } else {
+        throw new Error('Unsupported storage cleanup action.');
+      }
+      importLog('warn', 'Admin storage cleanup completed', {
+        adminId: admin.id,
+        action: body.action,
+        filesDeleted: result.filesDeleted,
+        bytesFreed: result.bytesFreed,
+        videosDeleted: result.videosDeleted,
+        clipsDeleted: result.clipsDeleted,
+      });
+      return json(res, 200, { result, stats: videoStorageStats() });
+    }
     if (pathname === '/api/admin/plans') {
       const db = loadDb();
       requireAdmin(req, db);
@@ -6735,6 +7074,27 @@ async function pollDueWatchedChannels() {
   }
 }
 
+function runStorageRetentionCleanupSafe(reason = 'interval') {
+  try {
+    const result = runStorageRetentionCleanup({ reason, retentionDays: STORAGE_RETENTION_DAYS });
+    if (result.filesDeleted || result.videosDeleted || result.clipsDeleted || result.errors.length) {
+      console.error('[storage-cleanup]', {
+        reason,
+        retentionDays: result.retentionDays,
+        filesDeleted: result.filesDeleted,
+        bytesFreed: result.bytesFreed,
+        videosDeleted: result.videosDeleted,
+        clipsDeleted: result.clipsDeleted,
+        errors: result.errors.length,
+      });
+    }
+    return result;
+  } catch (error) {
+    console.error('[storage-cleanup:failed]', { reason, error: String(error.message || error).slice(0, 800) });
+    return null;
+  }
+}
+
 const isMainModule = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (isMainModule && process.env.NODE_ENV !== 'test') {
@@ -6743,17 +7103,22 @@ if (isMainModule && process.env.NODE_ENV !== 'test') {
     await verifyMediaBinaries();
     recoverStaleJobs('startup');
     recoverQueuedSeriesJobs('startup');
+    runStorageRetentionCleanupSafe('startup');
     logMemory('startup');
     pollDueWatchedChannels().catch(() => {});
     setInterval(() => pollDueWatchedChannels().catch(() => {}), Number(process.env.WATCH_INTERVAL_MINUTES || 15) * 60 * 1000);
     setInterval(() => logMemory('heartbeat'), Number(process.env.MEMORY_LOG_INTERVAL_MS || 60_000));
     setInterval(() => recoverStaleJobs('interval'), 60_000);
+    setInterval(() => runStorageRetentionCleanupSafe('interval'), STORAGE_CLEANUP_INTERVAL_MS);
   });
 }
 
 export {
   buildTargetDurations,
   buildFullSeriesMoments,
+  cleanupClipAssets,
+  cleanupResult,
+  cleanupVideoAssets,
   chooseBestDownloadedMedia,
   fallbackMomentsForVideo,
   buildTranscriptReference,
@@ -6766,9 +7131,12 @@ export {
   parseFrameRate,
   parseVolumeStats,
   postProcessMoments,
+  resolveManagedDeletionPath,
+  runStorageRetentionCleanup,
   SOURCE_AUDIO_EXTRACTION_FAILED,
   SOURCE_AUDIO_PRESENT,
   SOURCE_HAS_NO_AUDIO,
   upsertSeriesPlan,
   userCanAccessMedia,
+  videoStorageStats,
 };
