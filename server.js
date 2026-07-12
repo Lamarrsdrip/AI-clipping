@@ -3222,14 +3222,17 @@ function buildPortraitFilter(srcW=1920, srcH=1080, outW=1080, outH=1920,
     if (suggestedFrac > 0.01 && !lowTrackingConfidence) {
       cropFrac = Math.max(suggestedFrac, minDynamicCropFrac);
     } else if (!hasFaces) {
-      // No face detected is the common case for animated/cartoon content, since
-      // face_track.py's detector is a human-face Haar cascade and rarely fires on
-      // stylized characters. 0.50 was leaving ~37% of the frame as blurred padding
-      // for what's usually a single centered subject. 0.42 matches the tightness
-      // already trusted elsewhere in this function for known multi-subject scenes
-      // (group/wide_shot), so it stays safe for wider compositions without a full
-      // content-aware detector, while meaningfully shrinking blur for the common case.
-      cropFrac = 0.42;
+      // Tried tightening this to 0.42 to reduce blur padding on single-character
+      // cartoon shots (common when face_track.py's human-face detector doesn't fire
+      // on stylized characters). Reverted after a live production re-render showed
+      // it cropping real content in scenes this function can't distinguish from that
+      // case without actual content-bounds detection: wide on-screen text/title
+      // cards clipped at both edges, and multi-character scenes with one character
+      // cut off at the frame boundary. Losing real content is worse than extra blur,
+      // so this stays at the safe (wider) default until real saliency/content-bounds
+      // detection exists to tell the two situations apart. See PR discussion for the
+      // before/after contact-sheet evidence.
+      cropFrac = 0.50;
     } else {
       switch (sceneType) {
         case 'group':          cropFrac = 0.50; break;

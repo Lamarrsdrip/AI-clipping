@@ -440,14 +440,16 @@ test('buildASSFile keeps caption events monotonic (no unexpected overlap)', () =
 });
 
 // ─── Framing: no-face-detected default should not waste ~37% of frame on blur ──
-test('buildPortraitFilter uses a tighter default crop for animated content with no detected face', () => {
-  // Real observed case: cartoon content where the human-face Haar cascade finds
-  // nothing. Previously defaulted to cropFrac=0.50 (~37% blurred padding); should
-  // now use 0.42, matching the tightness already trusted for known multi-subject
-  // scenes elsewhere in this function.
+test('buildPortraitFilter keeps the wider safe crop when no face is detected', () => {
+  // A tighter 0.42 default was tried here to reduce blur padding on single-character
+  // cartoon shots, but a live production re-render showed it cropping real content
+  // in scenes this function can't tell apart from that case without actual
+  // content-bounds detection: on-screen text/title cards clipped at both edges,
+  // and multi-character scenes with one character cut off at the frame edge.
+  // Reverted to 0.50 -- losing real content is worse than extra blur padding.
   const srcW = 1920, srcH = 1080, outW = 1080, outH = 1920;
   const result = buildPortraitFilter(srcW, srcH, outW, outH, 'center', 30, null, 'dynamic');
-  const expectedCropW = Math.max(2, Math.round(Math.min(srcW, 0.42 * srcW) / 2) * 2);
+  const expectedCropW = Math.max(2, Math.round(Math.min(srcW, 0.50 * srcW) / 2) * 2);
   assert.equal(result.cropW, expectedCropW);
 });
 
