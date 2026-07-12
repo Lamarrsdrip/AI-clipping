@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import {
+  assessCaptionSync,
   buildASSFile,
   buildFullSeriesMoments,
   buildLogoOverlay,
@@ -13,9 +14,13 @@ import {
   chooseBestDownloadedMedia,
   deoverlapCaptionSegments,
   estimateWordTimings,
+  parseYouTubeJson3,
   isProxyReachable,
   fallbackMomentsForVideo,
   buildTranscriptReference,
+  CAPTION_ALIGNMENT_LOW_CONFIDENCE,
+  CAPTION_SYNC_OFFSET_DETECTED,
+  CAPTION_SYNC_VALID,
   FINAL_AUDIO_MISSING,
   FINAL_AUDIO_SILENT,
   FINAL_AUDIO_VALID,
@@ -31,7 +36,26 @@ import {
   SOURCE_HAS_NO_AUDIO,
   upsertSeriesPlan,
   userCanAccessMedia,
+  WORD_TIMESTAMPS_MISSING,
 } from '../server.js';
+
+function assTimestampToSeconds(value) {
+  const [h, m, s] = String(value).split(':');
+  return Number(h) * 3600 + Number(m) * 60 + Number(s);
+}
+
+function parseAssEvents(ass) {
+  return ass.split('\n')
+    .filter(line => line.startsWith('Dialogue:'))
+    .map(line => {
+      const parts = line.split(',');
+      return {
+        start: assTimestampToSeconds(parts[1]),
+        end: assTimestampToSeconds(parts[2]),
+        text: parts.slice(9).join(','),
+      };
+    });
+}
 
 test('default long-video targets preserve 60, 90, and 120 second outputs', () => {
   assert.deepEqual(buildTargetDurations(900, 3, 60), [60, 90, 120]);
@@ -374,6 +398,40 @@ test('deoverlapCaptionSegments sorts out-of-order input and drops empty/invalid 
   assert.deepEqual(result.map(s => s.text), ['first', 'later']);
 });
 
+test('parseYouTubeJson3 preserves YouTube word offsets as source-global word timings', () => {
+  const raw = {
+    events: [
+      { tStartMs: 2480, dDurationMs: 5120, segs: [
+        { utf8: 'how' },
+        { utf8: ' much', tOffsetMs: 120 },
+        { utf8: ' time', tOffsetMs: 360 },
+        { utf8: ' I', tOffsetMs: 680 },
+        { utf8: ' have', tOffsetMs: 720 },
+        { utf8: ' to', tOffsetMs: 840 },
+        { utf8: ' set', tOffsetMs: 960 },
+        { utf8: ' aside', tOffsetMs: 1120 },
+      ] },
+      { tStartMs: 4870, dDurationMs: 2730, segs: [{ utf8: '\n' }] },
+      { tStartMs: 4880, dDurationMs: 4320, segs: [
+        { utf8: 'just' },
+        { utf8: ' to', tOffsetMs: 440 },
+        { utf8: ' clean.', tOffsetMs: 560 },
+      ] },
+    ],
+  };
+  const parsed = parseYouTubeJson3(raw);
+  assert.deepEqual(parsed.words.slice(0, 8).map(w => w.word), ['how', 'much', 'time', 'I', 'have', 'to', 'set', 'aside']);
+  assert.equal(Number(parsed.words[0].sourceStart.toFixed(2)), 2.48);
+  assert.equal(Number(parsed.words[1].sourceStart.toFixed(2)), 2.60);
+  assert.equal(Number(parsed.words[2].sourceStart.toFixed(2)), 2.84);
+  assert.equal(Number(parsed.words[7].sourceStart.toFixed(2)), 3.60);
+  assert.ok(parsed.words[0].sourceEnd <= parsed.words[1].sourceStart);
+  assert.ok(parsed.words.every(w => w.sourceEnd > w.sourceStart), 'every parsed word needs a real end time');
+  assert.ok(parsed.words.every(w => w.timingSource.startsWith('youtube-json3')), 'word cache must record its timing source');
+  assert.equal(parsed.segments.length, 2);
+  assert.equal(parsed.segments[0].end, 4.88);
+});
+
 // ─── Word-level timing bounds (Priority 1 validation subset) ──────────────
 test('estimateWordTimings never produces negative or out-of-clip timestamps', () => {
   const segments = [
@@ -404,19 +462,12 @@ test('buildASSFile never emits negative timestamps or timestamps beyond clip dur
     { word: 'this',  start: 9.8,  end: 10.5 }, // extends past a 10s clip
   ];
   const ass = buildASSFile(words, 0, 10, 'bold');
-  const dialogueLines = ass.split('\n').filter(l => l.startsWith('Dialogue:'));
-  assert.ok(dialogueLines.length > 0, 'expected at least one caption event');
-  for (const line of dialogueLines) {
-    const [, startStr, endStr] = line.split(',');
-    const toSeconds = (t) => {
-      const [h, m, s] = t.split(':');
-      return Number(h) * 3600 + Number(m) * 60 + Number(s);
-    };
-    const s = toSeconds(startStr);
-    const e = toSeconds(endStr);
-    assert.ok(s >= 0, `caption start must not be negative (got ${s})`);
-    assert.ok(e <= 10 + 0.05, `caption end must not exceed clip duration (got ${e})`);
-    assert.ok(e > s, 'caption end must be after start');
+  const events = parseAssEvents(ass);
+  assert.ok(events.length > 0, 'expected at least one caption event');
+  for (const event of events) {
+    assert.ok(event.start >= 0, `caption start must not be negative (got ${event.start})`);
+    assert.ok(event.end <= 10 + 0.05, `caption end must not exceed clip duration (got ${event.end})`);
+    assert.ok(event.end > event.start, 'caption end must be after start');
   }
 });
 
@@ -428,16 +479,80 @@ test('buildASSFile keeps caption events monotonic (no unexpected overlap)', () =
     { word: 'd', start: 2.0, end: 2.3 },
   ];
   const ass = buildASSFile(words, 0, 5, 'bold');
-  const starts = ass.split('\n')
-    .filter(l => l.startsWith('Dialogue:'))
-    .map(l => {
-      const [, , startStr] = l.split(',');
-      const [h, m, s] = startStr.split(':');
-      return Number(h) * 3600 + Number(m) * 60 + Number(s);
-    });
+  const starts = parseAssEvents(ass).map(event => event.start);
   for (let i = 1; i < starts.length; i++) {
     assert.ok(starts[i] >= starts[i - 1], 'caption event start times must be monotonic');
   }
+});
+
+test('buildASSFile keeps a phrase visible until a long spoken word actually ends', () => {
+  const words = [
+    { word: 'alpha', start: 0.00, end: 0.30 },
+    { word: 'stretch', start: 0.30, end: 1.35 },
+    { word: 'omega', start: 1.36, end: 1.70 },
+  ];
+  const ass = buildASSFile(words, 0, 3, 'bold');
+  const stretchEvent = parseAssEvents(ass).find(event => event.start >= 0.29 && event.start <= 0.31);
+  assert.ok(stretchEvent, 'expected an event beginning at the real "stretch" word timestamp');
+  assert.ok(stretchEvent.end >= 1.34, `caption must not disappear before the long word ends (got ${stretchEvent.end}s)`);
+});
+
+test('buildASSFile starts the phrase at the first word and lasts through the final word', () => {
+  const words = [
+    { word: 'cleaning', start: 5.20, end: 5.55 },
+    { word: 'is', start: 5.56, end: 5.68 },
+    { word: 'work', start: 5.70, end: 6.05 },
+  ];
+  const events = parseAssEvents(buildASSFile(words, 0, 8, 'bold'));
+  assert.ok(events.length >= 3);
+  assert.equal(events[0].start, 5.20);
+  assert.ok(Math.max(...events.map(event => event.end)) >= 6.04, 'phrase must remain visible through the final word');
+  assert.ok(Math.max(...events.map(event => event.end)) <= 6.14, 'readability tail should stay tiny');
+});
+
+test('buildASSFile readability tail never overlaps the next spoken phrase', () => {
+  const words = [
+    { word: 'hello', start: 0.00, end: 0.25 },
+    { word: 'done.', start: 0.25, end: 1.00 },
+    { word: 'next', start: 1.05, end: 1.30 },
+    { word: 'thought', start: 1.30, end: 1.60 },
+  ];
+  const firstPhraseEvents = parseAssEvents(buildASSFile(words, 0, 3, 'bold'))
+    .filter(event => event.start < 1.05);
+  assert.ok(firstPhraseEvents.length >= 2);
+  assert.ok(firstPhraseEvents.every(event => event.end <= 1.061), 'tail must be clipped at the next phrase start');
+});
+
+test('assessCaptionSync marks estimated timing as low-confidence instead of valid word alignment', () => {
+  const result = assessCaptionSync([
+    { word: 'estimated', start: 0.0, end: 0.4, timingSource: 'estimated-segment' },
+    { word: 'words', start: 0.4, end: 0.8, timingSource: 'estimated-segment' },
+  ], { outputDuration: 1 });
+  assert.equal(result.status, CAPTION_ALIGNMENT_LOW_CONFIDENCE);
+  assert.equal(result.valid, true);
+  assert.equal(result.estimatedWordCount, 2);
+});
+
+test('assessCaptionSync accepts real word-level timing and rejects impossible offsets', () => {
+  const valid = assessCaptionSync([
+    { word: 'real', start: 0.0, end: 0.2, timingSource: 'youtube-json3-word-offset' },
+    { word: 'timing', start: 0.2, end: 0.6, timingSource: 'youtube-json3-word-offset' },
+  ], { outputDuration: 1 });
+  assert.equal(valid.status, CAPTION_SYNC_VALID);
+  assert.equal(valid.valid, true);
+
+  const invalid = assessCaptionSync([
+    { word: 'bad', start: -0.4, end: 0.2, timingSource: 'youtube-json3-word-offset' },
+  ], { outputDuration: 1 });
+  assert.equal(invalid.status, CAPTION_SYNC_OFFSET_DETECTED);
+  assert.equal(invalid.valid, false);
+  assert.equal(invalid.fatal, true);
+});
+
+test('assessCaptionSync records missing word timestamps without pretending alignment exists', () => {
+  const result = assessCaptionSync([], { outputDuration: 1 });
+  assert.equal(result.status, WORD_TIMESTAMPS_MISSING);
+  assert.equal(result.confidence, 'missing');
 });
 
 // ─── Framing: no-face-detected default should not waste ~37% of frame on blur ──

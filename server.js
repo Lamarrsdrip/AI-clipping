@@ -737,6 +737,12 @@ const SOURCE_AUDIO_EXTRACTION_FAILED = 'SOURCE_AUDIO_EXTRACTION_FAILED';
 const FINAL_AUDIO_VALID = 'FINAL_AUDIO_VALID';
 const FINAL_AUDIO_SILENT = 'FINAL_AUDIO_SILENT';
 const FINAL_AUDIO_MISSING = 'FINAL_AUDIO_MISSING';
+const CAPTION_SYNC_VALID = 'CAPTION_SYNC_VALID';
+const CAPTION_SYNC_OFFSET_DETECTED = 'CAPTION_SYNC_OFFSET_DETECTED';
+const CAPTION_SYNC_DRIFT_DETECTED = 'CAPTION_SYNC_DRIFT_DETECTED';
+const WORD_TIMESTAMPS_MISSING = 'WORD_TIMESTAMPS_MISSING';
+const CAPTION_ALIGNMENT_LOW_CONFIDENCE = 'CAPTION_ALIGNMENT_LOW_CONFIDENCE';
+const STALE_CAPTION_DATA = 'STALE_CAPTION_DATA';
 
 function hasPathSeparator(value = '') {
   return /[\\/]/.test(String(value));
@@ -2301,11 +2307,24 @@ async function transcribeAudioWithWhisper(db, mediaPath, videoId) {
         end:   offsetSeconds + Number(seg.end   || seg.start + 2),
         text:  String(seg.text  || '').trim()
       })).filter(seg => seg.text),
-      words: (data.words || []).map(w => ({
-        word:  String(w.word  || '').trim(),
-        start: offsetSeconds + Number(w.start || 0),
-        end:   offsetSeconds + Number(w.end   || w.start + 0.15)
-      })).filter(w => w.word)
+      words: (data.words || []).map((w, wordIndex) => {
+        const word = String(w.word || '').trim();
+        const sourceStart = offsetSeconds + Number(w.start || 0);
+        const sourceEnd = offsetSeconds + Number(w.end || w.start + 0.15);
+        return {
+          id: `whisper_${Math.round(offsetSeconds * 1000)}_${wordIndex}`,
+          word,
+          text: word,
+          start: sourceStart,
+          end: sourceEnd,
+          sourceStart,
+          sourceEnd,
+          confidence: Number.isFinite(Number(w.confidence)) ? Number(w.confidence) : null,
+          segmentId: null,
+          speakerId: null,
+          timingSource: 'whisper-word',
+        };
+      }).filter(w => w.word && Number.isFinite(w.sourceStart))
     };
   }
 
@@ -2337,8 +2356,7 @@ async function transcribeAudioWithWhisper(db, mediaPath, videoId) {
     }
 
     if (wordData.length) {
-      const wordCachePath = path.join(STORAGE_DIR, 'originals', `${videoId}_words.json`);
-      try { writeFileSync(wordCachePath, JSON.stringify({ words: wordData }, null, 2)); } catch {}
+      writeWordCacheForVideo({ id: videoId }, wordData);
     }
     importLog('log', 'Whisper transcription succeeded', { videoId, chunks: chunks.length, segments: segs.length, words: wordData.length });
     return segs;
@@ -2370,11 +2388,142 @@ function deoverlapCaptionSegments(segments) {
   return sorted;
 }
 
+function cleanCaptionWord(value = '') {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function estimateSpokenWordDuration(word = '') {
+  const clean = cleanCaptionWord(word).replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+  const letters = Math.max(1, clean.length);
+  const base = 0.12 + letters * 0.035;
+  const punctuationTail = /[.!?]$/.test(String(word).trim()) ? 0.08 : 0;
+  return Math.max(0.14, Math.min(0.72, base + punctuationTail));
+}
+
+function normalizeWordTiming(word, index = 0) {
+  const text = cleanCaptionWord(word.word || word.text || '');
+  const sourceStart = Number.isFinite(Number(word.sourceStart)) ? Number(word.sourceStart) : Number(word.start);
+  const sourceEnd = Number.isFinite(Number(word.sourceEnd)) ? Number(word.sourceEnd) : Number(word.end);
+  if (!text || !Number.isFinite(sourceStart)) return null;
+  const end = Number.isFinite(sourceEnd) && sourceEnd > sourceStart
+    ? sourceEnd
+    : sourceStart + estimateSpokenWordDuration(text);
+  return {
+    id: word.id || `word_${index}`,
+    word: text,
+    text,
+    start: sourceStart,
+    end,
+    sourceStart,
+    sourceEnd: end,
+    confidence: Number.isFinite(Number(word.confidence)) ? Number(word.confidence) : null,
+    segmentId: word.segmentId ?? null,
+    speakerId: word.speakerId ?? null,
+    timingSource: word.timingSource || word.source || 'unknown',
+  };
+}
+
+function finalizeWordEndTimes(words = []) {
+  const sorted = words
+    .map((word, index) => normalizeWordTiming(word, index))
+    .filter(Boolean)
+    .sort((a, b) => a.sourceStart - b.sourceStart);
+  const out = [];
+  for (let i = 0; i < sorted.length; i += 1) {
+    const current = sorted[i];
+    const previous = out[out.length - 1];
+    if (previous && Math.abs(previous.sourceStart - current.sourceStart) < 0.015 && previous.word.toLowerCase() === current.word.toLowerCase()) {
+      continue;
+    }
+    const next = sorted[i + 1];
+    const naturalEnd = current.sourceStart + estimateSpokenWordDuration(current.word);
+    let sourceEnd = current.sourceEnd;
+    if (next && Number.isFinite(next.sourceStart) && next.sourceStart > current.sourceStart) {
+      const gapToNext = next.sourceStart - current.sourceStart;
+      sourceEnd = gapToNext <= 1.15
+        ? next.sourceStart
+        : Math.min(next.sourceStart - 0.03, naturalEnd);
+    } else if (!sourceEnd || sourceEnd <= current.sourceStart) {
+      sourceEnd = naturalEnd;
+    }
+    sourceEnd = Math.max(current.sourceStart + 0.04, sourceEnd);
+    out.push({
+      ...current,
+      end: sourceEnd,
+      sourceEnd,
+    });
+  }
+  return out;
+}
+
+function parseYouTubeJson3(raw) {
+  const events = Array.isArray(raw?.events) ? raw.events : [];
+  const rawSegments = [];
+  const rawWords = [];
+  events.forEach((event, eventIndex) => {
+    if (!Array.isArray(event.segs) || !Number.isFinite(event.tStartMs)) return;
+    const text = event.segs.map(seg => seg.utf8 || '').join('').replace(/\s+/g, ' ').trim();
+    if (!text) return;
+    const start = Number(event.tStartMs) / 1000;
+    const end = (Number(event.tStartMs) + Number(event.dDurationMs || 2000)) / 1000;
+    rawSegments.push({ id: `ytseg_${eventIndex}`, start, end, sourceStart: start, sourceEnd: end, text });
+    event.segs.forEach((seg, segIndex) => {
+      const word = cleanCaptionWord(seg.utf8 || '');
+      if (!word) return;
+      const sourceStart = (Number(event.tStartMs) + Number(seg.tOffsetMs || 0)) / 1000;
+      rawWords.push({
+        id: `ytw_${eventIndex}_${segIndex}`,
+        word,
+        text: word,
+        start: sourceStart,
+        sourceStart,
+        segmentId: `ytseg_${eventIndex}`,
+        speakerId: null,
+        confidence: null,
+        timingSource: Number.isFinite(seg.tOffsetMs) ? 'youtube-json3-word-offset' : 'youtube-json3-event-start',
+      });
+    });
+  });
+  return {
+    segments: deoverlapCaptionSegments(rawSegments),
+    words: finalizeWordEndTimes(rawWords),
+  };
+}
+
+function wordCachePathsForVideo(video = {}) {
+  return [
+    video.id ? path.join(STORAGE_DIR, 'originals', `${video.id}_words.json`) : '',
+    video.youtubeId ? path.join(STORAGE_DIR, 'originals', `${video.youtubeId}_words.json`) : '',
+  ].filter(Boolean);
+}
+
+function writeWordCacheForVideo(video, words = []) {
+  const normalized = finalizeWordEndTimes(words);
+  if (!normalized.length) return normalized;
+  for (const wordCachePath of wordCachePathsForVideo(video)) {
+    try {
+      writeFileSync(wordCachePath, JSON.stringify({
+        schema: 'clipforge-word-timeline-v1',
+        timingModel: 'source-global',
+        words: normalized,
+      }, null, 2));
+    } catch {}
+  }
+  return normalized;
+}
+
 async function getTranscript(video, mediaPath) {
   const transcriptPath = path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.transcript.json`);
   if (existsSync(transcriptPath)) {
     const cached = JSON.parse(readFileSync(transcriptPath, 'utf8'));
     if (Array.isArray(cached.segments) && cached.segments.length) {
+      const json3Path = path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.en.json3`);
+      if (existsSync(json3Path) && !wordCachePathsForVideo(video).some(wordPath => existsSync(wordPath))) {
+        try {
+          const parsed = parseYouTubeJson3(JSON.parse(readFileSync(json3Path, 'utf8')));
+          writeWordCacheForVideo(video, parsed.words);
+        } catch {}
+      }
       // Re-run deoverlap even on cached data: caches written before this fix still
       // carry YouTube's raw overlapping rolling-caption windows.
       return deoverlapCaptionSegments(cached.segments);
@@ -2402,16 +2551,8 @@ async function getTranscript(video, mediaPath) {
   const possible = (await readdir(path.join(STORAGE_DIR, 'originals'))).find(file => file.startsWith(video.youtubeId) && file.endsWith('.json3'));
   if (possible) {
     const raw = JSON.parse(readFileSync(path.join(STORAGE_DIR, 'originals', possible), 'utf8'));
-    const events = raw.events || [];
-    const rawSegments = events
-      .filter(event => event.segs?.length && Number.isFinite(event.tStartMs))
-      .map(event => ({
-        start: event.tStartMs / 1000,
-        end: (event.tStartMs + (event.dDurationMs || 2000)) / 1000,
-        text: event.segs.map(seg => seg.utf8).join('').replace(/\s+/g, ' ').trim()
-      }))
-      .filter(seg => seg.text);
-    const segments = deoverlapCaptionSegments(rawSegments);
+    const { segments, words } = parseYouTubeJson3(raw);
+    writeWordCacheForVideo(video, words);
     writeFileSync(transcriptPath, JSON.stringify({ segments }, null, 2));
     return segments;
   }
@@ -2753,20 +2894,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
   if (!cw.length) return header;
 
-  // Build caption events — karaoke-style word-by-word highlighting.
+  // Build caption events -- karaoke-style word-by-word highlighting.
   //
   // Caption sync rules:
-  //   • Speed-aware chunking: fast speech → fewer words per phrase, slow → more
-  //   • Gap-based phrase break: silence > GAP_BREAK forces a new phrase
-  //   • Seamless hand-off: highlighted word ends exactly when next word begins
-  //   • Hard cap on per-word highlight: prevents stuck captions from bad Whisper ts
-  //   • 60ms gap enforced between phrases: prevents bleed-through
+  //   - Grouping is visual only; it never invents a display duration.
+  //   - Each phrase starts when its first aligned word starts.
+  //   - Each phrase remains visible until its last aligned word ends.
+  //   - A tiny readability tail is clipped at the next phrase boundary.
+  //   - Highlight hand-off follows the next aligned word timestamp.
 
-  // Timing constants — professional creator standard
-  const LINGER       = 0.04;   // 40ms hold after last spoken word then hard cut
-  const MAX_WORD_DUR = 0.42;   // cap any single-word highlight (prevents stuck captions)
-  const PHRASE_GAP   = 0.03;   // 30ms gap enforced between adjacent phrases
-  const PAUSE_BREAK  = 0.22;   // 220ms silence forces a phrase boundary
+  // Timing constants -- phrase lifetime is tied to the aligned words, not a timer.
+  const READABILITY_TAIL = 0.08; // <= 80ms, clipped before next spoken phrase
+  const PAUSE_BREAK      = 0.22; // 220ms silence forces a phrase boundary
   const SENT_END     = /[.!?,;:]$/;
 
   // ── Emotional / high-impact word detection ────────────────────
@@ -2815,18 +2954,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     i += phrase.length;
   }
 
-  // Enforce strict inter-phrase gap
-  for (let pi = 0; pi < phrases.length - 1; pi++) {
-    const lastW    = phrases[pi][phrases[pi].length - 1];
-    const nextStart = phrases[pi + 1][0].rs;
-    if (lastW.re > nextStart - PHRASE_GAP) {
-      lastW.re = Math.max(lastW.rs + 0.03, nextStart - PHRASE_GAP);
-    }
-  }
-
   // ── Build ASS dialogue events ─────────────────────────────────
   // Each event = one word's highlight window showing the full phrase.
-  // Phrase lifetime: first word start → last word end + LINGER (then instant cut).
+  // Phrase lifetime: first word start → last word end (+ tiny tail only if it does
+  // not overlap the next phrase). Visual grouping never changes the timing truth.
   // Instant cut (fad out = 0) = tight sync, no caption overhang.
   const emphSzBig  = Math.round(p.size * 1.14);  // emphasis current word: 14% bigger
   const emphSzCtx  = Math.round(p.size * 0.88);  // emphasis non-current: 12% smaller
@@ -2837,8 +2968,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     const phraseS = phrase[0].rs;
     const lastW   = phrase[phrase.length - 1];
     const phraseE = Math.min(
-      lastW.re + LINGER,
-      pi < phrases.length - 1 ? phrases[pi + 1][0].rs - PHRASE_GAP : lastW.re + LINGER
+      lastW.re + READABILITY_TAIL,
+      pi < phrases.length - 1 ? phrases[pi + 1][0].rs : lastW.re + READABILITY_TAIL,
+      dur
     );
     if (phraseE <= phraseS + 0.01) continue;
 
@@ -2851,7 +2983,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       let   evtE = nxtW
         ? Math.min(phraseE, Math.max(w.re, nxtW.rs))
         : phraseE;
-      evtE = Math.min(evtE, evtS + MAX_WORD_DUR);
       if (evtE <= evtS + 0.01) continue;
 
       const parts = phrase.map((pw, j) => {
@@ -2876,6 +3007,99 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     }
   }
   return header + events.join('\n') + '\n';
+}
+
+function assessCaptionSync(words = [], options = {}) {
+  const enabled = options.enabled !== false;
+  if (!enabled) {
+    return {
+      enabled: false,
+      valid: true,
+      fatal: false,
+      status: CAPTION_SYNC_VALID,
+      confidence: 'disabled',
+      wordCount: 0,
+      estimatedWordCount: 0,
+      timingSources: [],
+      issues: [],
+      reason: 'Generated captions are disabled for this render.',
+    };
+  }
+
+  const outputDuration = Math.max(0, Number(options.outputDuration || 0));
+  const sorted = (words || [])
+    .map((word, index) => ({
+      index,
+      word: cleanCaptionWord(word.word || word.text || ''),
+      start: Number(word.start),
+      end: Number(word.end),
+      timingSource: word.timingSource || word.source || 'unknown',
+    }))
+    .filter(word => word.word && Number.isFinite(word.start) && Number.isFinite(word.end))
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+
+  if (!sorted.length) {
+    return {
+      enabled: true,
+      valid: true,
+      fatal: false,
+      status: WORD_TIMESTAMPS_MISSING,
+      confidence: 'missing',
+      wordCount: 0,
+      estimatedWordCount: 0,
+      timingSources: [],
+      issues: [WORD_TIMESTAMPS_MISSING],
+      reason: 'No usable word timestamps were available; generated captions may be omitted.',
+    };
+  }
+
+  const issues = [];
+  let status = CAPTION_SYNC_VALID;
+  let fatal = false;
+  let previous = null;
+  for (const word of sorted) {
+    if (word.start < -0.01) {
+      issues.push(`${CAPTION_SYNC_OFFSET_DETECTED}: negative word start ${word.start.toFixed(3)}s for "${word.word}"`);
+      status = CAPTION_SYNC_OFFSET_DETECTED;
+      fatal = true;
+    }
+    if (outputDuration && word.end > outputDuration + 0.10) {
+      issues.push(`${CAPTION_SYNC_OFFSET_DETECTED}: word "${word.word}" ends after output duration (${word.end.toFixed(3)}s > ${outputDuration.toFixed(3)}s)`);
+      status = CAPTION_SYNC_OFFSET_DETECTED;
+      fatal = true;
+    }
+    if (word.end <= word.start) {
+      issues.push(`${CAPTION_SYNC_OFFSET_DETECTED}: non-positive word duration for "${word.word}"`);
+      status = CAPTION_SYNC_OFFSET_DETECTED;
+      fatal = true;
+    }
+    if (previous && word.start + 0.02 < previous.start) {
+      issues.push(`${CAPTION_SYNC_DRIFT_DETECTED}: word timeline moved backwards near "${word.word}"`);
+      status = CAPTION_SYNC_DRIFT_DETECTED;
+      fatal = true;
+    }
+    previous = word;
+  }
+
+  const timingSources = [...new Set(sorted.map(word => word.timingSource))].sort();
+  const estimatedWordCount = sorted.filter(word => /^estimated-|unknown$/.test(String(word.timingSource || 'unknown'))).length;
+  if (!fatal && estimatedWordCount > 0) {
+    status = CAPTION_ALIGNMENT_LOW_CONFIDENCE;
+    issues.push(`${CAPTION_ALIGNMENT_LOW_CONFIDENCE}: ${estimatedWordCount} of ${sorted.length} words use estimated timing.`);
+  }
+
+  return {
+    enabled: true,
+    valid: !fatal,
+    fatal,
+    status,
+    confidence: status === CAPTION_SYNC_VALID ? 'word' : 'low',
+    wordCount: sorted.length,
+    estimatedWordCount,
+    timingSources,
+    issues,
+    reason: issues[0] || 'Caption timing uses aligned word timestamps.',
+  };
 }
 
 // ─── Transcript post-processing ──────────────────────────────────
@@ -2921,7 +3145,19 @@ function estimateWordTimings(segments, clipStart, clipEnd) {
     let t = s;
     ws.forEach((w, i) => {
       const d = useNatural ? naturalDur : (1 / WORDS_PER_SEC);
-      words.push({ word: w, start: t, end: Math.min(e, t + d) });
+      const sourceEnd = Math.min(e, t + d);
+      words.push({
+        word: w,
+        text: w,
+        start: t,
+        end: sourceEnd,
+        sourceStart: t,
+        sourceEnd,
+        confidence: null,
+        segmentId: seg.id || null,
+        speakerId: seg.speakerId || null,
+        timingSource: 'estimated-segment',
+      });
       t += d;
     });
   }
@@ -2934,7 +3170,18 @@ function remapWordTimings(words, edlSegs) {
   for (const seg of edlSegs) {
     const segDur = seg.end - seg.start;
     words.filter(w => w.start >= seg.start && w.end <= seg.end + 0.05).forEach(w => {
-      mapped.push({ word:w.word, start:out+(w.start-seg.start), end:out+(w.end-seg.start) });
+      mapped.push({
+        word: w.word,
+        text: w.text || w.word,
+        start: out + (w.start - seg.start),
+        end: out + (w.end - seg.start),
+        sourceStart: w.sourceStart ?? w.start,
+        sourceEnd: w.sourceEnd ?? w.end,
+        confidence: w.confidence ?? null,
+        segmentId: w.segmentId ?? null,
+        speakerId: w.speakerId ?? null,
+        timingSource: w.timingSource || w.source || 'unknown',
+      });
     });
     out += segDur;
   }
@@ -3701,16 +3948,14 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   // ── Stage 1: Word timings ─────────────────────────────────────
   // Try both possible cache key formats (video.id, video.youtubeId)
   let wordTimings = [];
-  const wordCacheCandidates = [
-    path.join(STORAGE_DIR, 'originals', `${video.id}_words.json`),
-    path.join(STORAGE_DIR, 'originals', `${video.youtubeId || ''}_words.json`),
-  ].filter((p, i, a) => p && a.indexOf(p) === i); // deduplicate
+  const wordCacheCandidates = wordCachePathsForVideo(video).filter((p, i, a) => p && a.indexOf(p) === i);
 
   for (const wordCache of wordCacheCandidates) {
     if (existsSync(wordCache)) {
       try {
         const cached = JSON.parse(readFileSync(wordCache, 'utf8'));
-        const cands  = (cached.words || []).filter(w => w.end > moment.start && w.start < moment.end);
+        const cands  = finalizeWordEndTimes(cached.words || [])
+          .filter(w => w.sourceEnd > moment.start && w.sourceStart < moment.end);
         if (cands.length) { wordTimings = cands; break; }
       } catch {}
     }
@@ -3725,7 +3970,22 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     const words = cleanTranscriptText(moment.text).split(/\s+/).filter(Boolean);
     const dur   = moment.end - moment.start;
     const wd    = dur / Math.max(1, words.length);
-    wordTimings = words.map((w, i) => ({ word:w, start:moment.start+i*wd, end:moment.start+(i+1)*wd }));
+    wordTimings = words.map((w, i) => {
+      const sourceStart = moment.start + i * wd;
+      const sourceEnd = moment.start + (i + 1) * wd;
+      return {
+        word: w,
+        text: w,
+        start: sourceStart,
+        end: sourceEnd,
+        sourceStart,
+        sourceEnd,
+        confidence: null,
+        segmentId: null,
+        speakerId: null,
+        timingSource: 'estimated-moment-text',
+      };
+    });
   }
 
   // ── Stage 2: Source dimensions + face tracking + stereo analysis
@@ -3781,7 +4041,18 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   // ── Stage 5: ASS word-level captions ─────────────────────────
   const assWords = useEDL
     ? remapWordTimings(wordTimings, edlSegs)
-    : wordTimings.map(w => ({ word:w.word, start:w.start-effectiveStart, end:w.end-effectiveStart }));
+    : wordTimings.map(w => ({
+        word: w.word,
+        text: w.text || w.word,
+        start: w.start - effectiveStart,
+        end: w.end - effectiveStart,
+        sourceStart: w.sourceStart ?? w.start,
+        sourceEnd: w.sourceEnd ?? w.end,
+        confidence: w.confidence ?? null,
+        segmentId: w.segmentId ?? null,
+        speakerId: w.speakerId ?? null,
+        timingSource: w.timingSource || w.source || 'unknown',
+      }));
   const totalOutDur = useEDL
     ? edlSegs.reduce((s, seg) => s + seg.end - seg.start, 0)
     : moment.end - effectiveStart;
@@ -3790,6 +4061,13 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   const faceCyAvg = kfCyVals.length ? kfCyVals.reduce((s, v) => s + v, 0) / kfCyVals.length : null;
 
   const shouldRenderGeneratedCaptions = !['none', 'source'].includes(captionMode);
+  const captionSync = assessCaptionSync(assWords, { enabled: shouldRenderGeneratedCaptions, outputDuration: totalOutDur });
+  if (captionSync.fatal) {
+    throw new Error(`Caption sync failed validation: ${captionSync.issues.join('; ')}`);
+  }
+  if (captionSync.status !== CAPTION_SYNC_VALID) {
+    console.warn('[render:caption-sync]', { clipId, status: captionSync.status, reason: captionSync.reason, sources: captionSync.timingSources });
+  }
   const assContent = shouldRenderGeneratedCaptions ? buildASSFile(assWords, 0, totalOutDur, captionPreset, RW, RH, faceCyAvg) : '';
   let hasASS = false;
   try {
@@ -4000,6 +4278,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   const thumbnailOptions = await generateThumbnailOptions(clipId, output, hook, title, canDT);
   const postingData      = await generatePostingAssistant(db, video, { ...moment, hook }, 'TikTok');
   const intelligence     = buildViralIntelligence(video, moment, hook, index);
+  const renderIssues     = [...quality.issues, ...(captionSync.issues || [])];
 
   return {
     id: clipId,
@@ -4026,8 +4305,11 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
     thumbnailOptions,
     platform,
     renderQuality:  quality.scores,
-    renderIssues:   quality.issues,
+    renderIssues,
     audioStatus:    quality.audio,
+    captionStatus:  captionSync.status,
+    captionSyncStatus: captionSync.status,
+    captionSync,
     wordCount:      wordTimings.length,
     blackTrimmed:   blackOffset > 0.05,
     silencesRemoved: silences.length,
@@ -7212,6 +7494,8 @@ export {
   cleanupVideoAssets,
   chooseBestDownloadedMedia,
   deoverlapCaptionSegments,
+  parseYouTubeJson3,
+  assessCaptionSync,
   estimateWordTimings,
   isProxyReachable,
   fallbackMomentsForVideo,
@@ -7219,6 +7503,12 @@ export {
   FINAL_AUDIO_MISSING,
   FINAL_AUDIO_SILENT,
   FINAL_AUDIO_VALID,
+  CAPTION_ALIGNMENT_LOW_CONFIDENCE,
+  CAPTION_SYNC_DRIFT_DETECTED,
+  CAPTION_SYNC_OFFSET_DETECTED,
+  CAPTION_SYNC_VALID,
+  STALE_CAPTION_DATA,
+  WORD_TIMESTAMPS_MISSING,
   isEffectivelySilent,
   momentsAreDiverse,
   overlapRatio,
