@@ -2383,10 +2383,21 @@ async function getTranscript(video, mediaPath) {
   try {
     const ytdlpCommand = await workingYtDlpCommand();
     if (ytdlpCommand) {
-      await run(ytdlpCommand, [...(await ytDlpBaseArgs()), '--skip-download', '--write-auto-subs', '--sub-lang', 'en', '--sub-format', 'json3', '-o', path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.%(ext)s`), video.url]);
+      // Was a raw run() call with none of the reliability layers below -- so the main
+      // video download could succeed (via client fallback / cookies / proxy tunnel)
+      // while this, a completely separate request, got bot-blocked on its own and
+      // failed silently, leaving a real video with zero captions and no visible error.
+      // Route it through the same fallback chain as every other yt-dlp call.
+      await runYtDlpWithClientFallback(ytdlpCommand, ['--skip-download', '--write-auto-subs', '--sub-lang', 'en', '--sub-format', 'json3', '-o', path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.%(ext)s`), video.url]);
     }
-  } catch {
-    // Keep the pipeline provider-neutral. LLM calls analyze transcripts; audio transcription is configured separately.
+  } catch (error) {
+    // Auto-captions are best-effort (LLM calls analyze transcripts too, and audio
+    // transcription is configured separately) -- but log why, instead of silently
+    // producing a video with no captions and no trace of the reason.
+    importLog('warn', 'auto-caption fetch failed, proceeding without a transcript', {
+      videoId: video.youtubeId,
+      raw: String(error?.message || error).slice(0, 400)
+    });
   }
   const possible = (await readdir(path.join(STORAGE_DIR, 'originals'))).find(file => file.startsWith(video.youtubeId) && file.endsWith('.json3'));
   if (possible) {
