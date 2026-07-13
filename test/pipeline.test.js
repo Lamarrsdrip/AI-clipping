@@ -12,6 +12,7 @@ import {
   cleanupResult,
   cleanupVideoAssets,
   chooseBestDownloadedMedia,
+  chooseNaturalBoundary,
   clipCaptionWordsToRenderWindow,
   deoverlapCaptionSegments,
   estimateWordTimings,
@@ -26,7 +27,9 @@ import {
   FINAL_AUDIO_SILENT,
   FINAL_AUDIO_VALID,
   isEffectivelySilent,
+  minPartDuration,
   momentsAreDiverse,
+  momentsFromPersistedSeriesPlan,
   overlapRatio,
   parseFrameRate,
   parseVolumeStats,
@@ -37,6 +40,7 @@ import {
   SOURCE_HAS_NO_AUDIO,
   upsertSeriesPlan,
   userCanAccessMedia,
+  validateSeriesPlan,
   WORD_TIMESTAMPS_MISSING,
 } from '../server.js';
 
@@ -616,5 +620,126 @@ test('isProxyReachable resolves true when something is actually listening', asyn
     assert.equal(reachable, true);
   } finally {
     server.close();
+  }
+});
+
+/* ── Full Series repair regression tests ─────────────────────────── */
+
+test('minPartDuration never drops below the 30s hard floor regardless of target/adjustment', () => {
+  assert.equal(minPartDuration(30, 15), 30);
+  assert.equal(minPartDuration(10, 20), 30);
+  assert.ok(minPartDuration(60, 15) >= 30 && minPartDuration(60, 15) <= 60);
+  assert.ok(minPartDuration(90, 15) >= 30 && minPartDuration(90, 15) <= 60);
+});
+
+test('chooseNaturalBoundary never returns a boundary closer than the minimum duration from cursor', () => {
+  const boundaries = [40, 300]; // a boundary candidate sits well inside the forbidden zone
+  const { time } = chooseNaturalBoundary(0, 90, 600, boundaries, 15, 60);
+  assert.ok(time >= 60, `boundary ${time} must respect the 60s floor, not snap to the 40s candidate`);
+});
+
+test('full video series never produces a part below the minimum duration except a merged final remainder', () => {
+  const transcript = Array.from({ length: 80 }, (_, i) => ({ start: i * 8, end: i * 8 + 8, text: `Beat ${i}.` }));
+  const parts = buildFullSeriesMoments(
+    { id: 'video-min-dur', title: 'Minimum duration audit', durationSeconds: 605 },
+    transcript,
+    { seriesId: 'series-min-dur', partDuration: 90, boundaryAdjustmentSeconds: 15 },
+  );
+  const minDuration = minPartDuration(90, 15);
+  parts.forEach((p, i) => {
+    if (i === parts.length - 1) return; // only the final part may be short
+    assert.ok(p.duration >= minDuration, `part ${p.partNumber} duration ${p.duration} below minimum ${minDuration}`);
+  });
+});
+
+test('a tiny trailing remainder is merged into the previous part instead of becoming its own sub-minimum part', () => {
+  // 601s source at a 120s target leaves a ~1s remainder after 5 full parts — must merge, not spawn Part 6.
+  const transcript = [{ start: 0, end: 601, text: 'One long continuous scene.' }];
+  const parts = buildFullSeriesMoments(
+    { id: 'video-remainder', title: 'Remainder audit', durationSeconds: 601 },
+    transcript,
+    { seriesId: 'series-remainder', partDuration: 120, boundaryAdjustmentSeconds: 15 },
+  );
+  assert.equal(parts.at(-1).sourceEnd, 601);
+  assert.ok(parts.at(-1).mergedFinal || parts.at(-1).duration >= minPartDuration(120, 15));
+  assert.ok(parts.every(p => p.duration >= 30), 'no part should ever be a stray few-second clip');
+});
+
+test('validateSeriesPlan accepts a chronologically continuous plan that reaches the source end', () => {
+  const parts = buildFullSeriesMoments(
+    { id: 'video-valid', title: 'Valid plan', durationSeconds: 400 },
+    Array.from({ length: 30 }, (_, i) => ({ start: i * 13.3, end: i * 13.3 + 13.3, text: `Line ${i}.` })),
+    { seriesId: 'series-valid', partDuration: 100, boundaryAdjustmentSeconds: 15 },
+  );
+  const result = validateSeriesPlan(parts, 0, 400, minPartDuration(100, 15));
+  assert.equal(result.valid, true);
+  assert.equal(result.status, 'SERIES_PLAN_VALID');
+  assert.equal(result.issues.length, 0);
+});
+
+test('validateSeriesPlan rejects a plan with a timeline gap', () => {
+  const parts = [
+    { partNumber: 1, sourceStart: 0, sourceEnd: 90, duration: 90 },
+    { partNumber: 2, sourceStart: 95, sourceEnd: 180, duration: 85 }, // 5s gap
+  ];
+  const result = validateSeriesPlan(parts, 0, 180, 30);
+  assert.equal(result.valid, false);
+  assert.equal(result.status, 'SERIES_GAP_DETECTED');
+  assert.ok(result.issues.some(i => i.includes('SERIES_GAP_DETECTED')));
+});
+
+test('validateSeriesPlan rejects a plan with unintended overlap', () => {
+  const parts = [
+    { partNumber: 1, sourceStart: 0, sourceEnd: 90, duration: 90 },
+    { partNumber: 2, sourceStart: 80, sourceEnd: 180, duration: 100 }, // 10s overlap
+  ];
+  const result = validateSeriesPlan(parts, 0, 180, 30);
+  assert.equal(result.valid, false);
+  assert.equal(result.status, 'SERIES_OVERLAP_DETECTED');
+});
+
+test('validateSeriesPlan rejects duplicate and out-of-order part numbers', () => {
+  const parts = [
+    { partNumber: 1, sourceStart: 0, sourceEnd: 90, duration: 90 },
+    { partNumber: 1, sourceStart: 90, sourceEnd: 180, duration: 90 },
+  ];
+  const result = validateSeriesPlan(parts, 0, 180, 30);
+  assert.equal(result.valid, false);
+  assert.ok(result.issues.some(i => i.includes('Duplicate partNumber')));
+});
+
+test('validateSeriesPlan rejects a plan that does not reach the source end', () => {
+  const parts = [
+    { partNumber: 1, sourceStart: 0, sourceEnd: 90, duration: 90 },
+    { partNumber: 2, sourceStart: 90, sourceEnd: 150, duration: 60 },
+  ];
+  const result = validateSeriesPlan(parts, 0, 200, 30); // source is 200s but plan stops at 150
+  assert.equal(result.valid, false);
+  assert.ok(result.issues.some(i => i.includes('not source end')));
+});
+
+test('momentsFromPersistedSeriesPlan reproduces the exact committed boundaries — a retry can never drift', () => {
+  const originalTranscript = Array.from({ length: 40 }, (_, i) => ({ start: i * 15, end: i * 15 + 15, text: `Original ${i}.` }));
+  const originalParts = buildFullSeriesMoments(
+    { id: 'video-drift', title: 'Drift audit', durationSeconds: 600 },
+    originalTranscript,
+    { seriesId: 'series-drift', partDuration: 120, boundaryAdjustmentSeconds: 15 },
+  );
+  const db = { seriesJobs: [], seriesParts: [] };
+  upsertSeriesPlan(db, { seriesId: 'series-drift', jobId: 'job-1', videoId: 'video-drift', userId: 'u1', parts: originalParts, targetPartDuration: 120 });
+
+  // Simulate a re-transcription on retry that would, on its own, produce different natural
+  // boundaries (different sentence lengths / different candidate boundary set entirely).
+  const differentTranscript = Array.from({ length: 12 }, (_, i) => ({ start: i * 50, end: i * 50 + 50, text: `Reworded ${i}.` }));
+  const rebuilt = momentsFromPersistedSeriesPlan(db.seriesParts, { id: 'video-drift', title: 'Drift audit' }, differentTranscript);
+
+  assert.equal(rebuilt.length, originalParts.length);
+  rebuilt.forEach((part, i) => {
+    assert.equal(part.sourceStart, originalParts[i].sourceStart, `part ${i + 1} sourceStart drifted on retry`);
+    assert.equal(part.sourceEnd, originalParts[i].sourceEnd, `part ${i + 1} sourceEnd drifted on retry`);
+  });
+  // Continuity must still hold on the reconstructed plan.
+  for (let i = 1; i < rebuilt.length; i += 1) {
+    assert.equal(rebuilt[i].sourceStart, rebuilt[i - 1].sourceEnd);
   }
 });

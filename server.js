@@ -597,10 +597,19 @@ function recoverStaleJobs(reason = 'startup') {
     const startedAt = Date.parse(job.startedAt || 0) || created;
     // A queued/running job that hasn't been updated in JOB_STALE_MS is stale
     const isStaleByUpdate = now - last > JOB_STALE_MS;
+    // Full Series jobs legitimately run for as long as totalParts * per-part-render-time —
+    // a 10-part series at ~5 real minutes per part is 50+ minutes of genuine, healthy work,
+    // and each completed part refreshes `updatedAt`. The flat 30-minute runtime cap and the
+    // ~22-minute creation-age cap below were tuned for short Viral Clips jobs; applying them
+    // to series jobs killed real, actively-progressing renders (reproduced during testing: a
+    // job that had successfully rendered 4 of 8 parts was killed here mid-part-5 even though
+    // it was still making progress). Series jobs rely on isStaleByUpdate alone — no activity
+    // for JOB_STALE_MS is still a genuine hang and gets caught.
+    const isSeriesJob = ['series', 'full_series', 'full-video-series'].includes(String(job.payload?.workflowMode || '').toLowerCase());
     // A running job that has been running for > 30 minutes is definitely stuck
-    const isStaleByRuntime = job.status === 'running' && now - startedAt > JOB_RUNNING_MAX_MS;
+    const isStaleByRuntime = !isSeriesJob && job.status === 'running' && now - startedAt > JOB_RUNNING_MAX_MS;
     // A job created longer ago than PROCESS_TIMEOUT_MS + JOB_STALE_MS with no activity
-    const isStaleByCreation = now - created > PROCESS_TIMEOUT_MS + JOB_STALE_MS;
+    const isStaleByCreation = !isSeriesJob && now - created > PROCESS_TIMEOUT_MS + JOB_STALE_MS;
     if (isStaleByUpdate || isStaleByRuntime || isStaleByCreation) {
       job.status = 'failed';
       job.progress = 100;
@@ -3292,10 +3301,53 @@ function buildEDL(words, silences, clipStart, clipEnd, blackOffset) {
 
 // ─── Pipeline Stage 4: Camera Director ───────────────────────────
 async function probeVideoDims(mediaPath) {
-  const result = await run(FFMPEG, ['-i', mediaPath, '-f', 'null', '-'],
-    { label:'probe-dims', timeoutMs:15_000 }).catch(e => ({ stderr: e.message||'' }));
-  const m = result.stderr.match(/(\d{3,5})x(\d{3,5})/);
-  return m ? { w:parseInt(m[1]), h:parseInt(m[2]) } : { w:1920, h:1080 };
+  // ffprobe reads container/stream metadata only — near-instant regardless of video
+  // length. The previous implementation ran `ffmpeg -f null -`, which fully decodes the
+  // entire file just to read its dimensions from the stderr banner; on longer sources
+  // (exactly what Full Series targets) that routinely exceeded the 15s timeout, silently
+  // fell back to a hardcoded 1920x1080 guess, and corrupted every crop filter downstream
+  // whenever the real source wasn't actually that resolution.
+  try {
+    const { stdout } = await run(FFPROBE, [
+      '-v', 'error', '-select_streams', 'v:0',
+      '-show_entries', 'stream=width,height',
+      '-of', 'csv=s=x:p=0', mediaPath
+    ], { label: 'probe-dims', timeoutMs: 15_000 });
+    const [w, h] = stdout.trim().split('x').map(Number);
+    if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) return { w, h };
+  } catch {}
+  return { w: 1920, h: 1080 };
+}
+
+// ─── HDR detection + tone-map-to-SDR ─────────────────────────────
+// Only ever applied when the source is actually flagged HDR (HLG/PQ transfer
+// characteristics) — never touches normal SDR input.
+async function detectHDR(mediaPath) {
+  try {
+    const { stdout } = await run(FFPROBE, [
+      '-v', 'error', '-select_streams', 'v:0',
+      '-show_entries', 'stream=color_transfer,color_primaries,color_space',
+      '-of', 'json', mediaPath
+    ], { label: 'probe-hdr', timeoutMs: 15_000 });
+    const stream = (JSON.parse(stdout || '{}').streams || [])[0] || {};
+    const transfer = String(stream.color_transfer || '').toLowerCase();
+    const isHDR = transfer.includes('smpte2084') || transfer.includes('arib-std-b67');
+    return { isHDR, transfer, primaries: stream.color_primaries || '', colorSpace: stream.color_space || '' };
+  } catch {
+    return { isHDR: false, transfer: '', primaries: '', colorSpace: '' };
+  }
+}
+
+let _tonemapFilterAvailable = null;
+async function tonemapFilterAvailable() {
+  if (_tonemapFilterAvailable !== null) return _tonemapFilterAvailable;
+  try {
+    const { stdout } = await run(FFMPEG, ['-hide_banner', '-filters'], { label: 'probe-filters', timeoutMs: 10_000 });
+    _tonemapFilterAvailable = /\bzscale\b/.test(stdout) && /\btonemap\b/.test(stdout);
+  } catch {
+    _tonemapFilterAvailable = false;
+  }
+  return _tonemapFilterAvailable;
 }
 
 async function mediaHasAudio(mediaPath) {
@@ -3757,6 +3809,47 @@ async function validateClipRender(outputPath, options = {}) {
       issues.push('Black frames at opening'); scores.framing -= 12;
     }
 
+    // Same check at the very end — catches render glitches that land a Full Series
+    // part (or any clip) on a black final frame, which reads as a broken cut to viewers.
+    if (videoDuration > 2.1) {
+      const rEnd = await run(FFMPEG, [
+        '-ss', String(Math.max(0, videoDuration - 2)), '-i', outputPath,
+        '-vf', 'blackdetect=d=0.03:pix_th=0.08', '-f', 'null', '-'
+      ], { label:'validate-black-end', timeoutMs:20_000 }).catch(e => ({ stderr:e.message||'' }));
+      if (/black_start/.test(rEnd.stderr) && !/black_end/.test(rEnd.stderr)) {
+        issues.push('Black frames at closing (clip ends on black)'); scores.framing -= 12;
+      }
+    }
+
+    // Frozen-frame check across the whole output — a stuck/frozen frame reads as a
+    // broken render, especially mid-timeline in a Full Series part.
+    const freeze = await run(FFMPEG, [
+      '-i', outputPath, '-vf', 'freezedetect=n=-30dB:d=1.0', '-an', '-f', 'null', '-'
+    ], { label:'validate-freeze', timeoutMs:30_000 }).catch(e => ({ stderr:e.message||'' }));
+    const freezeStarts = [...(freeze.stderr || '').matchAll(/freeze_start:([\d.]+)/g)].map(m => parseFloat(m[1]));
+    if (freezeStarts.length) {
+      issues.push(`Frozen frame(s) detected at ${freezeStarts.map(t => t.toFixed(1)).join(', ')}s`);
+      scores.stability -= 15;
+    }
+
+    // Duration-range check: catches exactly the class of bug where the declared/planned
+    // window is normal but the actual rendered output collapses to a few seconds (e.g. a
+    // silence/EDL pipeline over-cutting a part). Only enforced when the caller supplies
+    // an expected duration (series parts; optionally viral clips).
+    if (options.expectedDuration) {
+      const expected = Number(options.expectedDuration);
+      const minAllowed = Number(options.minDurationSeconds ?? Math.max(3, expected * 0.5));
+      const tolerance = Math.max(3, expected * 0.15);
+      if (videoDuration > 0 && videoDuration < minAllowed) {
+        issues.push(`PART_DURATION_INVALID: rendered ${videoDuration.toFixed(1)}s vs expected ~${expected.toFixed(1)}s (below minimum ${minAllowed.toFixed(1)}s)`);
+        fatalIssues.push('PART_DURATION_INVALID');
+        scores.stability -= 40;
+      } else if (videoDuration > 0 && Math.abs(videoDuration - expected) > tolerance) {
+        issues.push(`Duration drift: rendered ${videoDuration.toFixed(1)}s vs expected ${expected.toFixed(1)}s`);
+        scores.stability -= 10;
+      }
+    }
+
     // Check file size is reasonable
     try {
       const stat = statSync(outputPath);
@@ -4016,15 +4109,28 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
 
   // ── Stage 2: Source dimensions + face tracking + stereo analysis
   const clipDuration = moment.end - moment.start;
-  const [{ w: srcW, h: srcH }, stereoSide, faceData, sourceAudioInfo] = await Promise.all([
+  const [{ w: srcW, h: srcH }, stereoSide, faceData, sourceAudioInfo, hdrInfo] = await Promise.all([
     probeVideoDims(mediaPath),
     detectSpeakerSide(mediaPath, moment.start, moment.end),
     trackFaces(mediaPath, moment.start, moment.end),
     video._sourceAudioInfo ? Promise.resolve(video._sourceAudioInfo) : inspectSourceAudio(mediaPath),
+    video._hdrInfo ? Promise.resolve(video._hdrInfo) : detectHDR(mediaPath),
   ]);
+  video._hdrInfo = hdrInfo;
   const hasSourceAudio = sourceAudioInfo.status === SOURCE_AUDIO_PRESENT;
   if (sourceAudioInfo.status === SOURCE_AUDIO_EXTRACTION_FAILED) {
     throw new Error(`${SOURCE_AUDIO_EXTRACTION_FAILED}: ${sourceAudioInfo.reason || 'Could not verify source audio.'}`);
+  }
+  let hdrTonemapFrag = '';
+  if (hdrInfo.isHDR) {
+    if (await tonemapFilterAvailable()) {
+      // Tone-map HLG/PQ -> linear -> BT.709 SDR before the sharpen/contrast pass, which
+      // assumes roughly SDR-range pixel values.
+      hdrTonemapFrag = ',zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p';
+      console.log('[render:hdr]', { clipId, transfer: hdrInfo.transfer, action: 'tone-mapped to SDR Rec.709' });
+    } else {
+      console.warn('[render:hdr]', { clipId, transfer: hdrInfo.transfer, action: 'HDR input detected but zscale/tonemap filters are unavailable on this FFmpeg build — rendering without tone-mapping' });
+    }
   }
   // Face tracking takes priority over stereo for speaker side
   const speakerSide = faceData?.speakerSide || stereoSide;
@@ -4045,8 +4151,17 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   const effectiveStart = moment.start + blackOffset;
 
   // ── Stage 4: Silence + filler removal (EDL) ──────────────────
-  const silences = await detectSilences(mediaPath, effectiveStart, moment.end);
-  const edlSegs  = buildEDL(wordTimings, silences, moment.start, moment.end, blackOffset);
+  // Full Series parts must preserve the complete, continuous story — silence/filler
+  // cutting is a Viral Clips punch-up technique only. Cutting "silence" out of a series
+  // part can strip legitimate non-speech content (b-roll, pauses, action beats) and, in
+  // the worst case where most of the window reads as silence, collapse the rendered
+  // output to a couple of surviving seconds even though the part's nominal window is
+  // 60-120s. Series parts always render as one uninterrupted segment.
+  const isSeriesPart = String(moment.workflowMode || '').toLowerCase() === 'series';
+  const silences = isSeriesPart ? [] : await detectSilences(mediaPath, effectiveStart, moment.end);
+  const edlSegs  = isSeriesPart
+    ? [{ start: effectiveStart, end: moment.end }]
+    : buildEDL(wordTimings, silences, moment.start, moment.end, blackOffset);
 
   // ── Stage 5b: Brand kit / logo ────────────────────────────────
   const brandKit = moment.brandKitId
@@ -4107,7 +4222,13 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   }
 
   // loudnorm: broadcast-standard loudness (-14 LUFS), prevents clipping
-  const audioF = 'acompressor=threshold=0.089:ratio=4:attack=5:release=50,loudnorm=I=-14:TP=-1.5:LRA=11';
+  // Anti-pop fade: 30ms in/out at the absolute output boundaries (the real cut points
+  // against the source). Never long enough to fade over speech.
+  const antiPopFadeSec = 0.03;
+  const antiPopFade = totalOutDur > antiPopFadeSec * 4
+    ? `,afade=t=in:st=0:d=${antiPopFadeSec},afade=t=out:st=${Math.max(0, totalOutDur - antiPopFadeSec).toFixed(3)}:d=${antiPopFadeSec}`
+    : '';
+  const audioF = `acompressor=threshold=0.089:ratio=4:attack=5:release=50,loudnorm=I=-14:TP=-1.5:LRA=11${antiPopFade}`;
   const encodeArgs = [
     '-c:v', 'libx264', '-preset', 'fast',
     '-crf', String(renderCfg.crf), '-maxrate', renderCfg.maxrate, '-bufsize', renderCfg.bufsize,
@@ -4116,7 +4237,7 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   ];
 
   // Quality enhancement: sharpen + subtle contrast/saturation lift for premium look
-  const qualityF = ',unsharp=5:5:0.7:3:3:0.3,eq=contrast=1.04:saturation=1.10:brightness=0.01';
+  const qualityF = `${hdrTonemapFrag},unsharp=5:5:0.7:3:3:0.3,eq=contrast=1.04:saturation=1.10:brightness=0.01`;
 
   // Build a crop+scale filter for a specific static X (used in EDL segments)
   function segFillFilter(cropX) {
@@ -4292,7 +4413,11 @@ async function renderClip(db, video, mediaPath, moment, index, jobId = '') {
   } catch {}
 
   // ── Stage 9: Quality validation ───────────────────────────────
-  const quality = await validateClipRender(output, { sourceAudioInfo });
+  const quality = await validateClipRender(output, {
+    sourceAudioInfo,
+    expectedDuration: isSeriesPart ? (moment.duration || (moment.end - moment.start)) : undefined,
+    minDurationSeconds: isSeriesPart ? 20 : undefined,
+  });
   if (quality.issues.length) console.warn('[render:quality-issues]', { clipId, issues: quality.issues, audio: quality.audio });
   if (!quality.valid) {
     unlinkQuiet(output);
@@ -4426,14 +4551,23 @@ function candidateBoundariesFromTranscript(segments = []) {
     .sort((a, b) => a - b);
 }
 
-function chooseNaturalBoundary(cursor, targetEnd, sourceEnd, boundaries = [], adjustment = 15) {
-  const min = Math.max(cursor + 8, targetEnd - adjustment);
+// Minimum viable part length: a hard floor of 30s, but for target durations that leave
+// room within the boundary-adjustment window we prefer 45-60s so a natural boundary
+// search has real options. Never below 30s regardless of how short the target/adjustment is.
+function minPartDuration(targetDuration, adjustment) {
+  return Math.max(30, Math.min(60, targetDuration - adjustment));
+}
+
+function chooseNaturalBoundary(cursor, targetEnd, sourceEnd, boundaries = [], adjustment = 15, minDuration = 30) {
+  const floor = cursor + minDuration;
+  const min = Math.max(floor, targetEnd - adjustment);
   const max = Math.min(sourceEnd, targetEnd + adjustment);
-  if (sourceEnd <= max) return sourceEnd;
+  if (sourceEnd <= max) return { time: sourceEnd, reason: 'reached source end' };
   const candidates = boundaries
-    .filter(t => t > cursor + 8 && t >= min && t <= max)
+    .filter(t => t >= floor && t >= min && t <= max)
     .sort((a, b) => Math.abs(a - targetEnd) - Math.abs(b - targetEnd));
-  return cleanBoundaryTime(candidates[0] ?? targetEnd, cursor + 8, sourceEnd);
+  if (candidates.length) return { time: cleanBoundaryTime(candidates[0], floor, sourceEnd), reason: 'sentence/transcript boundary near target' };
+  return { time: cleanBoundaryTime(targetEnd, floor, sourceEnd), reason: 'exact target duration (no natural boundary found)' };
 }
 
 function buildFullSeriesMoments(video, transcript = [], options = {}) {
@@ -4442,6 +4576,7 @@ function buildFullSeriesMoments(video, transcript = [], options = {}) {
   const targetDuration = Math.max(30, Math.min(600, Number(options.partDuration || options.clipLength || 90)));
   const adjustment = Math.max(0, Math.min(30, Number(options.boundaryAdjustmentSeconds ?? 15)));
   const contextOverlap = Math.max(0, Math.min(3, Number(options.contextOverlapSeconds || 0)));
+  const minDuration = minPartDuration(targetDuration, adjustment);
   const boundaries = candidateBoundariesFromTranscript(transcript);
   const seriesId = options.seriesId || randomUUID();
   const parts = [];
@@ -4450,24 +4585,34 @@ function buildFullSeriesMoments(video, transcript = [], options = {}) {
   while (cursor < sourceEnd - 0.5 && guard < 1000) {
     guard += 1;
     const targetEnd = Math.min(sourceEnd, cursor + targetDuration);
-    let end = chooseNaturalBoundary(cursor, targetEnd, sourceEnd, boundaries, adjustment);
-    if (sourceEnd - end > 0 && sourceEnd - end < Math.max(20, targetDuration * 0.35)) end = sourceEnd;
+    let { time: end, reason: boundaryReason } = chooseNaturalBoundary(cursor, targetEnd, sourceEnd, boundaries, adjustment, minDuration);
+    let mergedFinal = false;
+    // If what would remain after this boundary is too small to stand as its own valid
+    // part, absorb it into the current part instead of emitting a tiny trailing part.
+    if (sourceEnd - end > 0 && sourceEnd - end < minDuration) {
+      end = sourceEnd;
+      boundaryReason = 'reached source end (tiny remainder merged in)';
+      mergedFinal = true;
+    }
     const renderStart = Math.max(sourceStart, cursor - (parts.length ? contextOverlap : 0));
-    const text = transcript
-      .filter(seg => seg.end > renderStart && seg.start < end)
-      .map(seg => seg.text)
-      .join(' ')
-      .replace(/\s+/g, ' ')
-      .trim();
+    const partSegs = transcript.filter(seg => seg.end > renderStart && seg.start < end);
+    const text = partSegs.map(seg => seg.text).join(' ').replace(/\s+/g, ' ').trim();
+    const words = text.split(/\s+/).filter(Boolean);
     parts.push({
       start: renderStart,
       end,
       sourceStart: cursor,
       sourceEnd: end,
       duration: Math.max(0, end - renderStart),
+      targetDuration,
       contextOverlapSeconds: parts.length ? contextOverlap : 0,
+      overlapSeconds: parts.length ? contextOverlap : 0,
       score: 85,
       reason: 'full-series',
+      boundaryReason,
+      mergedFinal,
+      firstWord: words[0] || null,
+      lastWord: words.length ? words[words.length - 1] : null,
       hook: `Part ${parts.length + 1}`,
       title: `Part ${parts.length + 1}`,
       rationale: 'Chronological full-video series part with natural-boundary adjustment.',
@@ -4488,6 +4633,84 @@ function buildFullSeriesMoments(video, transcript = [], options = {}) {
   }));
 }
 
+// Rebuilds renderClip-ready "moment" objects from an already-committed series plan
+// (db.seriesParts rows) instead of recomputing boundaries. Used on retry and on
+// restart-resume so previously-rendered sibling parts' timestamps can never drift.
+function momentsFromPersistedSeriesPlan(seriesRows, video, transcript = []) {
+  const totalParts = seriesRows.length ? Math.max(...seriesRows.map(r => r.totalParts || seriesRows.length)) : 0;
+  return seriesRows.map(row => {
+    const renderStart = Math.max(0, Number(row.sourceStart) - Number(row.overlapSeconds || 0));
+    const text = transcript
+      .filter(seg => seg.end > renderStart && seg.start < row.sourceEnd)
+      .map(seg => seg.text)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return {
+      start: renderStart,
+      end: row.sourceEnd,
+      sourceStart: row.sourceStart,
+      sourceEnd: row.sourceEnd,
+      duration: row.duration,
+      targetDuration: row.targetDuration,
+      contextOverlapSeconds: row.overlapSeconds || 0,
+      overlapSeconds: row.overlapSeconds || 0,
+      score: 85,
+      reason: 'full-series',
+      boundaryReason: row.boundaryReason || 'persisted plan',
+      mergedFinal: Boolean(row.mergedFinal),
+      firstWord: row.firstWord || null,
+      lastWord: row.lastWord || null,
+      hook: `Part ${row.partNumber} of ${totalParts}`,
+      title: `Part ${row.partNumber} of ${totalParts}`,
+      rationale: 'Chronological full-video series part with natural-boundary adjustment.',
+      text: text || video.title || `Part ${row.partNumber}`,
+      workflowMode: 'series',
+      seriesId: row.seriesId,
+      partNumber: row.partNumber,
+      totalParts,
+    };
+  });
+}
+
+// Validates a full series plan BEFORE any rendering starts: chronological continuity,
+// no gaps/overlaps, no duplicate/out-of-order part numbers, no invalid durations, first
+// part starts at source start, final part reaches source end. Never silently repairs —
+// callers must log `issues` and reject the plan if `valid` is false.
+function validateSeriesPlan(parts, sourceStart, sourceEnd, minDuration) {
+  const issues = [];
+  const sorted = [...parts].sort((a, b) => a.partNumber - b.partNumber);
+  if (!sorted.length) issues.push('SERIES_PLAN_EMPTY: plan has no parts');
+  const seen = new Set();
+  let gapDetected = false;
+  let overlapDetected = false;
+  sorted.forEach((p, i) => {
+    if (seen.has(p.partNumber)) issues.push(`Duplicate partNumber ${p.partNumber}`);
+    seen.add(p.partNumber);
+    if (p.partNumber !== i + 1) issues.push(`Part numbering gap at index ${i}: expected ${i + 1}, got ${p.partNumber}`);
+    const dur = p.sourceEnd - p.sourceStart;
+    if (!(dur > 0)) issues.push(`Part ${p.partNumber}: non-positive duration (${dur.toFixed(2)}s)`);
+    if (p.sourceStart > p.sourceEnd) issues.push(`Part ${p.partNumber}: start > end`);
+    if (p.sourceEnd > sourceEnd + 0.5) issues.push(`Part ${p.partNumber}: end (${p.sourceEnd.toFixed(2)}) beyond source duration (${sourceEnd.toFixed(2)})`);
+    if (dur > 0 && dur < minDuration && i !== sorted.length - 1) issues.push(`PART_TOO_SHORT: part ${p.partNumber} is ${dur.toFixed(2)}s, below minimum ${minDuration}s`);
+  });
+  for (let i = 1; i < sorted.length; i += 1) {
+    const prev = sorted[i - 1];
+    const cur = sorted[i];
+    const delta = cur.sourceStart - prev.sourceEnd;
+    if (delta > 0.5) { gapDetected = true; issues.push(`SERIES_GAP_DETECTED: ${delta.toFixed(2)}s gap between part ${prev.partNumber} and part ${cur.partNumber}`); }
+    if (delta < -0.5) { overlapDetected = true; issues.push(`SERIES_OVERLAP_DETECTED: ${(-delta).toFixed(2)}s unintended overlap between part ${prev.partNumber} and part ${cur.partNumber}`); }
+  }
+  if (sorted.length && Math.abs(sorted[0].sourceStart - sourceStart) > 0.5) issues.push(`First part starts at ${sorted[0].sourceStart.toFixed(2)}s, not source start ${sourceStart.toFixed(2)}s`);
+  if (sorted.length && Math.abs(sorted[sorted.length - 1].sourceEnd - sourceEnd) > 1.0) issues.push(`Final part ends at ${sorted[sorted.length - 1].sourceEnd.toFixed(2)}s, not source end ${sourceEnd.toFixed(2)}s`);
+  let status = 'SERIES_PLAN_VALID';
+  if (issues.some(i => i.startsWith('SERIES_GAP_DETECTED'))) status = 'SERIES_GAP_DETECTED';
+  else if (issues.some(i => i.startsWith('SERIES_OVERLAP_DETECTED'))) status = 'SERIES_OVERLAP_DETECTED';
+  else if (issues.some(i => i.startsWith('PART_TOO_SHORT'))) status = 'PART_TOO_SHORT';
+  else if (issues.length) status = 'PART_DURATION_INVALID';
+  return { valid: issues.length === 0, status, issues, gapDetected, overlapDetected };
+}
+
 function upsertSeriesPlan(db, { seriesId, jobId, videoId, userId, parts, targetPartDuration }) {
   if (!Array.isArray(db.seriesJobs)) db.seriesJobs = [];
   if (!Array.isArray(db.seriesParts)) db.seriesParts = [];
@@ -4503,6 +4726,7 @@ function upsertSeriesPlan(db, { seriesId, jobId, videoId, userId, parts, targetP
       totalParts: parts.length,
       completedParts: 0,
       failedParts: 0,
+      planStatus: 'SERIES_PLAN_PENDING',
       createdAt: new Date().toISOString(),
     };
     db.seriesJobs.unshift(series);
@@ -4530,7 +4754,16 @@ function upsertSeriesPlan(db, { seriesId, jobId, videoId, userId, parts, targetP
         sourceStart: part.sourceStart,
         sourceEnd: part.sourceEnd,
         duration: part.duration,
+        targetDuration: part.targetDuration ?? targetPartDuration,
+        overlapSeconds: part.overlapSeconds || 0,
+        boundaryReason: part.boundaryReason || '',
+        mergedFinal: Boolean(part.mergedFinal),
+        firstWord: part.firstWord || null,
+        lastWord: part.lastWord || null,
+        previousSeriesPartId: null,
+        nextSeriesPartId: null,
         status: 'queued',
+        validationStatus: 'PENDING',
         clipId: '',
         outputPath: '',
         error: '',
@@ -4538,32 +4771,80 @@ function upsertSeriesPlan(db, { seriesId, jobId, videoId, userId, parts, targetP
       };
       db.seriesParts.push(row);
     } else {
+      // Once a part row exists, its boundary-defining fields are committed — a later
+      // upsert call (retry, resume, or a second call in the same run) must never shift
+      // them, or already-rendered sibling parts would no longer line up.
       Object.assign(row, {
         jobId,
-        totalParts: part.totalParts,
-        sourceStart: part.sourceStart,
-        sourceEnd: part.sourceEnd,
-        duration: part.duration,
+        totalParts: row.totalParts,
         updatedAt: new Date().toISOString(),
       });
     }
   }
+  // Chronological previous/next links between series-part rows (not clip ids — those
+  // are attached once each part actually finishes rendering), so the UI/plan validator
+  // can walk the timeline before every part has rendered.
+  const ordered = db.seriesParts.filter(item => item.seriesId === seriesId).sort((a, b) => a.partNumber - b.partNumber);
+  ordered.forEach((row, i) => {
+    row.previousSeriesPartId = ordered[i - 1]?.id || null;
+    row.nextSeriesPartId = ordered[i + 1]?.id || null;
+  });
   return series;
 }
 
 function updateSeriesPart(partId, patch) {
   const db = loadDb();
   const part = db.seriesParts?.find(item => item.id === partId);
-  if (part) Object.assign(part, patch, { updatedAt: new Date().toISOString() });
+  if (part) {
+    Object.assign(part, patch, { updatedAt: new Date().toISOString() });
+    if (patch.status === 'complete') part.validationStatus = 'PART_VALID';
+    else if (patch.status === 'failed') part.validationStatus = 'PART_RENDER_FAILED';
+  }
   const series = part ? db.seriesJobs?.find(item => item.id === part.seriesId) : null;
   if (series) {
     const rows = db.seriesParts.filter(item => item.seriesId === series.id);
     series.completedParts = rows.filter(item => item.status === 'complete').length;
     series.failedParts = rows.filter(item => item.status === 'failed').length;
     series.status = series.completedParts === series.totalParts ? 'complete' : series.failedParts ? 'partial_failed' : 'running';
+    // Re-validate the whole timeline once every part has rendered: confirms Part 1 starts
+    // at source start, every next part starts where the previous ended, and the final
+    // part reaches the source end — never mark SERIES_COMPLETE on ffmpeg exit codes alone.
+    if (series.status === 'complete') {
+      const video = db.videos?.find(item => item.id === series.videoId);
+      const finalCheck = validateSeriesPlan(rows, 0, Number(video?.durationSeconds || 0), minPartDuration(series.targetPartDuration || 90, 15));
+      series.planStatus = finalCheck.valid ? 'SERIES_COMPLETE' : finalCheck.status;
+      if (!finalCheck.valid) console.error('[series:final-validation-failed]', { seriesId: series.id, issues: finalCheck.issues });
+    }
     series.updatedAt = new Date().toISOString();
   }
   saveDb(db);
+}
+
+// Persists a single rendered clip into db.clips immediately, rather than waiting for the
+// whole batch/series to finish. Without this, a job that fails partway (e.g. Full Series
+// part 5 of 7 errors) would silently lose the already-rendered parts 1-4 — they'd exist as
+// files on disk with a completed db.seriesParts row, but never appear in the clip library,
+// because completeJobWithClips (which used to be the only place clips were persisted) is
+// never reached on a thrown error. Idempotent so re-running never duplicates a clip.
+function appendClipRecord(jobId, videoId, clip) {
+  const fresh = loadDb();
+  const freshVideo = fresh.videos.find(item => item.id === videoId);
+  if (!freshVideo) return;
+  if (fresh.clips.some(item => item.id === clip.id)) return;
+  const freshJob = fresh.jobs.find(item => item.id === jobId);
+  const clipUserId = freshVideo.userId || freshVideo.createdBy || freshJob?.userId || '';
+  const row = { ...clip, jobId, videoId, userId: clipUserId, status: 'ready' };
+  // Cross-link neighboring series parts by whatever's already landed in db.clips —
+  // parts don't always render in order (retry / regenerate-from-here / restart-resume),
+  // so link in both directions whenever a neighbor is already present.
+  if (row.seriesId && row.partNumber) {
+    const prevClip = fresh.clips.find(item => item.seriesId === row.seriesId && item.partNumber === row.partNumber - 1);
+    const nextClip = fresh.clips.find(item => item.seriesId === row.seriesId && item.partNumber === row.partNumber + 1);
+    if (prevClip) { row.previousPartId = prevClip.id; prevClip.nextPartId = row.id; }
+    if (nextClip) { row.nextPartId = nextClip.id; nextClip.previousPartId = row.id; }
+  }
+  fresh.clips.unshift(row);
+  saveDb(fresh);
 }
 
 function completeJobWithClips(jobId, videoId, clipRows) {
@@ -4578,7 +4859,8 @@ function completeJobWithClips(jobId, videoId, clipRows) {
   freshJob.steps = processingSteps(freshJob.stage, freshJob.progress);
   freshVideo.status = 'complete';
   const clipUserId = freshVideo.userId || freshVideo.createdBy || freshJob.userId || '';
-  fresh.clips.unshift(...clipRows.map(clip => ({ ...clip, jobId, videoId, userId: clipUserId, status: 'ready' })));
+  const existingIds = new Set(fresh.clips.map(item => item.id));
+  fresh.clips.unshift(...clipRows.filter(clip => !existingIds.has(clip.id)).map(clip => ({ ...clip, jobId, videoId, userId: clipUserId, status: 'ready' })));
   const watch = fresh.watchedChannels.find(item => item.id === freshVideo.watchedChannelId);
   if (watch?.autoSchedule && watch.platforms?.length) {
     let minuteOffset = 30;
@@ -4688,6 +4970,7 @@ function createQueuedProcessingJob(payload) {
       captionMode: payload.captionMode || 'auto',
       framingMode: payload.framingMode || 'dynamic',
       brandKitId: payload.brandKitId || null,
+      seriesId: payload.seriesId || null,
     },
     status: 'queued',
     progress: 1,
@@ -4720,6 +5003,11 @@ async function processVideo(payload) {
     brandKitId:  payload.brandKitId || null,
   };
   const isSeriesMode = clipOptions.workflowMode !== 'viral';
+  // Fixed as early as possible (before the job.payload is first persisted) so that a
+  // restart-resume or retry reads back the SAME seriesId from job.payload rather than
+  // minting a fresh one — which would otherwise orphan the already-persisted plan and
+  // completed parts, and rebuild a brand new series from scratch.
+  const seriesId = isSeriesMode ? (payload.seriesId || randomUUID()) : null;
   if (!rightsConfirmed) throw new Error('Confirm that you own this video or have permission to reuse it before processing.');
   if (fairUseMode && !String(transformationNote || '').trim()) {
     throw new Error('Fair-use/remix mode requires a commentary, reaction, education, or transformation note.');
@@ -4771,6 +5059,7 @@ async function processVideo(payload) {
       workflowMode: clipOptions.workflowMode,
       captionMode: clipOptions.captionMode,
       partDuration: clipOptions.partDuration,
+      seriesId,
     },
     error: '',
     startedAt: job.startedAt || new Date().toISOString(),
@@ -4804,33 +5093,56 @@ async function processVideo(payload) {
     }
     updateJob(job.id, { progress: 30, stage: 'transcribing', steps: processingSteps('transcribing', 30) });
     let transcript = [];
-    try {
-      if (video.sourceKind === 'upload') {
-        updateJob(job.id, { progress: 35, stage: 'transcribing audio with Whisper', steps: processingSteps('transcribing', 35) });
-        transcript = await transcribeAudioWithWhisper(db, mediaPath, video.id);
-        if (!transcript.length) updateJob(job.id, { progress: 44, stage: 'no transcript: using visual edit fallback', steps: processingSteps('transcribing', 44) });
-      } else {
-        transcript = await getTranscript(video, mediaPath);
+    // Transcribe the full source exactly once per video and reuse the cached segments on
+    // every subsequent run (retry, resume, or a second series job against the same source)
+    // instead of re-calling Whisper/Gemini each time — this both avoids cost/latency and
+    // avoids introducing timing drift into an already-committed series plan.
+    const cachedTranscript = (db.transcriptions || []).find(t => t.videoId === video.id);
+    if (cachedTranscript?.segments?.length) {
+      transcript = cachedTranscript.segments;
+      updateJob(job.id, { progress: 44, stage: 'reusing cached transcript', steps: processingSteps('transcribing', 44) });
+    } else {
+      try {
+        if (video.sourceKind === 'upload') {
+          updateJob(job.id, { progress: 35, stage: 'transcribing audio with Whisper', steps: processingSteps('transcribing', 35) });
+          transcript = await transcribeAudioWithWhisper(db, mediaPath, video.id);
+          if (!transcript.length) updateJob(job.id, { progress: 44, stage: 'no transcript: using visual edit fallback', steps: processingSteps('transcribing', 44) });
+        } else {
+          transcript = await getTranscript(video, mediaPath);
+        }
+      } catch (error) {
+        updateJob(job.id, { progress: 44, stage: 'no transcript: using visual edit fallback', steps: processingSteps('transcribing', 44) });
       }
-    } catch (error) {
-      updateJob(job.id, { progress: 44, stage: 'no transcript: using visual edit fallback', steps: processingSteps('transcribing', 44) });
+      if (transcript.length) saveTranscriptToDb(video.id, transcript);
     }
     if (transcript.length) {
-      saveTranscriptToDb(video.id, transcript);
       updateJob(job.id, { progress: 50, stage: 'extracting B-roll suggestions', steps: processingSteps('analysis', 50) });
       suggestBrollKeywords(db, transcript, video.title).catch(() => {});
     }
     updateJob(job.id, { progress: 58, stage: isSeriesMode ? 'planning full video series' : 'AI analysis — scoring viral moments', steps: processingSteps('analysis', 58) });
-    const seriesId = payload.seriesId || (isSeriesMode ? randomUUID() : null);
     const targetDurations = buildTargetDurations(video.durationSeconds, clipOptions.clipCount, clipOptions.clipLength);
-    const rawMoments = isSeriesMode
-      ? buildFullSeriesMoments(video, transcript, {
+    let rawMoments;
+    if (isSeriesMode) {
+      const existingRows = (db.seriesParts || [])
+        .filter(p => p.seriesId === seriesId)
+        .sort((a, b) => a.partNumber - b.partNumber);
+      if (existingRows.length) {
+        // A plan for this seriesId is already committed (retry-series-part or a
+        // restart-resume). The persisted boundaries are authoritative — recomputing
+        // them here could drift from whatever already-rendered sibling parts assumed,
+        // breaking the nextPart.sourceStart === previousPart.sourceEnd invariant.
+        rawMoments = momentsFromPersistedSeriesPlan(existingRows, video, transcript);
+        updateJob(job.id, { stage: 'resuming committed series plan' });
+      } else {
+        rawMoments = buildFullSeriesMoments(video, transcript, {
           seriesId,
           partDuration: clipOptions.partDuration,
           boundaryAdjustmentSeconds: 15,
           contextOverlapSeconds: Number(payload.contextOverlapSeconds || 0),
-        })
-      : transcript.length
+        });
+      }
+    } else {
+      rawMoments = transcript.length
         ? await detectViralMoments(db, video, transcript, {
             ...clipOptions,
             clipCount: clipOptions.clipCount,
@@ -4839,6 +5151,7 @@ async function processVideo(payload) {
             mediaPath,  // gives Gemini direct video access for superior analysis
           })
         : fallbackMomentsForVideo(video, { ...clipOptions, targetDurations });
+    }
     const moments = rawMoments.map(m => ({
       ...m,
       workflowMode: isSeriesMode ? 'series' : 'viral',
@@ -4849,6 +5162,15 @@ async function processVideo(payload) {
     if (!moments.length) throw new Error('Could not create a clipping window for this video.');
     let seriesRowsByPart = new Map();
     if (isSeriesMode) {
+      // Validate the complete plan BEFORE any part renders. A bad plan (gap, overlap,
+      // invalid duration, wrong numbering) must be rejected loudly here — never silently
+      // repaired, and never discovered only after partial rendering.
+      const planMinDuration = minPartDuration(clipOptions.partDuration, 15);
+      const planCheck = validateSeriesPlan(moments, 0, Number(video.durationSeconds || 0), planMinDuration);
+      if (!planCheck.valid) {
+        console.error('[series:plan-invalid]', { seriesId, videoId: video.id, status: planCheck.status, issues: planCheck.issues });
+        throw new Error(`Series plan rejected (${planCheck.status}): ${planCheck.issues.join('; ')}`);
+      }
       const seriesDb = loadDb();
       upsertSeriesPlan(seriesDb, {
         seriesId,
@@ -4858,6 +5180,8 @@ async function processVideo(payload) {
         parts: moments,
         targetPartDuration: clipOptions.partDuration,
       });
+      const seriesRow = seriesDb.seriesJobs.find(item => item.id === seriesId);
+      if (seriesRow) seriesRow.planStatus = planCheck.status;
       saveDb(seriesDb);
       seriesRowsByPart = new Map((seriesDb.seriesParts || [])
         .filter(part => part.seriesId === seriesId)
@@ -4877,7 +5201,11 @@ async function processVideo(payload) {
       });
       try {
         const clip = await renderClip(db, video, mediaPath, moments[i], i, job.id);
+        if (seriesPart) updateJob(job.id, { stage: `Validating Part ${i + 1} of ${moments.length}` });
         rendered.push(clip);
+        // Persist immediately — do not wait for the whole batch to finish. If a later
+        // part in this same run fails, this part must still show up in the library.
+        appendClipRecord(job.id, video.id, clip);
         if (seriesPart) updateSeriesPart(seriesPart.id, { status: 'complete', clipId: clip.id, outputPath: clip.outputPath, error: '' });
       } catch (error) {
         if (seriesPart) updateSeriesPart(seriesPart.id, { status: 'failed', error: String(error.message || error) });
@@ -4885,12 +5213,9 @@ async function processVideo(payload) {
       }
     }
     if (!rendered.length || rendered.some(clip => !clip.outputPath)) throw new Error('Rendering failed: no clips were saved.');
-    if (isSeriesMode) {
-      for (let i = 0; i < rendered.length; i += 1) {
-        rendered[i].previousPartId = rendered[i - 1]?.id || null;
-        rendered[i].nextPartId = rendered[i + 1]?.id || null;
-      }
-    }
+    // previousPartId/nextPartId are cross-linked incrementally in appendClipRecord as each
+    // part lands — that handles out-of-order renders (retry/regenerate-from-here/resume)
+    // correctly, which a simple pass over `rendered` (only this run's subset) would not.
 
     completeJobWithClips(job.id, video.id, rendered);
 
@@ -6802,6 +7127,58 @@ async function handleApi(req, res, pathname) {
         retry.catch(error => console.error('[series:part-retry-failed]', String(error.message || error).slice(0, 2000)));
         return json(res, 202, { queued: true, jobId: queued.id, seriesId: series.id, partNumber: part.partNumber, queueDepth: renderQueue.length, activeRenderJobs });
       }
+      if (body.action === 'regenerate-series-from') {
+        const fromPart = db.seriesParts?.find(item => item.id === body.partId || (item.seriesId === body.seriesId && item.partNumber === Number(body.partNumber)));
+        if (!fromPart) throw new Error('Series part not found.');
+        const series = db.seriesJobs?.find(item => item.id === fromPart.seriesId);
+        if (!series) throw new Error('Series not found.');
+        if (user.role !== 'admin' && series.userId !== user.id) throw Object.assign(new Error('You do not have access to this series.'), { status: 403 });
+        const video = db.videos.find(item => item.id === series.videoId);
+        if (!video) throw new Error('Video not found for series regenerate.');
+        const toRegenerate = db.seriesParts.filter(item => item.seriesId === series.id && item.partNumber >= fromPart.partNumber);
+        killActiveJobProcesses(job.id);
+        for (const part of toRegenerate) {
+          part.status = 'queued';
+          part.error = '';
+          part.updatedAt = new Date().toISOString();
+        }
+        const basePayload = job.payload || db.jobs.find(item => item.id === series.jobId)?.payload || {};
+        saveDb(db);
+        const queued = createQueuedProcessingJob({
+          ...basePayload,
+          videoId: video.id,
+          userId: user.role === 'admin' ? (video.userId || video.createdBy || user.id) : user.id,
+          rightsConfirmed: true,
+          workflowMode: 'series',
+          seriesId: series.id,
+          partDuration: series.targetPartDuration || basePayload.partDuration || basePayload.clipLength || 90,
+        });
+        const retry = enqueueRenderJob({ ...(queued.payload || basePayload), videoId: video.id, userId: queued.userId, jobId: queued.id, rightsConfirmed: true, workflowMode: 'series', seriesId: series.id });
+        retry.catch(error => console.error('[series:regenerate-from-failed]', String(error.message || error).slice(0, 2000)));
+        return json(res, 202, { queued: true, jobId: queued.id, seriesId: series.id, fromPartNumber: fromPart.partNumber, regeneratingParts: toRegenerate.length, queueDepth: renderQueue.length, activeRenderJobs });
+      }
+      if (body.action === 'cancel-series-remaining') {
+        const series = db.seriesJobs?.find(item => item.id === body.seriesId);
+        if (!series) throw new Error('Series not found.');
+        if (user.role !== 'admin' && series.userId !== user.id) throw Object.assign(new Error('You do not have access to this series.'), { status: 403 });
+        const killed = killActiveJobProcesses(job.id);
+        const remaining = db.seriesParts.filter(item => item.seriesId === series.id && !['complete', 'cancelled'].includes(item.status));
+        for (const part of remaining) {
+          part.status = 'cancelled';
+          part.error = 'Cancelled by user.';
+          part.updatedAt = new Date().toISOString();
+        }
+        if (remaining.length) series.status = 'partial_failed';
+        series.updatedAt = new Date().toISOString();
+        if (['running', 'queued'].includes(job.status)) {
+          job.status = 'failed';
+          job.stage = 'cancelled';
+          job.error = 'Remaining series parts cancelled by user.';
+          job.updatedAt = new Date().toISOString();
+        }
+        saveDb(db);
+        return json(res, 200, { cancelled: true, killed, cancelledParts: remaining.length });
+      }
       throw new Error('Unsupported job action.');
     }
     if (pathname === '/api/video' && req.method === 'DELETE') {
@@ -7320,6 +7697,75 @@ async function handleApi(req, res, pathname) {
       }
       return json(res, 200, { jobs: db.jobs });
     }
+    // ── Full Series timeline debugger ───────────────────────────────
+    // Surfaces the shared transcript + committed plan boundaries for a series job so a
+    // bad cut can be diagnosed: which rule chose each boundary, whether the timeline has
+    // gaps/overlaps, and (when the source file hasn't been cleaned up yet) sample frames
+    // and a waveform image right at each boundary.
+    if (pathname === '/api/admin/series-timeline' && req.method === 'GET') {
+      const db = loadDb();
+      requireAdmin(req, db);
+      const seriesId = new URL(req.url, `http://${req.headers.host}`).searchParams.get('seriesId');
+      const series = seriesId
+        ? db.seriesJobs.find(item => item.id === seriesId)
+        : null;
+      if (seriesId && !series) throw new Error('Series not found.');
+      if (!seriesId) {
+        return json(res, 200, {
+          seriesJobs: (db.seriesJobs || []).map(s => ({
+            ...s,
+            videoTitle: db.videos.find(v => v.id === s.videoId)?.title || 'Untitled video',
+          })),
+        });
+      }
+      const video = db.videos.find(item => item.id === series.videoId);
+      const parts = (db.seriesParts || [])
+        .filter(item => item.seriesId === seriesId)
+        .sort((a, b) => a.partNumber - b.partNumber);
+      const transcript = (db.transcriptions || []).find(item => item.videoId === series.videoId);
+      const boundaries = candidateBoundariesFromTranscript(transcript?.segments || []);
+      const validation = validateSeriesPlan(parts, 0, Number(video?.durationSeconds || 0), minPartDuration(series.targetPartDuration || 90, 15));
+      const sourceAvailable = Boolean(video?.storagePath && existsSync(video.storagePath));
+      return json(res, 200, {
+        series,
+        video: video ? { id: video.id, title: video.title, durationSeconds: video.durationSeconds, sourceAvailable } : null,
+        parts,
+        transcriptBoundaryCount: boundaries.length,
+        validation,
+      });
+    }
+    if (pathname === '/api/admin/series-timeline-frames' && req.method === 'POST') {
+      const body = await readJson(req);
+      const db = loadDb();
+      requireAdmin(req, db);
+      const series = db.seriesJobs.find(item => item.id === body.seriesId);
+      if (!series) throw new Error('Series not found.');
+      const video = db.videos.find(item => item.id === series.videoId);
+      if (!video) throw new Error('Video not found.');
+      if (!video.storagePath || !existsSync(video.storagePath)) {
+        return json(res, 200, { available: false, reason: 'Source file has been cleaned up after processing — frames can only be generated while the series is still active or recently failed.' });
+      }
+      const parts = (db.seriesParts || []).filter(item => item.seriesId === series.id).sort((a, b) => a.partNumber - b.partNumber);
+      const boundaryTimes = [0, ...parts.map(p => p.sourceEnd)].filter((t, i, a) => a.indexOf(t) === i);
+      const debugDir = path.join(STORAGE_DIR, 'thumbs');
+      const frames = [];
+      for (const t of boundaryTimes.slice(0, 12)) {
+        const frameFile = `debug_${series.id}_${Math.round(t * 100)}.jpg`;
+        const framePath = path.join(debugDir, frameFile);
+        try {
+          await run(FFMPEG, ['-y', '-ss', String(Math.max(0, t - 0.05)), '-i', video.storagePath, '-frames:v', '1', '-vf', 'scale=240:-1', '-q:v', '4', framePath], { timeoutMs: 15_000, label: 'debug-frame' });
+          if (existsSync(framePath)) frames.push({ t, url: `/media/thumbs/${frameFile}` });
+        } catch {}
+      }
+      const waveFile = `debug_wave_${series.id}.png`;
+      const wavePath = path.join(debugDir, waveFile);
+      let waveformUrl = null;
+      try {
+        await run(FFMPEG, ['-y', '-i', video.storagePath, '-filter_complex', 'showwavespic=s=1600x180:colors=#7c8cff', '-frames:v', '1', wavePath], { timeoutMs: 30_000, label: 'debug-waveform' });
+        if (existsSync(wavePath)) waveformUrl = `/media/thumbs/${waveFile}`;
+      } catch {}
+      return json(res, 200, { available: true, frames, waveformUrl, boundaryTimes });
+    }
     // ── Brand Kits ────────────────────────────────────────────────
     if (pathname === '/api/brand-kits' && req.method === 'GET') {
       const db = loadDb();
@@ -7551,4 +7997,9 @@ export {
   upsertSeriesPlan,
   userCanAccessMedia,
   videoStorageStats,
+  chooseNaturalBoundary,
+  minPartDuration,
+  momentsFromPersistedSeriesPlan,
+  validateClipRender,
+  validateSeriesPlan,
 };

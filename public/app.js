@@ -118,6 +118,7 @@ const state = {
   // Clips library state
   clipsSearch: '',
   clipsSort: 'newest',
+  autoPlayNextPart: true,
   clipsBulkSelected: new Set(),
   openMenuClipId: null,
   // Framing mode for new clips
@@ -1128,21 +1129,34 @@ function jobCard(j) {
   const steps = j.steps||[];
   const isFailed = j.status==='failed';
   const isActive = ['queued','running'].includes(j.status);
+  const isSeries = ['series','full_series','full-video-series'].includes(String(j.payload?.workflowMode||'').toLowerCase());
+  const seriesJob = isSeries ? (state.library.seriesJobs||[]).find(s=>s.jobId===j.id) : null;
+  const seriesParts = seriesJob ? (state.library.seriesParts||[]).filter(p=>p.seriesId===seriesJob.id).sort((a,b)=>a.partNumber-b.partNumber) : [];
   const actions = isFailed
     ? `<button data-retry-job="${j.id}" style="font-size:.78rem;padding:7px 14px">Retry</button><button class="ghost" data-delete-job="${j.id}" style="font-size:.78rem;padding:7px 12px">Delete</button>`
     : isActive ? `<button class="ghost" data-cancel-job="${j.id}" style="font-size:.78rem;padding:7px 12px">Cancel</button>` : '';
+  const seriesStatusIcon = { queued:'⏳', running:'⚙️', complete:'✓', failed:'✕', cancelled:'⊘' };
   return `<div class="job-card ${isFailed?'failed':isActive?'active':''}">
     <div class="job-head">
       <div>
         <b style="font-size:.9rem">${esc(vid?.title||'Video')}</b>
         <span style="margin-left:8px">${pill(j.stage||j.status, isFailed?'error':isActive?'warn':'ok')}</span>
+        ${seriesJob ? `<span style="margin-left:8px">${pill(`${seriesJob.completedParts||0}/${seriesJob.totalParts||0} parts`, 'ok')}</span>` : ''}
       </div>
-      <div class="action-row">${actions}</div>
+      <div class="action-row">
+        ${actions}
+        ${isSeries && isActive ? `<button class="ghost danger-btn" data-cancel-series-remaining="${seriesJob?.id||''}" data-series-job="${j.id}" style="font-size:.78rem;padding:7px 12px">Cancel remaining parts</button>` : ''}
+      </div>
     </div>
     ${j.status==='queued' && j.queuePosition?`<p class="muted" style="margin:4px 0 0;font-size:.78rem">Queued — waiting behind ${j.queuePosition-1} other${j.queuePosition-1===1?'':'s'}${j.queueActive?` (${j.queueActive} rendering now)`:''}</p>`:''}
     ${steps.length?`<div class="steps-row">${steps.map(s=>`<div class="step ${s.status}"><span></span><small>${esc(s.label)}</small></div>`).join('')}</div>`:''}
     ${isActive?`<div class="progress" style="margin-top:9px"><span style="width:${j.progress||0}%"></span></div>`:''}
     ${j.error?`<p class="error-text" style="margin-top:7px">${esc(j.error)}</p>`:''}
+    ${seriesParts.length ? `
+      <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">
+        ${seriesParts.map(p => `<span class="pill" title="${esc(p.error || p.boundaryReason || '')}" style="font-size:.72rem">${seriesStatusIcon[p.status]||'·'} Part ${p.partNumber}</span>`).join('')}
+      </div>
+    ` : ''}
   </div>`;
 }
 
@@ -1262,7 +1276,7 @@ function renderClipDetail() {
       <!-- Left: video + scores -->
       <section class="panel stack">
         <div class="phone-frame">
-          ${c.outputPath?`<video src="${clipUrl(c.outputPath)}" controls poster="${esc(clipUrl(c.thumbnailPath||''))}" playsinline></video>`:`<div class="demo-frame">${esc(c.hook)}</div>`}
+          ${c.outputPath?`<video id="clipDetailVideo" src="${clipUrl(c.outputPath)}" controls poster="${esc(clipUrl(c.thumbnailPath||''))}" playsinline></video>`:`<div class="demo-frame">${esc(c.hook)}</div>`}
         </div>
         <div class="score-panel">
           <div class="big-score ${scoreColor(c.score)}">${c.score}<small>/100</small></div>
@@ -1282,6 +1296,14 @@ function renderClipDetail() {
             <button class="ghost" id="prevSeriesPart" ${previousSeriesClip?'':'disabled'}>Previous part</button>
             <button class="ghost" id="nextSeriesPart" ${nextSeriesClip?'':'disabled'}>Next part</button>
             ${seriesClips.length ? `<button class="ghost" id="downloadSeriesParts">Download all parts</button>` : ''}
+          </div>
+          <label style="display:flex;align-items:center;gap:7px;margin-top:8px;font-size:.82rem;color:var(--muted)">
+            <input type="checkbox" id="autoPlayNextToggle" ${state.autoPlayNextPart?'checked':''}>
+            Play next part automatically
+          </label>
+          <div class="action-row" style="gap:8px;flex-wrap:wrap;margin-top:4px">
+            <button class="ghost" id="regenThisPart">Regenerate this part</button>
+            <button class="ghost" id="regenFromThisPart">Regenerate from this part onward</button>
           </div>
         ` : ''}
         <a class="button" href="${clipUrl(c.outputPath)}" download="clip-${c.id}.mp4" style="text-align:center">⬇ Download clip</a>
@@ -1399,6 +1421,40 @@ function renderClipDetail() {
   });
   $('#prevSeriesPart')?.addEventListener('click', () => previousSeriesClip && openClipById(previousSeriesClip.id));
   $('#nextSeriesPart')?.addEventListener('click', () => nextSeriesClip && openClipById(nextSeriesClip.id));
+  $('#autoPlayNextToggle')?.addEventListener('change', (e) => { state.autoPlayNextPart = e.target.checked; });
+  const detailVideoEl = $('#clipDetailVideo');
+  if (detailVideoEl && nextSeriesClip) {
+    detailVideoEl.addEventListener('ended', () => {
+      if (state.autoPlayNextPart) {
+        openClipById(nextSeriesClip.id);
+        setTimeout(() => $('#clipDetailVideo')?.play().catch(() => {}), 150);
+      }
+    });
+  }
+  $('#regenThisPart')?.addEventListener('click', async () => {
+    if (!c.seriesId || !confirm(`Re-render ${partLabel}? This replaces the current output for this part only.`)) return;
+    const seriesJob = (state.library.seriesJobs || []).find(s => s.id === c.seriesId);
+    const seriesPart = (state.library.seriesParts || []).find(p => p.seriesId === c.seriesId && p.partNumber === c.partNumber);
+    if (!seriesJob || !seriesPart) { alert('Series data not found.'); return; }
+    try {
+      await api('/api/job', { method: 'PATCH', body: JSON.stringify({ action: 'retry-series-part', jobId: seriesJob.jobId, partId: seriesPart.id }) });
+      alert(`${partLabel} queued for regeneration.`);
+      await loadAll();
+      renderClipDetail();
+    } catch (e) { alert(e.message); }
+  });
+  $('#regenFromThisPart')?.addEventListener('click', async () => {
+    if (!c.seriesId || !confirm(`Re-render ${partLabel} and every part after it? Earlier parts are kept.`)) return;
+    const seriesJob = (state.library.seriesJobs || []).find(s => s.id === c.seriesId);
+    const seriesPart = (state.library.seriesParts || []).find(p => p.seriesId === c.seriesId && p.partNumber === c.partNumber);
+    if (!seriesJob || !seriesPart) { alert('Series data not found.'); return; }
+    try {
+      const res = await api('/api/job', { method: 'PATCH', body: JSON.stringify({ action: 'regenerate-series-from', jobId: seriesJob.jobId, partId: seriesPart.id }) });
+      alert(`Regenerating ${res.regeneratingParts || ''} part(s) from ${partLabel} onward.`);
+      await loadAll();
+      setView('clips');
+    } catch (e) { alert(e.message); }
+  });
   $('#downloadSeriesParts')?.addEventListener('click', () => {
     seriesClips.forEach((clip, index) => {
       setTimeout(() => {
@@ -3369,6 +3425,19 @@ function renderAdmin() {
         <div id="storageCleanupResult" style="margin-top:10px"></div>
       </section>
 
+      <!-- ── Full Series timeline debugger ── -->
+      <section class="panel" style="margin-top:16px">
+        <div class="panel-head" style="margin-bottom:14px">
+          <div>
+            <span class="eyebrow">Diagnostics</span>
+            <h2>Full Series timeline debugger</h2>
+            <p class="muted" style="margin:4px 0 0;font-size:.82rem">Inspect the committed plan for a series: boundary reasons, gap/overlap validation, and (while the source is still on disk) sample frames + a waveform at every part boundary.</p>
+          </div>
+        </div>
+        <select id="timelineSeriesSelect" style="max-width:480px"><option value="">Loading series jobs…</option></select>
+        <div id="timelineDebuggerPanel" style="margin-top:14px"></div>
+      </section>
+
       <!-- ── Gemini AI (Primary Brain) ── -->
       <section class="panel" style="margin-top:16px;border:2px solid var(--accent)">
         <div class="panel-head" style="margin-bottom:16px">
@@ -3773,6 +3842,75 @@ function renderAdmin() {
   }
   refreshStorageCleanupStatus();
 
+  // ── Full Series timeline debugger ─────────────────────────────
+  async function loadTimelineSeriesList() {
+    const select = $('#timelineSeriesSelect');
+    if (!select) return;
+    try {
+      const data = await api('/api/admin/series-timeline');
+      const jobs = data.seriesJobs || [];
+      select.innerHTML = jobs.length
+        ? `<option value="">Select a series…</option>${jobs.map(s => `<option value="${esc(s.id)}">${esc(s.videoTitle)} — ${s.completedParts||0}/${s.totalParts||0} parts (${esc(s.planStatus||s.status)})</option>`).join('')}`
+        : '<option value="">No series jobs yet</option>';
+    } catch {
+      select.innerHTML = '<option value="">Could not load series jobs</option>';
+    }
+  }
+  async function renderTimelineDebugger(seriesId) {
+    const panel = $('#timelineDebuggerPanel');
+    if (!panel) return;
+    if (!seriesId) { panel.innerHTML = ''; return; }
+    panel.innerHTML = '<p class="muted">Loading…</p>';
+    try {
+      const data = await api(`/api/admin/series-timeline?seriesId=${encodeURIComponent(seriesId)}`);
+      const v = data.validation || {};
+      panel.innerHTML = `
+        <div class="meta" style="gap:10px;flex-wrap:wrap;margin-bottom:10px">
+          <span>${pill(v.status || 'unknown', v.valid ? 'ok' : 'error')}</span>
+          <span>${data.video?.sourceAvailable ? 'Source file available for frame/waveform debug' : 'Source file already cleaned up (no frames available)'}</span>
+        </div>
+        ${v.issues?.length ? `<ul style="margin:0 0 12px 18px;font-size:.82rem;color:var(--danger)">${v.issues.map(i => `<li>${esc(i)}</li>`).join('')}</ul>` : ''}
+        <div style="overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse;font-size:.82rem">
+            <thead><tr>${['Part','Source start','Source end','Duration','Target','Boundary reason','Status'].map(h=>`<th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--border)">${h}</th>`).join('')}</tr></thead>
+            <tbody>
+              ${(data.parts||[]).map(p => `<tr>
+                <td style="padding:6px 10px">${p.partNumber}/${p.totalParts}</td>
+                <td style="padding:6px 10px">${Number(p.sourceStart).toFixed(2)}s</td>
+                <td style="padding:6px 10px">${Number(p.sourceEnd).toFixed(2)}s</td>
+                <td style="padding:6px 10px">${Number(p.duration).toFixed(2)}s${p.mergedFinal?' (merged)':''}</td>
+                <td style="padding:6px 10px">${Number(p.targetDuration||0).toFixed(0)}s</td>
+                <td style="padding:6px 10px">${esc(p.boundaryReason||'')}</td>
+                <td style="padding:6px 10px">${pill(p.status, p.status==='complete'?'ok':p.status==='failed'?'error':'warn')}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+        ${data.video?.sourceAvailable ? `<button class="ghost" id="genTimelineFramesBtn" style="margin-top:12px">Generate boundary frames + waveform</button>` : ''}
+        <div id="timelineFramesResult" style="margin-top:12px"></div>
+      `;
+      $('#genTimelineFramesBtn')?.addEventListener('click', async () => {
+        const btn = $('#genTimelineFramesBtn');
+        btn.disabled = true; btn.textContent = 'Generating…';
+        try {
+          const res = await api('/api/admin/series-timeline-frames', { method: 'POST', body: JSON.stringify({ seriesId }) });
+          const result = $('#timelineFramesResult');
+          if (!res.available) { result.innerHTML = `<p class="muted">${esc(res.reason)}</p>`; return; }
+          result.innerHTML = `
+            ${res.waveformUrl ? `<img src="${esc(res.waveformUrl)}" alt="waveform" style="width:100%;border-radius:8px;margin-bottom:10px">` : ''}
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              ${res.frames.map(f => `<div style="text-align:center"><img src="${esc(f.url)}" alt="frame at ${f.t}s" style="height:100px;border-radius:6px;display:block"><small class="muted">${f.t.toFixed(1)}s</small></div>`).join('')}
+            </div>`;
+        } catch (e) { $('#timelineFramesResult').innerHTML = `<p class="error-text">${esc(e.message)}</p>`; }
+        finally { btn.disabled = false; btn.textContent = 'Generate boundary frames + waveform'; }
+      });
+    } catch (e) {
+      panel.innerHTML = `<p class="error-text">${esc(e.message)}</p>`;
+    }
+  }
+  loadTimelineSeriesList();
+  $('#timelineSeriesSelect')?.addEventListener('change', (e) => renderTimelineDebugger(e.target.value));
+
   $('#runStorageRetentionBtn')?.addEventListener('click', async () => {
     const btn = $('#runStorageRetentionBtn');
     const resultEl = $('#storageCleanupResult');
@@ -3946,6 +4084,11 @@ document.addEventListener('click', e => {
 
   const cancelJob=e.target.closest('[data-cancel-job]');
   if (cancelJob) api('/api/job',{method:'PATCH',body:JSON.stringify({jobId:cancelJob.dataset.cancelJob,action:'cancel'})}).then(loadAll).then(()=>setView('clips'));
+
+  const cancelSeriesRemaining=e.target.closest('[data-cancel-series-remaining]');
+  if (cancelSeriesRemaining && confirm('Cancel all remaining unfinished parts? Parts already completed are kept.')) {
+    api('/api/job',{method:'PATCH',body:JSON.stringify({jobId:cancelSeriesRemaining.dataset.seriesJob,seriesId:cancelSeriesRemaining.dataset.cancelSeriesRemaining,action:'cancel-series-remaining'})}).then(loadAll).then(()=>setView('clips'));
+  }
 
   const deleteVideo=e.target.closest('[data-delete-video]');
   if (deleteVideo&&confirm('Delete this video and all its clips?')) {
