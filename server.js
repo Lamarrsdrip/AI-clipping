@@ -898,6 +898,42 @@ function chooseBestDownloadedMedia(candidates = []) {
   return { muxed, videoOnly, audioOnly };
 }
 
+async function chooseCachedDownloadedMedia(video = {}) {
+  if (!video.youtubeId) return '';
+  let files = [];
+  try {
+    files = await readdir(path.join(STORAGE_DIR, 'originals'));
+  } catch {
+    return '';
+  }
+  const mediaFiles = files
+    .filter(file => file.startsWith(video.youtubeId) && /\.(mp4|m4v|mov|webm|mkv)$/i.test(file))
+    .map(file => path.join(STORAGE_DIR, 'originals', file));
+  if (!mediaFiles.length) return '';
+
+  const inspected = [];
+  for (const filePath of mediaFiles) {
+    try {
+      const info = await probeMedia(filePath, { countPackets: true });
+      inspected.push({ ...info, size: statSync(filePath).size });
+    } catch (error) {
+      importLog('warn', 'cached media probe failed', { file: path.basename(filePath), error: String(error.message || error).slice(0, 300) });
+    }
+  }
+  const choice = chooseBestDownloadedMedia(inspected);
+  const selected = choice.muxed?.path || '';
+  if (!selected) return '';
+
+  const sourceAudio = await inspectSourceAudio(selected);
+  if (sourceAudio.status !== SOURCE_AUDIO_PRESENT) return '';
+  importLog('log', 'reusing cached downloaded media', {
+    videoId: video.youtubeId,
+    file: path.basename(selected),
+    durationSeconds: resolveMediaDurationSeconds(video, sourceAudio),
+  });
+  return selected;
+}
+
 // Cache result — probe runs once per process lifetime
 let _drawtextOk = null;
 let _toolsCache = null; // cached once per process startup
@@ -2200,6 +2236,8 @@ async function downloadVideo(video, jobId = '') {
   const ytdlpCommand = await workingYtDlpCommand();
   if (!ytdlpCommand) throw new Error('yt-dlp is required to download owned or permissioned source videos.');
   assertYtDlpNotCoolingDown();
+  const cachedMedia = await chooseCachedDownloadedMedia(video);
+  if (cachedMedia) return cachedMedia;
   const output = path.join(STORAGE_DIR, 'originals', `${video.youtubeId}.%(ext)s`);
   try {
     await runYtDlpWithClientFallback(
