@@ -35,6 +35,7 @@ import {
   parseVolumeStats,
   postProcessMoments,
   resolveManagedDeletionPath,
+  resolveMediaDurationSeconds,
   sanitizeApiPayload,
   SOURCE_AUDIO_EXTRACTION_FAILED,
   SOURCE_AUDIO_PRESENT,
@@ -182,6 +183,32 @@ test('full video series covers a 10-minute source with sequential numbered parts
     assert.equal(parts[i].sourceStart, parts[i - 1].sourceEnd);
     assert.equal(parts[i].start, parts[i].sourceStart);
   }
+});
+
+test('full video series refuses unknown source duration instead of inventing a one-second part', () => {
+  const parts = buildFullSeriesMoments(
+    { id: 'video-unknown-duration', title: 'Unknown duration', durationSeconds: 0 },
+    [],
+    { partDuration: 90 }
+  );
+  assert.deepEqual(parts, []);
+
+  const validation = validateSeriesPlan(
+    [{ partNumber: 1, sourceStart: 0, sourceEnd: 1, duration: 1 }],
+    0,
+    0,
+    minPartDuration(90, 15)
+  );
+  assert.equal(validation.status, 'SOURCE_DURATION_UNAVAILABLE');
+  assert.ok(validation.issues.some(issue => issue.startsWith('SOURCE_DURATION_UNAVAILABLE')));
+});
+
+test('media duration resolution repairs zero-duration import metadata from ffprobe results', () => {
+  const duration = resolveMediaDurationSeconds(
+    { id: 'v1', durationSeconds: 0 },
+    { formatDuration: 615.432, videoDuration: 615.4, audioDuration: 615.44 }
+  );
+  assert.equal(duration, 615.432);
 });
 
 test('full video series uses natural boundaries within the configured adjustment window', () => {

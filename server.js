@@ -846,6 +846,19 @@ async function inspectSourceAudio(mediaPath) {
   }
 }
 
+function resolveMediaDurationSeconds(video = {}, mediaInfo = {}) {
+  const candidates = [
+    mediaInfo.formatDuration,
+    mediaInfo.videoDuration,
+    mediaInfo.audioDuration,
+    video.durationSeconds,
+  ]
+    .map(value => Number(value))
+    .filter(value => Number.isFinite(value) && value > 0.05);
+  if (!candidates.length) return 0;
+  return Number(candidates[0].toFixed(3));
+}
+
 function summarizeFormat(info = {}) {
   return {
     file: path.basename(info.path || ''),
@@ -4572,7 +4585,9 @@ function chooseNaturalBoundary(cursor, targetEnd, sourceEnd, boundaries = [], ad
 
 function buildFullSeriesMoments(video, transcript = [], options = {}) {
   const sourceStart = Math.max(0, Number(options.sourceStart || 0));
-  const sourceEnd = Math.max(sourceStart + 1, Number(options.sourceEnd || video.durationSeconds || 0));
+  const rawSourceEnd = Number(options.sourceEnd ?? video.durationSeconds ?? 0);
+  const sourceEnd = Number.isFinite(rawSourceEnd) ? rawSourceEnd : 0;
+  if (sourceEnd <= sourceStart + 0.05) return [];
   const targetDuration = Math.max(30, Math.min(600, Number(options.partDuration || options.clipLength || 90)));
   const adjustment = Math.max(0, Math.min(30, Number(options.boundaryAdjustmentSeconds ?? 15)));
   const contextOverlap = Math.max(0, Math.min(3, Number(options.contextOverlapSeconds || 0)));
@@ -4680,6 +4695,9 @@ function momentsFromPersistedSeriesPlan(seriesRows, video, transcript = []) {
 function validateSeriesPlan(parts, sourceStart, sourceEnd, minDuration) {
   const issues = [];
   const sorted = [...parts].sort((a, b) => a.partNumber - b.partNumber);
+  if (!(Number(sourceEnd) > Number(sourceStart))) {
+    issues.push(`SOURCE_DURATION_UNAVAILABLE: source duration must be known before planning a full series (start ${Number(sourceStart || 0).toFixed(2)}s, end ${Number(sourceEnd || 0).toFixed(2)}s)`);
+  }
   if (!sorted.length) issues.push('SERIES_PLAN_EMPTY: plan has no parts');
   const seen = new Set();
   let gapDetected = false;
@@ -4704,7 +4722,8 @@ function validateSeriesPlan(parts, sourceStart, sourceEnd, minDuration) {
   if (sorted.length && Math.abs(sorted[0].sourceStart - sourceStart) > 0.5) issues.push(`First part starts at ${sorted[0].sourceStart.toFixed(2)}s, not source start ${sourceStart.toFixed(2)}s`);
   if (sorted.length && Math.abs(sorted[sorted.length - 1].sourceEnd - sourceEnd) > 1.0) issues.push(`Final part ends at ${sorted[sorted.length - 1].sourceEnd.toFixed(2)}s, not source end ${sourceEnd.toFixed(2)}s`);
   let status = 'SERIES_PLAN_VALID';
-  if (issues.some(i => i.startsWith('SERIES_GAP_DETECTED'))) status = 'SERIES_GAP_DETECTED';
+  if (issues.some(i => i.startsWith('SOURCE_DURATION_UNAVAILABLE'))) status = 'SOURCE_DURATION_UNAVAILABLE';
+  else if (issues.some(i => i.startsWith('SERIES_GAP_DETECTED'))) status = 'SERIES_GAP_DETECTED';
   else if (issues.some(i => i.startsWith('SERIES_OVERLAP_DETECTED'))) status = 'SERIES_OVERLAP_DETECTED';
   else if (issues.some(i => i.startsWith('PART_TOO_SHORT'))) status = 'PART_TOO_SHORT';
   else if (issues.length) status = 'PART_DURATION_INVALID';
@@ -5079,6 +5098,11 @@ async function processVideo(payload) {
     const sourceAudioInfo = await inspectSourceAudio(mediaPath);
     video.sourceAudioStatus = sourceAudioInfo.status;
     video._sourceAudioInfo = sourceAudioInfo;
+    const resolvedDuration = resolveMediaDurationSeconds(video, sourceAudioInfo);
+    if (resolvedDuration > 0) {
+      video.durationSeconds = resolvedDuration;
+      video.isShort = resolvedDuration <= 90;
+    }
     const audioDb = loadDb();
     const audioVideo = audioDb.videos.find(item => item.id === video.id);
     if (audioVideo) {
@@ -5086,10 +5110,17 @@ async function processVideo(payload) {
       audioVideo.sourceAudioReason = sourceAudioInfo.reason || '';
       audioVideo.sourceAudioMaxVolumeDb = sourceAudioInfo.maxVolumeDb ?? null;
       audioVideo.sourceAudioBitrate = sourceAudioInfo.audioBitrate ?? null;
+      if (resolvedDuration > 0) {
+        audioVideo.durationSeconds = resolvedDuration;
+        audioVideo.isShort = resolvedDuration <= 90;
+      }
       saveDb(audioDb);
     }
     if (video.sourceKind !== 'upload' && sourceAudioInfo.status !== SOURCE_AUDIO_PRESENT) {
       throw new Error(`${SOURCE_AUDIO_EXTRACTION_FAILED}: YouTube source audio was not audibly valid after download (${sourceAudioInfo.reason || sourceAudioInfo.status}).`);
+    }
+    if (isSeriesMode && !(Number(video.durationSeconds || 0) > 0)) {
+      throw new Error('SOURCE_DURATION_UNAVAILABLE: Full Video Series needs a known source duration. Re-import the YouTube source or upload the video file so FFmpeg can probe the media duration.');
     }
     updateJob(job.id, { progress: 30, stage: 'transcribing', steps: processingSteps('transcribing', 30) });
     let transcript = [];
@@ -8006,6 +8037,7 @@ export {
   parseVolumeStats,
   postProcessMoments,
   resolveManagedDeletionPath,
+  resolveMediaDurationSeconds,
   runStorageRetentionCleanup,
   sanitizeApiPayload,
   SOURCE_AUDIO_EXTRACTION_FAILED,
