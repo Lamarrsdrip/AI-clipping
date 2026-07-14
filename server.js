@@ -467,7 +467,7 @@ function verifyToken(token = '') {
 }
 
 function json(res, status, payload) {
-  const body = JSON.stringify(payload);
+  const body = JSON.stringify(payload, apiJsonReplacer);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store'
@@ -5346,6 +5346,22 @@ function publicUser(user) {
   return safe;
 }
 
+const INTERNAL_API_RESPONSE_KEYS = new Set([
+  'passwordHash',
+  'storagePath',
+  '_sourceAudioInfo',
+]);
+
+function apiJsonReplacer(key, value) {
+  if (INTERNAL_API_RESPONSE_KEYS.has(key)) return undefined;
+  return value;
+}
+
+function sanitizeApiPayload(payload) {
+  if (payload === undefined) return undefined;
+  return JSON.parse(JSON.stringify(payload, apiJsonReplacer));
+}
+
 function requireUser(req, db) {
   const user = currentUser(req, db);
   if (!user) throw Object.assign(new Error('Authentication required.'), { status: 401 });
@@ -7991,6 +8007,7 @@ export {
   postProcessMoments,
   resolveManagedDeletionPath,
   runStorageRetentionCleanup,
+  sanitizeApiPayload,
   SOURCE_AUDIO_EXTRACTION_FAILED,
   SOURCE_AUDIO_PRESENT,
   SOURCE_HAS_NO_AUDIO,

@@ -35,6 +35,7 @@ import {
   parseVolumeStats,
   postProcessMoments,
   resolveManagedDeletionPath,
+  sanitizeApiPayload,
   SOURCE_AUDIO_EXTRACTION_FAILED,
   SOURCE_AUDIO_PRESENT,
   SOURCE_HAS_NO_AUDIO,
@@ -574,6 +575,34 @@ test('assessCaptionSync records missing word timestamps without pretending align
   const result = assessCaptionSync([], { outputDuration: 1 });
   assert.equal(result.status, WORD_TIMESTAMPS_MISSING);
   assert.equal(result.confidence, 'missing');
+});
+
+test('sanitizeApiPayload strips internal Windows storage paths from API responses', () => {
+  const payload = sanitizeApiPayload({
+    videos: [{
+      id: 'v1',
+      title: 'Upload response',
+      url: '/media/uploads/source.mp4',
+      thumbnailUrl: '/media/thumbs/source.jpg',
+      storagePath: 'C:\\ClipForge\\storage\\uploads\\source.mp4',
+      _sourceAudioInfo: { status: SOURCE_AUDIO_PRESENT },
+    }],
+    user: {
+      id: 'u1',
+      email: 'person@example.test',
+      passwordHash: 'scrypt:secret',
+    },
+  });
+
+  assert.equal(payload.videos[0].url, '/media/uploads/source.mp4');
+  assert.equal(payload.videos[0].thumbnailUrl, '/media/thumbs/source.jpg');
+  assert.equal(payload.videos[0].storagePath, undefined);
+  assert.equal(payload.videos[0]._sourceAudioInfo, undefined);
+  assert.equal(payload.user.passwordHash, undefined);
+
+  const body = JSON.stringify(payload);
+  assert.doesNotThrow(() => JSON.parse(body));
+  assert.ok(!body.includes('C:\\ClipForge'), 'response must not leak VPS disk paths');
 });
 
 // ─── Framing: no-face-detected default should not waste ~37% of frame on blur ──
